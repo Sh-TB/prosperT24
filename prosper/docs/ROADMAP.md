@@ -56,8 +56,13 @@ Turn the file into a resident, relocated guest image in host memory.
 - [x] NID hash (SHA1 + 16-byte salt + Sony base64) + name↔NID DB; traps now print
       readable names (`src/hle/nid.{hpp,cpp}`). Validated: `memcpy`→`Q3VBxCXhUHs`,
       105/159 dictionary names resolve real eboot imports.
-- [ ] Turn traps into a real HLE **dispatch** (call → handler → return) instead of halt.
-- [ ] TLS setup (`%fs` base) — needed before much libc/libkernel runs.
+- [x] Real HLE **dispatch**: per-import executable stubs — implemented imports
+      tail-jump to a C handler (args intact); unimplemented ones log + return 0 so the
+      boot advances (`src/hle/dispatch.*`, stubs in `exec_image_linux.cpp`).
+- [x] First HLE module: `src/hle/hle_libc.cpp` — libc thunks (mem/str/heap) + CRT
+      no-ops, registered by NID. Boot trace now shows the real startup call order.
+- [ ] TLS setup (`%fs` base) — the boot null-derefs at image+0x89eafa; first crt call
+      `libc::bzQExy189ZI` (likely TLS/`__tls_get_addr`) returns 0. Next target.
 - **Verify (programmatic, GREEN):** `tests/test_trap_linux.cpp` (map + identify 4
   representative imports) and `tests/test_boot_linux.cpp` (jump into real entry,
   assert it reaches an import trap). Both headless, exit-code = truth.

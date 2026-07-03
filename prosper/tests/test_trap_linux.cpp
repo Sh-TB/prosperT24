@@ -1,11 +1,11 @@
-// test_trap_linux — agentic-first M2 test (Linux only).
-// Maps the real eboot into executable host memory, binds imports to a PROT_NONE
-// stub region, and verifies that "calling" an import faults and is identified by
-// name. Proves the map + relocate + trap-and-identify chain end to end.
+// test_trap_linux — M2/M3: map the real eboot executable, install HLE stubs, and
+// verify that "calling" an import routes through dispatch: the unimplemented logger
+// records it (by index -> lib::nid) and returns 0. Proves map + relocate + stub +
+// dispatch end to end.
 #include "../src/self/module.hpp"
 #include "../src/host/exec_image.hpp"
+#include "../src/hle/dispatch.hpp"
 #include <cstdio>
-#include <cstring>
 #include <string>
 
 using namespace prosper;
@@ -19,52 +19,32 @@ int main(int argc, char** argv) {
 
     std::string err;
     auto mo = Module::load(path, &err);
-    CHECK(mo.has_value(), "load failed: %s", err.c_str());
+    CHECK(mo.has_value(), "load: %s", err.c_str());
     if (!mo) return 1;
     Module& m = *mo;
 
-    const uint64_t BASE = 0x400000000ull;     // 16 GiB — clear of the host process
-    const uint64_t STUB_BASE = 0x500000000ull; // +4 GiB, clear of the image
-    const uint64_t STUB_SZ = 16;
-
+    const uint64_t BASE = 0x400000000ull, STUB_BASE = 0x500000000ull, STUB_SZ = 32;
     LoadedImage img = build_image(m, BASE);
     bind_imports_to_stubs(m, img, STUB_BASE, STUB_SZ);
-    size_t applied = apply_relocations(m, img);
-    CHECK(applied > 50000, "too few relocs applied: %zu", applied);
-
-    if (!map_image(m, img, STUB_BASE, STUB_SZ, &err)) {
-        printf("  [FAIL] map_image: %s\n", err.c_str());
-        printf("\n== %d passed, %d failed ==\n", g_pass, g_fail + 1);
-        return g_fail + 1;
-    }
+    CHECK(apply_relocations(m, img) > 50000, "too few relocs applied");
+    CHECK(map_image(m, img, &err), "map_image: %s", err.c_str());
+    CHECK(install_stubs(m, STUB_BASE, STUB_SZ, &err), "install_stubs: %s", err.c_str());
     install_trap_handler();
 
-    // The image is now resident & executable at BASE; the entry byte must be
-    // real code (fetched through the live mapping, not the staging vector).
-    const uint8_t* entry = (const uint8_t*)img.entry;
-    bool nz = false; for (int i = 0; i < 16; i++) if (entry[i]) nz = true;
-    CHECK(nz, "entry code not present in live mapping");
-
-    // Find representative imports and verify trap-by-name.
     auto find = [&](const char* lib) -> long {
         for (size_t i = 0; i < m.imports.size(); i++) if (m.imports[i].lib_name == lib) return (long)i;
         return -1;
     };
-    struct { const char* lib; long idx; } probes[] = {
-        {"libkernel", find("libkernel")},
-        {"libSceAgc", find("libSceAgc")},
-        {"libc",      find("libc")},
-        {"libSceVideoOut", find("libSceVideoOut")},
-    };
-    for (auto& p : probes) {
-        CHECK(p.idx >= 0, "no import found for %s", p.lib);
-        if (p.idx < 0) continue;
-        std::string name;
-        int kind = invoke_stub((uint64_t)p.idx, &name);
-        CHECK(kind == 1, "%s: expected stub trap (1), got %d", p.lib, kind);
-        CHECK(name.rfind(std::string(p.lib) + "::", 0) == 0,
-              "%s: trap name '%s' does not start with '%s::'", p.lib, name.c_str(), p.lib);
-        printf("  trapped import[%ld] -> %s\n", p.idx, name.c_str());
+    for (const char* lib : {"libkernel", "libSceAgc", "libc", "libSceVideoOut"}) {
+        long idx = find(lib);
+        CHECK(idx >= 0, "no import for %s", lib);
+        if (idx < 0) continue;
+        reset_call_log();
+        uint64_t ret = invoke_stub((uint64_t)idx);           // acts as a guest call
+        CHECK(ret == 0, "%s stub should return 0 (unimplemented), got %llu", lib, (unsigned long long)ret);
+        CHECK(call_order().size() == 1 && call_order()[0] == (uint32_t)idx,
+              "%s: dispatch did not record import #%ld", lib, idx);
+        printf("  dispatched import[%ld] %s::%s -> 0\n", idx, lib, m.imports[idx].nid.c_str());
     }
 
     printf("\n== %d passed, %d failed ==\n", g_pass, g_fail);

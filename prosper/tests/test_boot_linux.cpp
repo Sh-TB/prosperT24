@@ -1,8 +1,10 @@
-// test_boot_linux — M2b: jump into the real guest entry point and run until the
-// first fault. Success = the crt executed and reached its first Sony import call
-// (trap kind 1), which we identify by name. Fully headless/self-checking.
+// test_boot_linux — M3: jump into the real guest entry and let it run, with
+// unimplemented imports logged-and-stubbed (return 0) so the boot advances. Reports
+// the startup Sony-call sequence and where it finally faults. Success = the crt
+// executed and made at least one Sony call (dispatch works end to end).
 #include "../src/self/module.hpp"
 #include "../src/host/exec_image.hpp"
+#include "../src/hle/dispatch.hpp"
 #include <cstdio>
 #include <string>
 
@@ -17,26 +19,27 @@ int main(int argc, char** argv) {
     if (!mo) { printf("  [FAIL] load: %s\n", err.c_str()); return 1; }
     Module& m = *mo;
 
-    const uint64_t BASE = 0x400000000ull, STUB_BASE = 0x500000000ull, STUB_SZ = 16;
+    const uint64_t BASE = 0x400000000ull, STUB_BASE = 0x500000000ull, STUB_SZ = 32;
     LoadedImage img = build_image(m, BASE);
     bind_imports_to_stubs(m, img, STUB_BASE, STUB_SZ);
     apply_relocations(m, img);
-    if (!map_image(m, img, STUB_BASE, STUB_SZ, &err)) { printf("  [FAIL] map: %s\n", err.c_str()); return 1; }
+    if (!map_image(m, img, &err))               { printf("  [FAIL] map: %s\n", err.c_str()); return 1; }
+    register_builtin_hle();                      // real libc thunks so the crt can make progress
+    if (!install_stubs(m, STUB_BASE, STUB_SZ, &err)) { printf("  [FAIL] stubs: %s\n", err.c_str()); return 1; }
     install_trap_handler();
+    reset_call_log();
 
-    printf("  entry = 0x%llx  jumping in...\n", (unsigned long long)img.entry);
+    printf("  entry = 0x%llx  jumping in...\n\n", (unsigned long long)img.entry);
     BootResult r = run_entry(img);
 
-    printf("  -> kind=%d  detail='%s'\n", r.kind, r.detail.c_str());
-    printf("     fault_addr=0x%llx  guest_rip=0x%llx (base+0x%llx)\n",
-           (unsigned long long)r.fault_addr, (unsigned long long)r.fault_rip,
-           (unsigned long long)(r.fault_rip - BASE));
+    dump_call_log(stdout);
+    printf("\n  run ended: kind=%d  %s\n", r.kind, r.detail.c_str());
 
-    // The crt must have executed past its prologue and reached its first import.
-    if (r.kind == 1) {
-        printf("\n== PASS: guest executed and trapped at first Sony call: %s ==\n", r.detail.c_str());
+    size_t n = call_order().size();
+    if (n >= 1) {
+        printf("\n== PASS: guest executed and made %zu distinct Sony call(s) via dispatch ==\n", n);
         return 0;
     }
-    printf("\n== FAIL: expected an import trap (kind 1); got kind %d ==\n", r.kind);
+    printf("\n== FAIL: guest made no Sony calls (dispatch/boot broken) ==\n");
     return 2;
 }
