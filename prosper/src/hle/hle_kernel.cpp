@@ -243,6 +243,7 @@ HLE(k_sema_poll)   { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n
 // handler on that thread. A stubbed RaiseException left every thread un-acked -> deadlock.
 namespace {
 uint64_t g_exc_handlers[128] = {0};   // guest handler fn ptr, indexed by exception type
+bool g_exc_log = false;               // set once (outside signal ctx) from PROSPER_SYNCLOG
 #ifdef __linux__
 int  g_exc_sig = -1;
 void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
@@ -262,10 +263,13 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
     WQ(0xA0, g[REG_RIP]); WQ(0xB8, g[REG_RSP]);
     // Run the guest handler on this (the target) thread: handler(type, &mcontext). It captures
     // the registers, acks via SuspendSemaphore, and blocks on ResumeSemaphore until resumed.
+    if (g_exc_log) { const char m[] = "[exc] handler ENTER on target\n"; (void)!write(2, m, sizeof m - 1); }
     ((void (*)(uint64_t, void*))(uintptr_t)g_exc_handlers[type])((uint64_t)type, ctx);
+    if (g_exc_log) { const char m[] = "[exc] handler EXIT (resumed)\n";   (void)!write(2, m, sizeof m - 1); }
 }
 void ensure_exc_sig() {
     if (g_exc_sig != -1) return;
+    g_exc_log = getenv("PROSPER_SYNCLOG") != nullptr;
     g_exc_sig = SIGRTMIN + 4;                    // free RT signal (not our SIGSEGV/ILL/BUS)
     struct sigaction sa; memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = exc_delivery_handler;
