@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <cstdio>
 
 namespace prosper {
 
@@ -56,12 +57,26 @@ HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our s
 }
 HLE(g_vo_resstatus)   { if (a1) memset((void*)(uintptr_t)a1, 0, 0x20); return 0; }  // SceVideoOutResolutionStatus ~0x20
 
+// Diagnostic: log args of the (undocumented) AGC/AgcDriver calls so we can map the GPU-memory /
+// GPU-VA scheme (gated on PROSPER_GFXLOG). Returns 0 like the old unimplemented stub — same
+// behaviour, just observable — so it doesn't change control flow.
+static const char* g_glog_nid = nullptr;
+HLE(g_glog) {
+    if (getenv("PROSPER_GFXLOG"))
+        fprintf(stderr, "[gfx] agc call a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1,
+                (unsigned long long)a2, (unsigned long long)a3);
+    (void)g_glog_nid; return 0;
+}
+
 void register_graphics_hle() {
     #define RN(nid, fn) Hle::register_fn(nid, (HleFn)(fn), nid)   // raw NID (graphics libs undocumented)
     #define R(str, fn)  Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     // libSceAgc getters whose results the guest dereferences → return stable zeroed objects.
     RN("2JtWUUiYBXs", g_agc_dev);
     RN("wRbq6ZjNop4", g_agc_ctx);
+    // AgcDriver + AGC calls: log args (GFXLOG) to reverse-engineer the GPU-memory model.
+    RN("MM4IZSEYytQ", g_glog); RN("XlNp7jzGiPo", g_glog); RN("Zw7uUVPulbw", g_glog); RN("w2rJhmD+dsE", g_glog);
     // libSceVideoOut display / flip
     R("sceVideoOutOpen", g_vo_open);            R("sceVideoOutClose", g_vo_close);
     R("sceVideoOutSubmitFlip", g_vo_submitflip);R("sceVideoOutIsFlipPending", g_vo_flippending);
