@@ -117,7 +117,26 @@ Turn the file into a resident, relocated guest image in host memory.
       on `UnityEngine.GL::Internal_SetRTSimple_Injected` (SetRenderTarget) at `Il2cpp+0x110ea`.
       The rendering icalls are registered when the engine's **graphics device initializes**, so
       the boot now genuinely needs the GPU path. This is the transition to M4/M5.
-### M4 — Window + VideoOut + graphics-device init  ← NEXT
+### M3.5 — Threading correctness (in progress)
+- [x] **GC "unknown thread" fixed**: `pthread_equal` was unregistered (POSIX name) so the GC's
+      thread-table search never matched. Root cause found via gdb (empty thread table → the
+      compare import always returned 0). Registered `pthread_equal`.
+- [x] `scePthreadSelf`/`pthread_self` return the real, unique host thread id (was a shared
+      static TCB — broke every per-thread lookup).
+- [x] Registered the **POSIX `pthread_*` aliases** (create/join/mutex/cond/attr/keys) — the
+      game uses both Sony and POSIX names; guest libc is FreeBSD-style (pointer pthread types).
+- [x] Real **event flags + semaphores** (mutex+condvar), **`sync_on_address` futex** (Linux futex).
+- [x] Real **per-thread stack tracking** (main + workers we spawn) — replaced the crash-prone
+      `pthread_getattr_np` so the GC gets accurate stack bounds. (Correctness, not a fake.)
+- **Now: the engine fully initializes** — spawns a **14-thread job-system pool** (all correctly
+  parked on the futex awaiting work). The main thread is parked on a `sync_on_address` address.
+- [ ] **Frontier (correctness): the main thread's futex wake never arrives.** Confirm the exact
+      `sceKernelWaitOnAddress`/`WakeByAddress` ABI (observed args: `wait(addr,0,0,0)`,
+      `wake(addr,1)`) and implement the precise semantics — do NOT hack a forced wake. Likely a
+      producer/consumer where an earlier stubbed call made the main thread take a wrong path, or
+      a futex expected-value/lost-wakeup subtlety. Diagnose which address + who should wake it.
+
+### M4 — Window + VideoOut + graphics-device init
 - [ ] `libSceVideoOut` → open an SDL3 window + Vulkan swapchain (headless offscreen for tests).
 - [ ] Enough `libSceAgc`/`AgcDriver` + video-out for the engine's graphics device to init and
       register its rendering internal calls (unblocks the IL2CPP abort).

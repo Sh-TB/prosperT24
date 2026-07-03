@@ -43,6 +43,7 @@ HLE(k_gettimeofday) {                                      // (struct timeval*, 
     return 0;
 }
 HLE(k_time) { uint64_t s = ns_now() / 1000000000ull + 1700000000ull; if (a0) *(int64_t*)P(a0) = (int64_t)s; return s; }
+HLE(k_clock) { return ns_now() / 1000; }   // clock(): CLOCKS_PER_SEC=1e6 -> microseconds
 
 // --- assorted libkernel stubs ---
 HLE(k_ok)              { return 0; }                       // generic success no-op
@@ -75,6 +76,7 @@ void register_kernel_time_hle() {
     R("sceKernelGettimeofday", k_gettimeofday);
     R("gettimeofday", k_gettimeofday);
     R("time", k_time);
+    R("clock", k_clock);
     // module loading (report success; real PRX are already resident in our address space)
     R("sceSysmoduleLoadModule", k_ok);
     R("sceSysmoduleUnloadModule", k_ok);

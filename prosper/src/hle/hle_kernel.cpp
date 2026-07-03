@@ -7,7 +7,11 @@
 #endif
 #include "dispatch.hpp"
 #include "nid.hpp"
+#include "../host/exec_image.hpp"
 #include <pthread.h>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
@@ -57,14 +61,10 @@ HLE(k_cond_broadcast) { if (a0 && *(void**)a0) pthread_cond_broadcast((pthread_c
 HLE(k_cond_wait)      { if (a0 && *(void**)a0 && a1 && *(void**)a1) pthread_cond_wait((pthread_cond_t*)*(void**)a0, (pthread_mutex_t*)*(void**)a1); return 0; }
 
 // --- thread identity ---
-// The guest may read fields at fixed offsets of "its" thread object, so we hand out
-// a large zeroed per-process control block (single-thread bring-up). Multi-thread
-// TCBs come with scePthreadCreate later.
-static uint64_t main_tcb() {
-    static void* tcb = calloc(1, 0x4000);   // 16 KiB zeroed, plenty for field reads
-    return (uint64_t)(uintptr_t)tcb;
-}
-HLE(k_pthread_self) { return main_tcb(); }
+// Return the real host thread handle as the Sony ScePthread — unique and stable per
+// thread, used as an opaque id (stored/compared, not dereferenced). A constant here
+// collides across threads and breaks per-thread lookups (GC, TLS).
+HLE(k_pthread_self) { return (uint64_t)pthread_self(); }
 HLE(k_pthread_equal){ return (uint64_t)(a0 == a1); }
 HLE(k_pthread_yield){ sched_yield(); return 0; }
 
@@ -77,7 +77,15 @@ HLE(k_attr_noop)        { return 0; }
 // Query the CURRENT thread's real attributes into the caller's attr object (the GC needs
 // accurate stack bounds to scan roots; bad bounds make IL2CPP's GC init assert).
 HLE(k_attr_get) {
-    if (a0 && *(void**)a0) pthread_getattr_np(pthread_self(), (pthread_attr_t*)*(void**)a0);
+#ifdef __linux__
+    if (a0 && *(void**)a0) {
+        auto* at = (pthread_attr_t*)*(void**)a0;
+        void* base; size_t sz;
+        if (guest_stack_for_current_thread(&base, &sz))
+            pthread_attr_setstack(at, base, sz);   // real, tracked stack for this thread
+        // else: leave the attr as-is (avoid the fragile pthread_getattr_np)
+    }
+#endif
     return 0;
 }
 // scePthreadAttrGetstackaddr(attr, void** addr) — Sony reports the stack *base* (low addr).
@@ -99,11 +107,30 @@ HLE(k_attr_getstacksize) {
 }
 
 // --- thread creation: run the guest entry on a real host thread (ABI matches) ---
+// We give each worker a stack we allocate and TRACK, so GC/thread-stack queries get
+// accurate bounds (see k_attr_get) without relying on pthread_getattr_np.
 HLE(k_pthread_create) {
-    pthread_attr_t* at = (a1 && *(void**)a1) ? (pthread_attr_t*)*(void**)a1 : nullptr;
+    auto entry = (void* (*)(void*))(uintptr_t)a2;
+    void* arg  = (void*)(uintptr_t)a3;
     pthread_t tid;
-    int r = pthread_create(&tid, at, (void* (*)(void*))(uintptr_t)a2, (void*)(uintptr_t)a3);
+#ifdef __linux__
+    pthread_attr_t la; bool own = false;
+    pthread_attr_t* at;
+    if (a1 && *(void**)a1) at = (pthread_attr_t*)*(void**)a1;
+    else { pthread_attr_init(&la); at = &la; own = true; }
+    size_t ssz = 8 * 1024 * 1024;
+    void* sbase = mmap(nullptr, ssz, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+    if (sbase != MAP_FAILED) pthread_attr_setstack(at, sbase, ssz);
+    int r = pthread_create(&tid, at, entry, arg);
+    if (own) pthread_attr_destroy(&la);
+    if (r) { if (sbase != MAP_FAILED) munmap(sbase, ssz); return (uint64_t)r; }
+    if (sbase != MAP_FAILED) register_thread_stack((uint64_t)tid, sbase, ssz);
+#else
+    pthread_attr_t* at = (a1 && *(void**)a1) ? (pthread_attr_t*)*(void**)a1 : nullptr;
+    int r = pthread_create(&tid, at, entry, arg);
     if (r) return (uint64_t)r;
+#endif
     if (a0) *(uint64_t*)a0 = (uint64_t)tid;
     return 0;
 }
@@ -123,6 +150,58 @@ HLE(k_key_create) {
 HLE(k_key_delete)    { pthread_key_delete((pthread_key_t)a0); return 0; }
 HLE(k_getspecific)   { return (uint64_t)(uintptr_t)pthread_getspecific((pthread_key_t)a0); }
 HLE(k_setspecific)   { return (uint64_t)(int64_t)pthread_setspecific((pthread_key_t)a0, (void*)(uintptr_t)a1); }
+
+// --- event flags (SceKernelEventFlag): a bit pattern with wait/set/clear ---
+namespace {
+    struct EventFlag { pthread_mutex_t m; pthread_cond_t c; uint64_t bits; };
+    bool evf_match(uint64_t bits, uint64_t pat, uint32_t mode) {
+        return (mode & 0x1) ? ((bits & pat) == pat) : ((bits & pat) != 0);  // AND vs OR
+    }
+}
+HLE(k_ef_create) {   // (ef*, name, attr, initPattern, opt)
+    auto* e = (EventFlag*)calloc(1, sizeof(EventFlag));
+    pthread_mutex_init(&e->m, nullptr); pthread_cond_init(&e->c, nullptr); e->bits = a3;
+    if (a0) *(void**)(uintptr_t)a0 = e;
+    return 0;
+}
+HLE(k_ef_delete)  { if (a0) free((void*)(uintptr_t)a0); return 0; }
+HLE(k_ef_set)     { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; pthread_mutex_lock(&e->m); e->bits |= a1; pthread_cond_broadcast(&e->c); pthread_mutex_unlock(&e->m); return 0; }
+HLE(k_ef_clear)   { auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0; pthread_mutex_lock(&e->m); e->bits &= a1; pthread_mutex_unlock(&e->m); return 0; }
+HLE(k_ef_wait)    { // (ef, pattern, waitMode, resultPat*, timeout*)
+    auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0;
+    pthread_mutex_lock(&e->m);
+    while (!evf_match(e->bits, a1, (uint32_t)a2)) pthread_cond_wait(&e->c, &e->m);
+    uint64_t res = e->bits;
+    if (a2 & 0x10) e->bits = 0; else if (a2 & 0x20) e->bits &= ~a1;   // CLEAR_ALL / CLEAR_PAT
+    pthread_mutex_unlock(&e->m);
+    if (a3) *(uint64_t*)(uintptr_t)a3 = res;
+    return 0;
+}
+HLE(k_ef_poll)    { // (ef, pattern, waitMode, resultPat*)
+    auto* e = (EventFlag*)(uintptr_t)a0; if (!e) return 0;
+    pthread_mutex_lock(&e->m);
+    bool ok = evf_match(e->bits, a1, (uint32_t)a2); uint64_t res = e->bits;
+    if (ok) { if (a2 & 0x10) e->bits = 0; else if (a2 & 0x20) e->bits &= ~a1; }
+    pthread_mutex_unlock(&e->m);
+    if (a3) *(uint64_t*)(uintptr_t)a3 = res;
+    return ok ? 0 : 0x80020023;   // SCE_KERNEL_ERROR_EBUSY-ish when not matched
+}
+
+// --- semaphores (SceKernelSema): counting sem with wait/signal ---
+namespace { struct Sema { pthread_mutex_t m; pthread_cond_t c; int64_t count; }; }
+HLE(k_sema_create) { // (sema*, name, attr, initCount, maxCount, opt)
+    auto* s = (Sema*)calloc(1, sizeof(Sema));
+    pthread_mutex_init(&s->m, nullptr); pthread_cond_init(&s->c, nullptr); s->count = (int64_t)a3;
+    if (a0) *(void**)(uintptr_t)a0 = s;
+    return 0;
+}
+HLE(k_sema_delete) { if (a0) free((void*)(uintptr_t)a0); return 0; }
+HLE(k_sema_wait)   { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
+    pthread_mutex_lock(&s->m); while (s->count < need) pthread_cond_wait(&s->c, &s->m); s->count -= need; pthread_mutex_unlock(&s->m); return 0; }
+HLE(k_sema_signal) { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n = a1 ? (int64_t)a1 : 1;
+    pthread_mutex_lock(&s->m); s->count += n; pthread_cond_broadcast(&s->c); pthread_mutex_unlock(&s->m); return 0; }
+HLE(k_sema_poll)   { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
+    pthread_mutex_lock(&s->m); bool ok = s->count >= need; if (ok) s->count -= need; pthread_mutex_unlock(&s->m); return ok ? 0 : 0x80020023; }
 
 void register_kernel_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
@@ -168,6 +247,36 @@ void register_kernel_hle() {
     R("pthread_getspecific", k_getspecific); R("scePthreadGetspecific", k_getspecific);
     R("pthread_setspecific", k_setspecific); R("scePthreadSetspecific", k_setspecific);
     R("pthread_self", k_pthread_self);
+    // POSIX pthread_equal — the GC compares thread ids with this while searching its
+    // thread table; unimplemented (always "not equal") made every thread look unknown.
+    R("pthread_equal", k_pthread_equal);
+    // POSIX pthread_* names. The guest's libc is FreeBSD-derived (pointer/opaque pthread
+    // types), so these have the same semantics as our Sony handlers — alias them.
+    R("pthread_create", k_pthread_create);   R("pthread_join", k_pthread_join);
+    R("pthread_detach", k_pthread_detach);    R("pthread_exit", k_pthread_exit);
+    R("pthread_yield", k_pthread_yield);      R("sched_yield", k_pthread_yield);
+    R("pthread_mutex_init", k_mutex_init);    R("pthread_mutex_destroy", k_mutex_destroy);
+    R("pthread_mutex_lock", k_mutex_lock);    R("pthread_mutex_trylock", k_mutex_trylock);
+    R("pthread_mutex_unlock", k_mutex_unlock);
+    R("pthread_mutexattr_init", k_mutexattr_init); R("pthread_mutexattr_settype", k_mutexattr_settype);
+    R("pthread_mutexattr_destroy", k_mutexattr_destroy); R("pthread_mutexattr_setprotocol", k_mutexattr_setprotocol);
+    R("pthread_cond_init", k_cond_init);      R("pthread_cond_destroy", k_cond_destroy);
+    R("pthread_cond_signal", k_cond_signal);  R("pthread_cond_broadcast", k_cond_broadcast);
+    R("pthread_cond_wait", k_cond_wait);
+    R("pthread_condattr_init", k_condattr_init); R("pthread_condattr_destroy", k_condattr_destroy);
+    R("pthread_attr_init", k_attr_init);      R("pthread_attr_destroy", k_attr_destroy);
+    R("pthread_attr_setstacksize", k_attr_setstacksize);
+    R("pthread_attr_setdetachstate", k_attr_noop); R("pthread_attr_setinheritsched", k_attr_noop);
+    R("pthread_attr_setschedpolicy", k_attr_noop);  R("pthread_attr_setschedparam", k_attr_noop);
+    R("pthread_attr_getstacksize", k_attr_getstacksize);
+    R("scePthreadAttrSetaffinity", k_attr_noop); R("pthread_setname_np", k_attr_noop);
+    // event flags + semaphores (engine thread synchronization)
+    R("sceKernelCreateEventFlag", k_ef_create); R("sceKernelDeleteEventFlag", k_ef_delete);
+    R("sceKernelSetEventFlag", k_ef_set);       R("sceKernelClearEventFlag", k_ef_clear);
+    R("sceKernelWaitEventFlag", k_ef_wait);     R("sceKernelPollEventFlag", k_ef_poll);
+    R("sceKernelCreateSema", k_sema_create);    R("sceKernelDeleteSema", k_sema_delete);
+    R("sceKernelWaitSema", k_sema_wait);        R("sceKernelSignalSema", k_sema_signal);
+    R("sceKernelPollSema", k_sema_poll);
     #undef R
     register_kernel_mem_hle();    // virtual/direct memory
     register_kernel_time_hle();   // time/clock + C11 threads + stubs

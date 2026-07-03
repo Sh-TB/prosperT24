@@ -8,14 +8,24 @@
 #include <sys/mman.h>
 #include <signal.h>
 #include <setjmp.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <map>
+#include <mutex>
 
 namespace prosper {
 
 namespace {
     uint64_t g_base = 0, g_stub_base = 0, g_stub_size = 0, g_nstubs = 0;
+    // Real per-thread stack registry (keyed by pthread id). Each guest thread runs on a
+    // stack we allocate (the main thread's mmap'd stack; workers' stacks from
+    // k_pthread_create), so the GC/thread code gets accurate bounds without the fragile
+    // pthread_getattr_np.
+    std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_stacks;   // tid -> (base, size)
+    std::mutex g_smx;
     // Per-thread recovery point: only the thread that armed it can be longjmp'd back
     // (siglongjmp across threads is undefined). Guest worker threads that fault have no
     // armed point, so we terminate the process cleanly instead of corrupting state.
@@ -39,8 +49,15 @@ namespace {
         g_trap_sig = sig;
         g_trap_kind = (sig == SIGILL) ? 3 : 2;
         if (g_armed) siglongjmp(g_jb, 1);
-        // Fault on a thread with no recovery point (e.g. a guest worker thread during
-        // bring-up): terminate cleanly rather than longjmp across threads.
+        // Fault on a thread with no recovery point (a guest worker thread). Report where
+        // (async-signal-safe write) then terminate cleanly instead of a cross-thread longjmp.
+        {
+            char b[160];
+            int n = snprintf(b, sizeof b, "[prosper] WORKER-THREAD FAULT: sig=%d addr=%p rip=0x%llx (image+0x%llx)\n",
+                             sig, g_fault_addr, (unsigned long long)g_fault_rip,
+                             (unsigned long long)(g_base && g_fault_rip >= g_base ? g_fault_rip - g_base : g_fault_rip));
+            write(2, b, n);
+        }
         _exit(90);
     }
 
@@ -120,6 +137,19 @@ uint64_t invoke_stub(uint64_t idx) {
     return fn();
 }
 
+void register_thread_stack(uint64_t tid, void* base, uint64_t size) {
+    std::lock_guard<std::mutex> lk(g_smx);
+    g_stacks[tid] = { (uint64_t)base, size };
+}
+bool guest_stack_for_current_thread(void** base, size_t* size) {
+    uint64_t tid = (uint64_t)pthread_self();
+    std::lock_guard<std::mutex> lk(g_smx);
+    auto it = g_stacks.find(tid);
+    if (it == g_stacks.end()) return false;
+    *base = (void*)it->second.first; *size = (size_t)it->second.second;
+    return true;
+}
+
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {
     size_t ok = 0;
     for (uint64_t f : fns) {
@@ -137,6 +167,8 @@ BootResult run_entry(const LoadedImage& img) {
     void* stk = mmap(nullptr, STK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     BootResult r;
     if (stk == MAP_FAILED) { r.kind = 2; r.detail = "guest stack mmap failed"; return r; }
+
+    register_thread_stack((uint64_t)pthread_self(), stk, STK);   // guest main thread
 
     uint64_t top = ((uint64_t)stk + STK) & ~(uint64_t)0xf;
     static const char argstr[] = "/app0/eboot.bin";

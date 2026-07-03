@@ -52,6 +52,18 @@ HLE(h_strncat) { return (uint64_t)(uintptr_t)strncat((char*)P(a0), CS(a1), a2); 
 HLE(h_strchr)  { return (uint64_t)(uintptr_t)strchr(CS(a0), (int)a1); }
 HLE(h_strrchr) { return (uint64_t)(uintptr_t)strrchr(CS(a0), (int)a1); }
 HLE(h_strstr)  { return (uint64_t)(uintptr_t)strstr(CS(a0), CS(a1)); }
+// BSD strlcpy/strlcat: bounded, always NUL-terminate; return the length they tried to build.
+HLE(h_strlcpy) {
+    const char* s = CS(a1); size_t n = a2, sl = strlen(s);
+    if (n) { size_t c = sl < n - 1 ? sl : n - 1; memcpy(P(a0), s, c); ((char*)P(a0))[c] = 0; }
+    return sl;
+}
+HLE(h_strlcat) {
+    char* d = (char*)P(a0); const char* s = CS(a1); size_t n = a2;
+    size_t dl = strnlen(d, n), sl = strlen(s);
+    if (dl < n) { size_t c = sl < n - dl - 1 ? sl : n - dl - 1; memcpy(d + dl, s, c); d[dl + c] = 0; }
+    return dl + sl;
+}
 
 HLE(h_malloc)  { return (uint64_t)(uintptr_t)malloc(a0); }
 HLE(h_calloc)  { return (uint64_t)(uintptr_t)calloc(a0, a1); }
@@ -153,6 +165,7 @@ void register_builtin_hle() {
     R("strcpy", h_strcpy);   R("strncpy", h_strncpy);
     R("strcat", h_strcat);   R("strncat", h_strncat);
     R("strchr", h_strchr);   R("strrchr", h_strrchr); R("strstr", h_strstr);
+    R("strlcpy", h_strlcpy); R("strlcat", h_strlcat);
     R("malloc", h_malloc);   R("calloc", h_calloc);   R("realloc", h_realloc); R("free", h_free);
     R("memalign", h_memalign); R("posix_memalign", h_posix_memalign); R("aligned_alloc", h_aligned_alloc);
     // operator new / new[] (+ nothrow), and aligned variants
