@@ -148,11 +148,17 @@ Turn the file into a resident, relocated guest image in host memory.
   runtime lock `L = *(r14+0x90)` (`call 0x1e2390` @0x1285fc) — a **mutex held by another thread**.
   The GC thread is parked on `SuspendSemaphore` (needs a resume). So a thread holds `L` across a
   GC stop-the-world suspend, and main wants `L` → classic stop-the-world lock-ordering deadlock.
-- [ ] **Frontier (correctness):** determine (a) whether a GC collection is being triggered
-      *during init* and, if so, why (premature — likely GC heap accounting fed by our memory HLE),
-      and (b) which thread holds `L` and how the suspend/resume protocol should let it release.
-      Fix the real cause (e.g. correct GC heap sizing so it doesn't collect mid-init, or correct
-      the suspend/resume semantics) — no forced unlocks. Tools: `PROSPER_SYNCLOG`, `boot_trace`, gdb.
+- [x] **SOLVED — GC stop-the-world deadlock.** It was the IL2CPP GC's thread suspension:
+      `sceKernelInstallExceptionHandler`(type 0x1e) + `sceKernelRaiseException`(thread,0x1e) were
+      stubbed→0, so threads were never interrupted/ack'd and the collector waited forever on
+      `SuspendSemaphore`. Implemented real async exception delivery (`pthread_sigqueue` RT signal →
+      SA_SIGINFO handler synthesises a FreeBSD mcontext → runs the guest handler on the target
+      thread) + real `setjmp`/`longjmp` (GC root-register flush). Boot now runs far past GC init.
+- [ ] **Frontier (correctness): IL2CPP marshaling abort.** A worker aborts at `Il2cpp+0x110d3`
+      (`ud2` after guest abort): *"field 'Instructions' of type 'InstructionArray': Reference type
+      field marshaling is not supported"*. Real PS5 shouldn't hit this → find why our env drives
+      IL2CPP into marshaling this type (branch at 0x110ad; wrong metadata value / eager marshaling /
+      speculative type-load on a worker). Disassemble the marshal-info builder around 0x110xx.
 
 ### M4 — Window + VideoOut + graphics-device init
 - [ ] `libSceVideoOut` → open an SDL3 window + Vulkan swapchain (headless offscreen for tests).
