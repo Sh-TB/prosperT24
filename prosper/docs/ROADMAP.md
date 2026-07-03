@@ -8,6 +8,20 @@ and x86-64 — but the GPU translation + shader recompiler alone are enormous.
 We build it as a sequence of **independently verifiable milestones**. Each one
 produces something concrete you can run and check.
 
+## Verification philosophy — agentic-first (non-negotiable)
+
+This project is built to be completed by **AI agents with no human in the loop**.
+Therefore **no milestone is "done" on human observation.** Every `Verify:` step
+below is a **programmatic, headless, self-checking** gate:
+- automated tests + assertions (exit code = truth),
+- structured, greppable logs (per-module call tracing behind flags),
+- deterministic golden snapshots (memory maps, call traces, **framebuffer pixel
+  hashes**) checked by CI, not by eye,
+- debugging tooling shipped alongside each feature (map dumpers, packet loggers,
+  disassembly helpers, headless render + hash compare).
+"A window opens" is never a criterion; "test asserts swapchain created, N frames
+presented, framebuffer CRC == golden" is. Each change adds the check that proves it.
+
 ---
 
 ### M0 — Recon & tooling ✅ (done)
@@ -42,23 +56,31 @@ Turn the file into a resident, relocated guest image in host memory.
 ### M4 — Window + VideoOut + AGC capture
 - [ ] `libSceVideoOut` → SDL3 window + Vulkan swapchain; flip/vsync.
 - [ ] `libSceAgc`/`AgcDriver` → capture command-buffer submissions; log/parse packets.
-- **Verify:** a window opens; we can dump the guest's per-frame GPU command stream.
+- **Verify (programmatic):** headless run asserts swapchain created + ≥N flips
+  presented; per-frame GPU command stream dumped to file and asserted to contain
+  the expected packet opcodes. No human viewing.
 
 ### M5 — GPU translation + shader recompiler (the big one)
 - [ ] Command/packet → Vulkan pipeline + draw translation; resource/descriptor mgmt.
 - [ ] Shader recompiler: GPU ISA decode → IR → SPIR-V; resource binding model.
-- **Verify:** **first correctly rendered frame** (title/splash).
+- **Verify (programmatic):** headless render to offscreen target; **framebuffer
+  pixel-hash matches a golden snapshot** (captured once, then regression-gated).
+  Shader recompiler has unit tests: ISA fixture → expected SPIR-V/behavior.
 
 ### M6 — Input + Audio
 - [ ] `libScePad` → SDL gamepad. `libSceAudioOut(2)` → host audio.
 - [ ] `libSceAjm` (ATRAC9/AAC decode); `libSceAvPlayer` (cutscenes) via ffmpeg.
-- **Verify:** menu navigable with a controller; music/SFX play.
+- **Verify (programmatic):** inject **synthetic pad input** → assert guest state
+  transitions in the call trace; assert audio-out ringbuffer receives non-silent
+  PCM (RMS > threshold); `libSceAjm` decode of a fixture matches a reference hash.
 
 ### M7 — Services & polish (playable)
 - [ ] `libSceSaveData` → host files; `libSceSystemService`/`UserService`.
 - [ ] `libSceNp*` stubs (single-player: trophies/presence no-op or local).
 - [ ] Dialogs (`MsgDialog`, `Ime`, `CommonDialog`).
-- **Verify:** boot → menu → gameplay; save/load works.
+- **Verify (programmatic):** a **scripted input sequence** drives boot→menu→gameplay
+  with no human; save then reload asserts state round-trips byte-for-byte; the full
+  boot call-trace is diffed against a golden trace.
 
 ---
 
