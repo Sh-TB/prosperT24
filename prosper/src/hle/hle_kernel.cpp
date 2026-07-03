@@ -135,6 +135,21 @@ HLE(k_attr_getstacksize) {
 // --- thread creation: run the guest entry on a real host thread (ABI matches) ---
 // We give each worker a stack we allocate and TRACK, so GC/thread-stack queries get
 // accurate bounds (see k_attr_get) without relying on pthread_getattr_np.
+#ifdef __linux__
+namespace {
+struct ThreadStart { void* (*entry)(void*); void* arg; void* sbase; uint64_t ssz; };
+// Runs first on the new thread: register our own stack (keyed by our tid) BEFORE any guest code,
+// so an early GC_register_my_thread / stack-base query from this thread finds it. Closes a race
+// where a fast-starting worker ran before the parent's post-create registration → "Bad stack base".
+void* thread_trampoline(void* p) {
+    auto* ts = (ThreadStart*)p;
+    if (ts->sbase) register_thread_stack((uint64_t)pthread_self(), ts->sbase, ts->ssz);
+    auto entry = ts->entry; void* arg = ts->arg; free(ts);
+    return entry ? entry(arg) : nullptr;
+}
+}
+#endif
+
 HLE(k_pthread_create) {
     auto entry = (void* (*)(void*))(uintptr_t)a2;
     void* arg  = (void*)(uintptr_t)a3;
@@ -150,11 +165,19 @@ HLE(k_pthread_create) {
     size_t ssz = 8 * 1024 * 1024;
     void* sbase = mmap(nullptr, ssz, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
-    if (sbase != MAP_FAILED) pthread_attr_setstack(at, sbase, ssz);
-    int r = pthread_create(&tid, at, entry, arg);
+    int r;
+    if (sbase != MAP_FAILED) {
+        pthread_attr_setstack(at, sbase, ssz);
+        auto* ts = (ThreadStart*)malloc(sizeof(ThreadStart));
+        ts->entry = entry; ts->arg = arg; ts->sbase = sbase; ts->ssz = ssz;
+        r = pthread_create(&tid, at, thread_trampoline, ts);   // trampoline registers the stack first
+        if (r) free(ts);
+    } else {
+        r = pthread_create(&tid, at, entry, arg);
+    }
     if (own) pthread_attr_destroy(&la);
     if (r) { if (sbase != MAP_FAILED) munmap(sbase, ssz); return (uint64_t)r; }
-    if (sbase != MAP_FAILED) register_thread_stack((uint64_t)tid, sbase, ssz);
+    if (sbase != MAP_FAILED) register_thread_stack((uint64_t)tid, sbase, ssz);  // redundant safety net
 #else
     pthread_attr_t* at = (a1 && *(void**)a1) ? (pthread_attr_t*)*(void**)a1 : nullptr;
     int r = pthread_create(&tid, at, entry, arg);
