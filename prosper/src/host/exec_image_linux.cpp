@@ -171,6 +171,19 @@ BootResult run_entry(const LoadedImage& img) {
         r.fault_rip = g_fault_rip;
         r.rbp = g_rbp; r.rsp = g_rsp; r.rax = g_rax;
         r.rdi = g_rdi; r.rsi = g_rsi; r.rdx = g_rdx;
+        // Walk the rbp chain for a backtrace, guarded so a bad frame can't crash us.
+        g_armed = true;
+        if (sigsetjmp(g_jb, 1) == 0) {
+            uint64_t bp = g_rbp;
+            for (int i = 0; i < 24 && bp > 0x10000; i++) {
+                uint64_t ret = *(uint64_t*)(bp + 8);
+                if (ret) r.backtrace.push_back(ret);
+                uint64_t nbp = *(uint64_t*)bp;
+                if (nbp <= bp) break;
+                bp = nbp;
+            }
+        }
+        g_armed = false;
     }
     return r;
 }

@@ -37,6 +37,7 @@ struct BootResult {
     std::string  detail;        // fault description
     uint64_t     fault_addr = 0, fault_rip = 0;
     uint64_t     rbp = 0, rsp = 0, rax = 0, rdi = 0, rsi = 0, rdx = 0; // regs at fault
+    std::vector<uint64_t> backtrace;   // return addresses (rbp chain) at the fault
 };
 // Run dependent-module init functions (C++ global ctors etc.) before entry. Each is
 // called under a per-thread recovery point; a faulting init is skipped (best-effort).

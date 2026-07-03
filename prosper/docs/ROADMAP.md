@@ -90,8 +90,18 @@ Turn the file into a resident, relocated guest image in host memory.
       with **`/app0` → dump-dir path translation** (real asset loading).
 - **Now**: the game's own IL2CPP code executes; boot advances through crt → C++/threads →
   memory → stdio → file I/O → locale/ctype init (`_Getpctype`).
-- [ ] Next: locale/ctype tables; per-thread TCB; the remaining libkernel/libScePosix; then
-      **`libSceVideoOut` (window/swapchain)** and **`libSceAgc` → Vulkan + shader recompiler**.
+- [x] Dependent-module `init_array` (C++ global ctors) now run before entry — the key
+      unlock that let IL2CPP's runtime initialize.
+- [x] locale/ctype tables; `sync_on_address` futex (Linux `futex(2)`); C++ new/delete; stdio.
+- [x] Fault backtrace (rbp-chain walk) for debugging deep crashes.
+- **The game's `main()` runs and prints output** (`"Argument Count = 1 … /app0/eboot.bin"`),
+  then initializes PS5 services: user (accessibility), NP/online state, **controller
+  (`scePadOpen`)**, mouse, AppContent, CommonDialog.
+- [ ] Current crash: eboot init (`eboot+0x146ed30` subtree) jumps through an uninitialized
+      function pointer into mapped memory — trace which init/callback is missing.
+- [ ] Then: per-thread TCB; implement the service functions that return handles/objects
+      (scePadOpen, user/NP); then **`libSceVideoOut` (window/swapchain)** and
+      **`libSceAgc` → Vulkan + RDNA2 shader recompiler** (first frame).
 - **Verify (programmatic, GREEN):** `tests/test_trap_linux.cpp` (map + identify 4
   representative imports) and `tests/test_boot_linux.cpp` (jump into real entry,
   assert it reaches an import trap). Both headless, exit-code = truth.
