@@ -1,6 +1,7 @@
 // exec_image_linux.cpp — Linux host backing + import trap (M2). Compiles to
 // nothing on non-Linux hosts so the shared build (mingw) is unaffected.
 #include "exec_image.hpp"
+#include "../hle/nid.hpp"
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -16,35 +17,47 @@ namespace {
     const Module* g_mod = nullptr;
     uint64_t g_stub_base = 0, g_stub_size = 0, g_nstubs = 0;
     sigjmp_buf g_jb;
+    // Signal handler is kept async-signal-safe: it only stores indices/addresses.
+    // All name resolution (which touches std::string / maps) happens after longjmp.
     volatile sig_atomic_t g_trap_kind = 0;
-    char g_trap_name[256];
+    volatile long         g_trap_index = -1;   // import index if kind==1
     void*    g_fault_addr = nullptr;
     uint64_t g_fault_rip = 0;
+    NidDb*   g_nid_db = nullptr;
 
     void segv_handler(int, siginfo_t* si, void* uctx) {
         uint64_t a = (uint64_t)si->si_addr;
         g_fault_addr = si->si_addr;
         auto* uc = (ucontext_t*)uctx;
         g_fault_rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
-        if (g_mod && a >= g_stub_base && a < g_stub_base + g_nstubs * g_stub_size) {
-            uint64_t idx = (a - g_stub_base) / g_stub_size;
-            if (idx < g_mod->imports.size()) {
-                const auto& im = g_mod->imports[idx];
-                snprintf(g_trap_name, sizeof g_trap_name, "%s::%s",
-                         im.lib_name.c_str(), im.nid.c_str());
-            } else {
-                snprintf(g_trap_name, sizeof g_trap_name, "<stub #%llu oob>", (unsigned long long)idx);
-            }
+        if (a >= g_stub_base && a < g_stub_base + g_nstubs * g_stub_size) {
+            g_trap_index = (long)((a - g_stub_base) / g_stub_size);
             g_trap_kind = 1;
         } else {
-            snprintf(g_trap_name, sizeof g_trap_name, "<non-stub fault at %p, rip=0x%llx>",
-                     si->si_addr, (unsigned long long)g_fault_rip);
+            g_trap_index = -1;
             g_trap_kind = 2;
         }
         siglongjmp(g_jb, 1);
     }
 
-    uint64_t page_dn(uint64_t v) { return v & ~((uint64_t)0xfff); }
+    // Build a human-readable description of the last trap. Safe (post-longjmp) context.
+    std::string trap_detail() {
+        char buf[320];
+        if (g_trap_kind == 1 && g_mod && g_trap_index >= 0 &&
+            (size_t)g_trap_index < g_mod->imports.size()) {
+            const auto& im = g_mod->imports[g_trap_index];
+            std::string name = g_nid_db ? g_nid_db->resolve(im.nid) : std::string();
+            if (!name.empty())
+                snprintf(buf, sizeof buf, "%s::%s  [%s]", im.lib_name.c_str(), im.nid.c_str(), name.c_str());
+            else
+                snprintf(buf, sizeof buf, "%s::%s", im.lib_name.c_str(), im.nid.c_str());
+        } else {
+            snprintf(buf, sizeof buf, "<non-stub fault at %p, rip=0x%llx>",
+                     g_fault_addr, (unsigned long long)g_fault_rip);
+        }
+        return buf;
+    }
+
     uint64_t page_up(uint64_t v) { return (v + 0xfff) & ~((uint64_t)0xfff); }
 }
 
@@ -76,6 +89,7 @@ bool map_image(const Module& m, const LoadedImage& img,
 }
 
 void install_trap_handler() {
+    if (!g_nid_db) g_nid_db = new NidDb();     // seed the readable-name dictionary once
     struct sigaction sa{};
     sa.sa_sigaction = segv_handler;
     sa.sa_flags = SA_SIGINFO;
@@ -85,13 +99,13 @@ void install_trap_handler() {
 }
 
 int invoke_stub(uint64_t idx, std::string* name_out) {
-    g_trap_kind = 0; g_trap_name[0] = 0;
+    g_trap_kind = 0; g_trap_index = -1;
     if (sigsetjmp(g_jb, 1) == 0) {
         auto fn = (void(*)())(g_stub_base + idx * g_stub_size);
         fn();                    // jumps into PROT_NONE stub -> faults -> handler
         return 0;                // should never reach here
     }
-    if (name_out) *name_out = g_trap_name;
+    if (name_out) *name_out = trap_detail();
     return (int)g_trap_kind;
 }
 
@@ -120,7 +134,7 @@ BootResult run_entry(const LoadedImage& img) {
     uint64_t rdi = sp;               // Sony crt: rdi -> {argc, argv...}
     uint64_t rsi = 0;
 
-    g_trap_kind = 0; g_trap_name[0] = 0; g_fault_addr = nullptr; g_fault_rip = 0;
+    g_trap_kind = 0; g_trap_index = -1; g_fault_addr = nullptr; g_fault_rip = 0;
     if (sigsetjmp(g_jb, 1) == 0) {
         register uint64_t e  asm("rax") = img.entry;
         register uint64_t s  asm("r8")  = sp;
@@ -136,7 +150,7 @@ BootResult run_entry(const LoadedImage& img) {
         r.kind = 0; r.detail = "entry returned without faulting"; // unreachable normally
     } else {
         r.kind = (int)g_trap_kind;
-        r.detail = g_trap_name;
+        r.detail = trap_detail();
         r.fault_addr = (uint64_t)g_fault_addr;
         r.fault_rip = g_fault_rip;
     }

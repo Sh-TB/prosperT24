@@ -53,7 +53,9 @@ Turn the file into a resident, relocated guest image in host memory.
 - [x] Minimal bootstrap: SysV initial stack + `argc/argv` block; jump to entry.
 - [x] **Guest executes**: `eboot` crt runs and traps at its **first Sony call**
       (`libc::bzQExy189ZI`). *This is the "it's alive" moment.* ✅
-- [ ] NID hash (SHA1+salt+base64) + name↔NID DB so traps read as real function names.
+- [x] NID hash (SHA1 + 16-byte salt + Sony base64) + name↔NID DB; traps now print
+      readable names (`src/hle/nid.{hpp,cpp}`). Validated: `memcpy`→`Q3VBxCXhUHs`,
+      105/159 dictionary names resolve real eboot imports.
 - [ ] Turn traps into a real HLE **dispatch** (call → handler → return) instead of halt.
 - [ ] TLS setup (`%fs` base) — needed before much libc/libkernel runs.
 - **Verify (programmatic, GREEN):** `tests/test_trap_linux.cpp` (map + identify 4

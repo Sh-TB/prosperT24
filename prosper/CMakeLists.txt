@@ -38,6 +38,11 @@ if(TARGET prosper_core)
   add_test(NAME module_loads_eboot
            COMMAND test_module "${GAME_DUMP}/eboot.bin")
 
+  add_executable(test_nid tests/test_nid.cpp)
+  target_link_libraries(test_nid PRIVATE prosper_core)
+  add_test(NAME nid_hash_matches_imports
+           COMMAND test_nid "${GAME_DUMP}/eboot.bin")
+
   # M2: real memory mapping + import trap (Linux only).
   if(UNIX AND NOT APPLE)
     add_executable(test_trap_linux tests/test_trap_linux.cpp)
