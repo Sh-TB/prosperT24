@@ -56,6 +56,10 @@ const std::vector<uint32_t>& call_order();
 // first-seen unimplemented call. Survives across fork() so a crash-prone deep boot can
 // still be measured by a parent process.
 void dispatch_set_progress(volatile int* counter);
+// Optional external counter incremented on each sceKernelRaiseException delivery (the GC's
+// stop-the-world). Also fork-safe. Used by tests to prove the boot reached — and got through —
+// the IL2CPP GC thread-suspension handshake (a regression guard for the deadlock/GC fixes).
+void set_exc_raise_counter(volatile int* counter);
 // Print the accumulated unimplemented-call trace (index, lib::nid [name], count).
 void dump_call_log(FILE* f);
 void reset_call_log();

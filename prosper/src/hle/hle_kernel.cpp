@@ -249,6 +249,7 @@ HLE(k_sema_poll)   { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n
 namespace {
 uint64_t g_exc_handlers[128] = {0};   // guest handler fn ptr, indexed by exception type
 bool g_exc_log = false;               // set once (outside signal ctx) from PROSPER_SYNCLOG
+volatile int* g_exc_counter = nullptr; // optional fork-safe raise counter (tests)
 #ifdef __linux__
 int  g_exc_sig = -1;
 void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
@@ -301,6 +302,7 @@ HLE(k_install_exc_handler) {   // (exceptionType, handler, ...)
 }
 HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionType, arg)
     ensure_exc_sig();
+    if (g_exc_counter) (*g_exc_counter)++;
     if (getenv("PROSPER_SYNCLOG"))
         fprintf(stderr, "[exc] T%ld raise target=0x%llx type=0x%llx\n",
                 sctid(), (unsigned long long)a0, (unsigned long long)a1);
@@ -312,6 +314,8 @@ HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionTyp
 #endif
     return 0;
 }
+
+void set_exc_raise_counter(volatile int* counter) { g_exc_counter = counter; }
 
 void register_kernel_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)

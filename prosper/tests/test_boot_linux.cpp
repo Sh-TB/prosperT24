@@ -43,6 +43,11 @@ int main(int argc, char** argv) {
 
     volatile int* p = (volatile int*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     *p = 0; dispatch_set_progress(p);
+    // Fork-safe counter for GC stop-the-world exception deliveries. This is only reached deep in
+    // il2cpp_init, *after* the 15-thread GC handshake that used to deadlock — so a non-zero count
+    // proves the deadlock fix + the exception-based thread suspension + stack scanning all work.
+    volatile int* ex = (volatile int*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    *ex = 0; set_exc_raise_counter(ex);
 
     printf("  entry=0x%llx  %zu dependent-module init fns  running guest in a child...\n",
            (unsigned long long)prog.entry, prog.init_fns.size());
@@ -52,15 +57,22 @@ int main(int argc, char** argv) {
     int st; if (waitpid(pid, &st, WNOHANG) == 0) { kill(pid, SIGKILL); waitpid(pid, &st, 0); }
 
     int reached = *p;
-    printf("  guest reached %d distinct unimplemented system calls before stopping\n", reached);
-    // Note: this count *drops* as we implement more functions (the boot then advances to
-    // new, deeper unimplemented calls). >=3 robustly proves the full pipeline works:
-    // link -> map -> stubs -> crt -> heap -> virtual memory -> engine/game code.
+    int raises  = *ex;
+    printf("  guest reached %d distinct unimplemented system calls; %d GC stop-the-world exception(s)\n",
+           reached, raises);
+    // (1) unimpl count *drops* as we implement more functions (boot then advances to new, deeper
+    // calls). >=3 robustly proves the pipeline: link -> map -> stubs -> crt -> heap -> vmem -> game.
     const int THRESHOLD = 3;
-    if (reached >= THRESHOLD) {
-        printf("\n== PASS: linked program booted through init into engine/game code (%d >= %d) ==\n", reached, THRESHOLD);
+    // (2) >=1 exception raise proves the boot got *through* the IL2CPP GC thread-suspension
+    // handshake (the deadlock we fixed) and ran the exception-based stop-the-world + stack scan.
+    bool pipeline = reached >= THRESHOLD;
+    bool gc_stw   = raises  >= 1;
+    if (pipeline && gc_stw) {
+        printf("\n== PASS: booted into IL2CPP and through GC stop-the-world (%d>=%d unimpl, %d>=1 raise) ==\n",
+               reached, THRESHOLD, raises);
         return 0;
     }
-    printf("\n== FAIL: stalled early (%d < %d) ==\n", reached, THRESHOLD);
+    if (!pipeline) printf("\n== FAIL: stalled early (%d < %d unimpl) ==\n", reached, THRESHOLD);
+    if (!gc_stw)   printf("\n== FAIL: GC stop-the-world never ran (%d raises) — deadlock/GC regression? ==\n", raises);
     return 2;
 }

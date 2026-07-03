@@ -60,5 +60,10 @@ if(TARGET prosper_core)
     target_link_libraries(test_boot_linux PRIVATE prosper_core)
     add_test(NAME boot_reaches_first_syscall
              COMMAND test_boot_linux "${GAME_DUMP}")
+
+    # Regression test for the real setjmp/longjmp impl (x86-64 asm; used by the GC's root scan).
+    add_executable(test_setjmp tests/test_setjmp.cpp)
+    target_link_libraries(test_setjmp PRIVATE prosper_core)
+    add_test(NAME setjmp_saves_and_restores COMMAND test_setjmp)
   endif()
 endif()
