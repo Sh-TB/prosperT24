@@ -17,9 +17,11 @@ std::string nid_hash(const std::string& name);
 // name <-> NID dictionary. Seed with known names; look up by NID.
 class NidDb {
 public:
-    NidDb();                                   // seeds a built-in common-symbol list
+    NidDb();                                   // seeds built-ins + known_names.txt if found
     void add(const std::string& name);         // hashes and registers one name
     void add_many(const std::vector<std::string>& names);
+    // Hash every newline-separated symbol name in `path` into the DB. Returns count added.
+    size_t load_names_file(const std::string& path);
     // Resolve a NID to a name, or "" if unknown.
     const std::string& resolve(const std::string& nid) const;
     size_t size() const { return by_nid_.size(); }

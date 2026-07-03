@@ -6,6 +6,23 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#ifdef _WIN32
+#include <malloc.h>   // _aligned_malloc
+#endif
+
+namespace prosper {
+// Portable aligned allocation (POSIX posix_memalign / Windows _aligned_malloc).
+// NOTE: on Windows these need _aligned_free; the guest doesn't run on Windows yet,
+// so h_free's plain free() is fine for now (Linux is the runtime target).
+static void* aligned_alloc_portable(size_t align, size_t size) {
+#ifdef _WIN32
+    return _aligned_malloc(size, align);
+#else
+    void* p = nullptr;
+    return posix_memalign(&p, align, size) == 0 ? p : nullptr;
+#endif
+}
+} // namespace prosper
 
 namespace prosper {
 
@@ -37,6 +54,20 @@ HLE(h_malloc)  { return (uint64_t)(uintptr_t)malloc(a0); }
 HLE(h_calloc)  { return (uint64_t)(uintptr_t)calloc(a0, a1); }
 HLE(h_realloc) { return (uint64_t)(uintptr_t)realloc(P(a0), a1); }
 HLE(h_free)    { free(P(a0)); return 0; }
+// memalign(alignment, size): aligned allocation. Normalize alignment to a valid
+// power-of-two >= sizeof(void*) for posix_memalign.
+HLE(h_memalign) {
+    uint64_t al = a0 < sizeof(void*) ? sizeof(void*) : a0;
+    if (al & (al - 1)) { uint64_t p = sizeof(void*); while (p < al) p <<= 1; al = p; } // round up to pow2
+    return (uint64_t)(uintptr_t)aligned_alloc_portable(al, a1);
+}
+HLE(h_posix_memalign) {
+    void* p = aligned_alloc_portable(a1, a2);
+    if (!p) return 12; // ENOMEM
+    *(void**)P(a0) = p;
+    return 0;
+}
+HLE(h_aligned_alloc)  { return (uint64_t)(uintptr_t)aligned_alloc_portable(a0, a1); }
 
 // C++/CRT lifecycle: we don't run global destructors, so registration is a no-op.
 HLE(h_atexit)      { return 0; }
@@ -46,6 +77,22 @@ HLE(h_cxa_finalize){ return 0; }
 HLE(h_guard_acquire) { uint8_t* g = (uint8_t*)P(a0); return (*g) ? 0 : 1; }
 HLE(h_guard_release) { uint8_t* g = (uint8_t*)P(a0); *g = 1; return 0; }
 HLE(h_guard_abort)   { return 0; }
+
+// std::_Execute_once(once_flag&, int(*cb)(void*,void*,void**), void* arg) — the guts
+// of std::call_once. It MUST invoke the callback (which runs the real one-time init),
+// exactly once per flag, and return nonzero on success (call_once throws on 0).
+HLE(h_execute_once) {
+    uint32_t* flag = (uint32_t*)P(a0);
+    if (flag && *flag) return 1;                 // already executed
+    auto cb = (int (*)(void*, void*, void**))P(a1);
+    int r = 1;
+    if (cb) { void* ctx = nullptr; r = cb((void*)P(a0), (void*)P(a2), &ctx); }
+    if (flag) *flag = 1;
+    return (uint64_t)(r ? 1 : 0);
+}
+// C++ exception refcounting — no-op is safe for the non-throwing boot path.
+HLE(h_cxa_dec_refcount) { return 0; }
+HLE(h_cxa_inc_refcount) { return 0; }
 
 void register_builtin_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
@@ -57,11 +104,16 @@ void register_builtin_hle() {
     R("strcat", h_strcat);   R("strncat", h_strncat);
     R("strchr", h_strchr);   R("strrchr", h_strrchr); R("strstr", h_strstr);
     R("malloc", h_malloc);   R("calloc", h_calloc);   R("realloc", h_realloc); R("free", h_free);
+    R("memalign", h_memalign); R("posix_memalign", h_posix_memalign); R("aligned_alloc", h_aligned_alloc);
     R("atexit", h_atexit);   R("__cxa_atexit", h_cxa_atexit); R("__cxa_finalize", h_cxa_finalize);
     R("__cxa_guard_acquire", h_guard_acquire);
     R("__cxa_guard_release", h_guard_release);
     R("__cxa_guard_abort",   h_guard_abort);
+    R("_ZSt13_Execute_onceRSt9once_flagPFiPvS1_PS1_ES1_", h_execute_once);  // std::call_once core
+    R("__cxa_decrement_exception_refcount", h_cxa_dec_refcount);
+    R("__cxa_increment_exception_refcount", h_cxa_inc_refcount);
     #undef R
+    register_kernel_hle();   // libkernel primitives (pthread/sync/...)
 }
 
 } // namespace prosper

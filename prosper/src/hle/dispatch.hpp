@@ -26,8 +26,13 @@ public:
 // Wire the unimplemented-call logger to the running module + name DB.
 void dispatch_init(const Module* m, NidDb* db);
 
-// Register the built-in HLE implementations (libc thunks, CRT no-ops). Call before install_stubs.
+// Register the built-in HLE implementations (libc thunks, CRT no-ops, libkernel
+// primitives). Call before install_stubs.
 void register_builtin_hle();
+// libkernel primitives (pthread/sync/etc.); called by register_builtin_hle().
+void register_kernel_hle();
+// libkernel virtual/direct memory (Linux backing); called by register_kernel_hle().
+void register_kernel_mem_hle();
 
 // The default target for unimplemented imports: logs (first-seen) and returns 0.
 // Called by generated stubs with the import index in the first arg.

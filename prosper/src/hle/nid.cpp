@@ -1,5 +1,7 @@
 #include "nid.hpp"
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 namespace prosper {
 
@@ -74,9 +76,31 @@ std::string nid_hash(const std::string& name) {
 }
 
 // ---- NidDb -----------------------------------------------------------------
-NidDb::NidDb() { add_many(builtin_symbol_names()); }
+NidDb::NidDb() {
+    add_many(builtin_symbol_names());
+    // Load the big known-symbol list (idc/ps4libdoc) if available, so traces name
+    // the whole import surface. Env override first, then the compiled-in source path.
+    if (const char* env = getenv("PROSPER_NIDDB")) { if (load_names_file(env)) return; }
+#ifdef PROSPER_SOURCE_DIR
+    load_names_file(PROSPER_SOURCE_DIR "/data/known_names.txt");
+#endif
+}
 void NidDb::add(const std::string& name) { by_nid_[nid_hash(name)] = name; }
 void NidDb::add_many(const std::vector<std::string>& names) { for (auto& n : names) add(n); }
+size_t NidDb::load_names_file(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return 0;
+    size_t n = 0; char line[512];
+    while (fgets(line, sizeof line, f)) {
+        char* p = line;
+        if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3; // BOM
+        size_t len = strlen(p);
+        while (len && (p[len-1] == '\n' || p[len-1] == '\r' || p[len-1] == ' ')) p[--len] = 0;
+        if (len) { by_nid_[nid_hash(p)] = p; n++; }
+    }
+    fclose(f);
+    return n;
+}
 const std::string& NidDb::resolve(const std::string& nid) const {
     auto it = by_nid_.find(nid);
     return it == by_nid_.end() ? empty_ : it->second;
@@ -103,7 +127,16 @@ const std::vector<std::string>& builtin_symbol_names() {
         // pthread (Sony scePthread + posix names)
         "scePthreadCreate","scePthreadJoin","scePthreadExit","scePthreadMutexInit",
         "scePthreadMutexLock","scePthreadMutexUnlock","scePthreadMutexDestroy",
+        "scePthreadMutexTrylock","scePthreadMutexTimedlock",
+        "scePthreadMutexattrInit","scePthreadMutexattrDestroy","scePthreadMutexattrSettype",
+        "scePthreadMutexattrSetprotocol","scePthreadMutexattrSetpshared","scePthreadMutexattrGettype",
         "scePthreadCondInit","scePthreadCondWait","scePthreadCondSignal","scePthreadCondBroadcast",
+        "scePthreadCondDestroy","scePthreadCondTimedwait","scePthreadCondattrInit","scePthreadCondattrDestroy",
+        "scePthreadSelf","scePthreadOnce","scePthreadKeyCreate","scePthreadSetspecific","scePthreadGetspecific",
+        "scePthreadKeyDelete","scePthreadEqual","scePthreadYield","scePthreadDetach",
+        "scePthreadAttrInit","scePthreadAttrDestroy","scePthreadAttrSetstacksize","scePthreadAttrSetdetachstate",
+        "scePthreadAttrSetinheritsched","scePthreadAttrSetschedparam","scePthreadRename","scePthreadSetprio","scePthreadGetprio",
+        "scePthreadRwlockInit","scePthreadRwlockDestroy","scePthreadRwlockRdlock","scePthreadRwlockWrlock","scePthreadRwlockUnlock",
         "pthread_create","pthread_join","pthread_mutex_lock","pthread_mutex_unlock",
         "pthread_cond_wait","pthread_cond_signal","pthread_self","pthread_once",
         // libkernel memory

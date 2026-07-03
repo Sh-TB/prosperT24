@@ -19,6 +19,9 @@ prosper/build-*/
 *.lib
 compile_commands.json
 
+# ---- Third-party data not for redistribution (fetch via tools/fetch_niddb.sh) ----
+/prosper/data/known_names.txt
+
 # ---- Editor / OS ----
 .vscode/
 .idea/

@@ -61,8 +61,19 @@ Turn the file into a resident, relocated guest image in host memory.
       boot advances (`src/hle/dispatch.*`, stubs in `exec_image_linux.cpp`).
 - [x] First HLE module: `src/hle/hle_libc.cpp` — libc thunks (mem/str/heap) + CRT
       no-ops, registered by NID. Boot trace now shows the real startup call order.
-- [ ] TLS setup (`%fs` base) — the boot null-derefs at image+0x89eafa; first crt call
-      `libc::bzQExy189ZI` (likely TLS/`__tls_get_addr`) returns 0. Next target.
+- [x] Stack alignment fixed (Sony crt wants entry rsp ≡ 8 mod 16); boot clears
+      C++ static init.
+- [x] NID name DB integrated: `known_names.txt` (idc/ps4libdoc, 42k names) auto-loaded
+      into `NidDb` → 476/612 imports named in traces. (Fetch via `tools/fetch_niddb.sh`.)
+- [x] libc: mem/str/heap (+`memalign`), `std::call_once` (`_Execute_once`), CRT no-ops.
+- [x] libkernel: pthread mutex/cond (+attrs), `scePthreadSelf`; virtual/direct **memory**
+      (`sceKernelReserveVirtualRange`, `MapNamedFlexibleMemory`, `AllocateDirectMemory`,
+      `MapDirectMemory`, `Munmap`, `Mprotect`, `VirtualQuery`) backed by host mmap.
+- **Boot now runs**: crt → C++ global/`call_once` init → pthread/mutex init → heap →
+  virtual-memory reservation & mapping → deep into engine init. Only `_init_env` still
+  stubbed; current wall is a memory-region overrun at image+0x17968cd (mapping-size model).
+- [ ] Next: refine the memory model (track mappings; correct region sizes), `_init_env`,
+      TLS (`%fs`), then the climb toward VideoOut + AGC.
 - **Verify (programmatic, GREEN):** `tests/test_trap_linux.cpp` (map + identify 4
   representative imports) and `tests/test_boot_linux.cpp` (jump into real entry,
   assert it reaches an import trap). Both headless, exit-code = truth.

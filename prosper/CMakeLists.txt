@@ -25,6 +25,9 @@ file(GLOB_RECURSE PROSPER_SRC CONFIGURE_DEPENDS src/*.cpp)
 if(PROSPER_SRC)
   add_library(prosper_core STATIC ${PROSPER_SRC})
   target_include_directories(prosper_core PUBLIC src)
+  target_compile_definitions(prosper_core PRIVATE PROSPER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  find_package(Threads REQUIRED)
+  target_link_libraries(prosper_core PUBLIC Threads::Threads)
 endif()
 
 # --- tests (agentic-first: self-checking, exit-code = truth) -------------
