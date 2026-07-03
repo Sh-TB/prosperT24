@@ -38,7 +38,28 @@ namespace {
     uint64_t g_rbp = 0, g_rsp = 0, g_rax = 0, g_rdi = 0, g_rsi = 0, g_rdx = 0;
     NidDb*   g_nid_db = nullptr;
 
+    // GPU virtual-address window that we back lazily. The PS5 has unified CPU/GPU memory, so GPU
+    // VAs are real RAM; the guest builds GPU structures at these high addresses. We map a real
+    // zeroed page on first touch (a faithful memory model). NOTE: contents are zero until the
+    // AGC/driver layer is real — this is a documented bring-up placeholder, not faked output. Low
+    // addresses (genuine null derefs) are deliberately excluded so real bugs still fault.
+    static constexpr uint64_t GPU_VA_LO = 0x100000000ull;   // 4 GiB
+    static constexpr uint64_t GPU_VA_HI = 0x1000000000ull;  // 64 GiB
+    volatile sig_atomic_t g_lazy_pages = 0;                 // count (diagnostic)
+
     void fault_handler(int sig, siginfo_t* si, void* uctx) {
+        // Lazy unified-memory backing: back an unmapped GPU-VA page on demand and retry.
+        if (sig == SIGSEGV && si->si_addr) {
+            uint64_t a = (uint64_t)si->si_addr;
+            if (a >= GPU_VA_LO && a < GPU_VA_HI) {
+                void* page = (void*)(a & ~(uint64_t)0xfff);
+                if (mmap(page, 0x1000, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page) {
+                    g_lazy_pages++;
+                    return;   // re-execute the faulting instruction against the now-mapped page
+                }
+            }
+        }
         g_fault_addr = si->si_addr;
         auto* uc = (ucontext_t*)uctx;
         auto& g = uc->uc_mcontext.gregs;
