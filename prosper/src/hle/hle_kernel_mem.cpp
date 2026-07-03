@@ -8,6 +8,10 @@
 
 #ifdef __linux__
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
+#include <unistd.h>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -187,6 +191,27 @@ HLE(k_virtual_query) {
     return 0;
 }
 
+// libkernel_sync_on_address — PS5 futex. Guest and host share the address space, so the
+// wait address is a real host address we can pass to Linux futex(2). Signature inferred
+// as wait(addr, expectedValue32, ...) / wake(addr, count). First calls log their args so
+// we can confirm the ABI.
+HLE(k_wait_on_address) {
+    static std::atomic<int> logn{0};
+    if (logn++ < 6) MLOG("wait_on_address(addr=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx)\n",
+                         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
+    if (!a0) return 0;
+    syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, (uint32_t)a1, nullptr, nullptr, 0);
+    return 0;
+}
+HLE(k_wake_by_address) {
+    static std::atomic<int> logn{0};
+    if (logn++ < 6) MLOG("wake_by_address(addr=0x%llx a1=0x%llx)\n", (unsigned long long)a0, (unsigned long long)a1);
+    if (!a0) return 0;
+    int n = a1 ? (int)a1 : INT_MAX;
+    syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, n, nullptr, nullptr, 0);
+    return 0;
+}
+
 HLE(k_munmap)   { if (a0) munmap((void*)a0, a1); return 0; }
 HLE(k_mprotect) { if (a0) mprotect((void*)a0, a1, host_prot(a2)); return 0; }
 HLE(k_dmem_size){ return 8ull * 1024 * 1024 * 1024; }   // 8 GiB pool
@@ -207,6 +232,9 @@ void register_kernel_mem_hle() {
     R("sceKernelGetDirectMemorySize", k_dmem_size);
     R("sceKernelAvailableDirectMemorySize", k_dmem_size);
     #undef R
+    // sync_on_address futex — registered by raw NID (names not in any public DB yet).
+    Hle::register_fn("Hc4CaR6JBL0", (HleFn)k_wait_on_address, "sceKernelWaitOnAddress?");
+    Hle::register_fn("q2y-wDIVWZA", (HleFn)k_wake_by_address, "sceKernelWakeByAddress?");
 }
 
 } // namespace prosper
