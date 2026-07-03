@@ -43,8 +43,10 @@ void set_app0_root(const std::string& root) { g_app0 = root; }
 // guest expects: 0x78 bytes, different field order. Writing the host layout (144 bytes,
 // different offsets) both gives wrong values AND overruns the guest's 0x78-byte buffer
 // (smashing an adjacent stack canary). Fields per FreeBSD 9 <sys/stat.h>.
-namespace {
-    void to_sce_stat(const struct stat& s, uint8_t* out) {
+// Translate a host `struct stat` into the guest's FreeBSD-layout SceKernelStat (0x78 bytes).
+// Exposed (not file-local) so tests can guard the layout — writing the wrong size/offsets here
+// once smashed a guest stack canary (st_size must land at 0x48, st_mode at 0x08, total 0x78).
+void to_sce_stat(const struct stat& s, uint8_t* out) {
         memset(out, 0, 0x78);
         *(uint32_t*)(out + 0x00) = (uint32_t)s.st_dev;
         *(uint32_t*)(out + 0x04) = (uint32_t)s.st_ino;
@@ -59,7 +61,6 @@ namespace {
         *(int64_t*)(out + 0x48)  = s.st_size;
         *(int64_t*)(out + 0x50)  = s.st_blocks;
         *(uint32_t*)(out + 0x58) = (uint32_t)s.st_blksize;
-    }
 }
 
 // --- stdio FILE* ---

@@ -50,6 +50,10 @@ if(TARGET prosper_core)
   target_link_libraries(test_hle_registered PRIVATE prosper_core)
   add_test(NAME hle_functions_registered COMMAND test_hle_registered)
 
+  add_executable(test_stat tests/test_stat.cpp)
+  target_link_libraries(test_stat PRIVATE prosper_core)
+  add_test(NAME sce_stat_layout COMMAND test_stat)
+
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux only).
   if(UNIX AND NOT APPLE)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
