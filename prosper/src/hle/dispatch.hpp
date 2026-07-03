@@ -41,6 +41,8 @@ void register_file_hle();
 void set_app0_root(const std::string& root);
 // PS5 system services (user/NP/pad/mouse/appcontent/dialog); called by register_builtin_hle().
 void register_service_hle();
+// Headless graphics bring-up (libSceAgc/libSceVideoOut placeholders); see hle_graphics.cpp.
+void register_graphics_hle();
 // libkernel virtual/direct memory (Linux backing); called by register_kernel_hle().
 void register_kernel_mem_hle();
 // libkernel time/clock + C11 threads + assorted stubs; called by register_kernel_hle().

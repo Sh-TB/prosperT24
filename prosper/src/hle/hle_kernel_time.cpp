@@ -69,8 +69,26 @@ HLE(m_cnd_broadcast){ if (a0 && *(void**)P(a0)) pthread_cond_broadcast((pthread_
 HLE(m_cnd_wait)   { if (a0 && *(void**)P(a0) && a1 && *(void**)P(a1)) pthread_cond_wait((pthread_cond_t*)*(void**)P(a0), (pthread_mutex_t*)*(void**)P(a1)); return 0; }
 HLE(m_cnd_destroy){ if (a0 && *(void**)P(a0)) { pthread_cond_destroy((pthread_cond_t*)*(void**)P(a0)); free(*(void**)P(a0)); } return 0; }
 
+// --- event queue (sceKernelEqueue): kqueue-like event mechanism the engine uses for vsync/flip
+// and async I/O completion. Headless: give a valid queue object; WaitEqueue yields briefly and
+// reports no events (callers time out and retry) so nothing busy-spins and no null queue is used. ---
+HLE(k_eq_create) { if (a0) *(void**)P(a0) = calloc(1, 64); return 0; }   // *eq = valid opaque queue
+HLE(k_eq_delete) { if (a0) free(P(a0)); return 0; }
+HLE(k_eq_wait)   {   // (eq, ev*, num, out*, timeout*): brief yield, 0 events ready
+    struct timespec ts{ 0, 1 * 1000 * 1000 }; nanosleep(&ts, nullptr);
+    if (a3) *(int32_t*)P(a3) = 0;
+    return 0;
+}
+HLE(k_eq_getcount){ return 0; }
+
 void register_kernel_time_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+    R("sceKernelCreateEqueue", k_eq_create);   R("sceKernelDeleteEqueue", k_eq_delete);
+    R("sceKernelWaitEqueue", k_eq_wait);        R("sceKernelGetEventCount", k_eq_getcount);
+    R("sceKernelAddHRTimerEvent", k_ok);        R("sceKernelAddUserEvent", k_ok);
+    R("sceKernelAddUserEventEdge", k_ok);       R("sceKernelTriggerUserEvent", k_ok);
+    R("sceKernelDeleteUserEvent", k_ok);        R("sceKernelDeleteHRTimerEvent", k_ok);
+    R("sceKernelDeleteTimerEvent", k_ok);       R("sceKernelAddTimerEvent", k_ok);
     R("sceKernelGetProcessTimeCounter", k_get_ptc);
     R("sceKernelGetProcessTimeCounterFrequency", k_get_ptc_freq);
     R("sceKernelGetProcessTime", k_get_proc_time);

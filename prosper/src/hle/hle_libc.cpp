@@ -270,7 +270,7 @@ void register_builtin_hle() {
     R("_ZdlPvRKSt9nothrow_t", h_delete); R("_ZdaPvRKSt9nothrow_t", h_delete);
     // stdio
     R("vsnprintf", h_vsnprintf); R("vsprintf", h_vsprintf);
-    R("snprintf", h_snprintf);   R("sprintf", h_sprintf);
+    R("snprintf", h_snprintf);   R("sprintf", h_sprintf);   R("snprintf_s", h_snprintf);
     R("printf", h_printf);       R("puts", h_puts);
     R("putchar", h_putchar);     R("fputs", h_fputs);
     // locale / ctype
@@ -304,6 +304,7 @@ void register_builtin_hle() {
     #undef R
     register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)
     register_service_hle();  // PS5 system services (user/NP/pad/mouse/appcontent)
+    register_graphics_hle(); // headless libSceAgc/libSceVideoOut placeholders (bring-up)
     register_kernel_hle();   // libkernel primitives (pthread/sync/...)
 }
 

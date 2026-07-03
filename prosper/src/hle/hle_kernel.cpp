@@ -366,6 +366,9 @@ void register_kernel_hle() {
     R("scePthreadAttrGet", k_attr_get);
     R("scePthreadAttrGetstackaddr", k_attr_getstackaddr);
     R("scePthreadAttrGetstacksize", k_attr_getstacksize);
+    R("scePthreadGetschedparam", k_attr_noop);  R("pthread_getschedparam", k_attr_noop);
+    R("scePthreadSetschedparam", k_attr_noop);  R("scePthreadSetprio", k_attr_noop);
+    R("scePthreadGetprio", k_attr_noop);
     R("scePthreadGetstack", k_attr_getstackaddr);
     // TLS keys (POSIX + Sony names -> host pthread keys)
     R("pthread_key_create", k_key_create);   R("scePthreadKeyCreate", k_key_create);
