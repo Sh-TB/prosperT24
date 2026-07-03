@@ -33,6 +33,8 @@ void register_builtin_hle();
 void register_kernel_hle();
 // libkernel virtual/direct memory (Linux backing); called by register_kernel_hle().
 void register_kernel_mem_hle();
+// libkernel time/clock + C11 threads + assorted stubs; called by register_kernel_hle().
+void register_kernel_time_hle();
 
 // The default target for unimplemented imports: logs (first-seen) and returns 0.
 // Called by generated stubs with the import index in the first arg.
@@ -40,6 +42,10 @@ extern "C" uint64_t prosper_on_unimpl(uint64_t import_index);
 
 // First-seen order of unimplemented import indices called by the guest.
 const std::vector<uint32_t>& call_order();
+// Optional external progress counter (e.g. shared memory), incremented once per
+// first-seen unimplemented call. Survives across fork() so a crash-prone deep boot can
+// still be measured by a parent process.
+void dispatch_set_progress(volatile int* counter);
 // Print the accumulated unimplemented-call trace (index, lib::nid [name], count).
 void dump_call_log(FILE* f);
 void reset_call_log();

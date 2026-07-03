@@ -14,7 +14,10 @@ namespace {
     // unimplemented-call bookkeeping
     std::vector<uint32_t>            g_order;      // first-seen import indices
     std::unordered_map<uint32_t, uint64_t> g_count; // index -> call count
+    volatile int*                    g_progress = nullptr;
 }
+
+void dispatch_set_progress(volatile int* counter) { g_progress = counter; }
 
 void Hle::register_fn(const std::string& nid, HleFn fn, const char* name) {
     registry()[nid] = { fn, name ? name : "" };
@@ -37,6 +40,7 @@ extern "C" uint64_t prosper_on_unimpl(uint64_t import_index) {
     uint64_t c = ++g_count[idx];
     if (c == 1) {
         g_order.push_back(idx);
+        if (g_progress) (*g_progress)++;
         if (g_mod && idx < g_mod->imports.size()) {
             const auto& im = g_mod->imports[idx];
             std::string nm = g_db ? g_db->resolve(im.nid) : std::string();

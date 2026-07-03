@@ -65,6 +65,25 @@ HLE(k_pthread_self) { return main_tcb(); }
 HLE(k_pthread_equal){ return (uint64_t)(a0 == a1); }
 HLE(k_pthread_yield){ sched_yield(); return 0; }
 
+// --- thread attributes ---
+HLE(k_attr_init)        { if (a0) { auto* at = (pthread_attr_t*)calloc(1, sizeof(pthread_attr_t)); pthread_attr_init(at); *(void**)a0 = at; } return 0; }
+HLE(k_attr_destroy)     { if (a0 && *(void**)a0) { pthread_attr_destroy((pthread_attr_t*)*(void**)a0); free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
+HLE(k_attr_setstacksize){ if (a0 && *(void**)a0 && a1 >= 16384) pthread_attr_setstacksize((pthread_attr_t*)*(void**)a0, a1); return 0; }
+HLE(k_attr_noop)        { return 0; }
+
+// --- thread creation: run the guest entry on a real host thread (ABI matches) ---
+HLE(k_pthread_create) {
+    pthread_attr_t* at = (a1 && *(void**)a1) ? (pthread_attr_t*)*(void**)a1 : nullptr;
+    pthread_t tid;
+    int r = pthread_create(&tid, at, (void* (*)(void*))(uintptr_t)a2, (void*)(uintptr_t)a3);
+    if (r) return (uint64_t)r;
+    if (a0) *(uint64_t*)a0 = (uint64_t)tid;
+    return 0;
+}
+HLE(k_pthread_join)   { void* rv = nullptr; pthread_join((pthread_t)a0, a1 ? &rv : nullptr); if (a1) *(void**)(uintptr_t)a1 = rv; return 0; }
+HLE(k_pthread_detach) { pthread_detach((pthread_t)a0); return 0; }
+HLE(k_pthread_exit)   { pthread_exit((void*)(uintptr_t)a0); return 0; }
+
 void register_kernel_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("scePthreadMutexattrInit", k_mutexattr_init);
@@ -87,8 +106,22 @@ void register_kernel_hle() {
     R("scePthreadSelf", k_pthread_self);
     R("scePthreadEqual", k_pthread_equal);
     R("scePthreadYield", k_pthread_yield);
+    R("scePthreadCreate", k_pthread_create);
+    R("scePthreadJoin", k_pthread_join);
+    R("scePthreadDetach", k_pthread_detach);
+    R("scePthreadExit", k_pthread_exit);
+    R("scePthreadAttrInit", k_attr_init);
+    R("scePthreadAttrDestroy", k_attr_destroy);
+    R("scePthreadAttrSetstacksize", k_attr_setstacksize);
+    R("scePthreadAttrSetinheritsched", k_attr_noop);
+    R("scePthreadAttrSetschedpolicy", k_attr_noop);
+    R("scePthreadAttrSetschedparam", k_attr_noop);
+    R("scePthreadAttrSetdetachstate", k_attr_noop);
+    R("scePthreadAttrGetschedparam", k_attr_noop);
+    R("scePthreadAttrGetstacksize", k_attr_noop);
     #undef R
-    register_kernel_mem_hle();   // virtual/direct memory
+    register_kernel_mem_hle();    // virtual/direct memory
+    register_kernel_time_hle();   // time/clock + C11 threads + stubs
 }
 
 } // namespace prosper

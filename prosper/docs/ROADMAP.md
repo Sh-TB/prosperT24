@@ -69,11 +69,20 @@ Turn the file into a resident, relocated guest image in host memory.
 - [x] libkernel: pthread mutex/cond (+attrs), `scePthreadSelf`; virtual/direct **memory**
       (`sceKernelReserveVirtualRange`, `MapNamedFlexibleMemory`, `AllocateDirectMemory`,
       `MapDirectMemory`, `Munmap`, `Mprotect`, `VirtualQuery`) backed by host mmap.
-- **Boot now runs**: crt → C++ global/`call_once` init → pthread/mutex init → heap →
-  virtual-memory reservation & mapping → deep into engine init. Only `_init_env` still
-  stubbed; current wall is a memory-region overrun at image+0x17968cd (mapping-size model).
-- [ ] Next: refine the memory model (track mappings; correct region sizes), `_init_env`,
-      TLS (`%fs`), then the climb toward VideoOut + AGC.
+- [x] Memory model: track mappings; honor reservation alignment; `VirtualQuery` reports
+      real regions/holes; `DirectMemoryQuery` + direct-memory tracking.
+- [x] Time/clock sources (advancing) — broke a wait-for-time spin.
+- [x] **Real multithreading**: `scePthreadCreate` runs the guest thread entry on a host
+      pthread (ABI matches); join/detach/attrs; C11 `_Mtx_*`/`_Cnd_*`.
+- [x] Assorted stubs: `sceSysmoduleLoadModule`, `sceKernelLoadStartModule`, UUID, sched hints.
+- [x] Thread-safe fault handling (per-thread recovery point); crash-proof forked boot test.
+- **Boot now runs deep**: crt → C++/`call_once` init → pthread/mutex init → heap →
+  virtual+direct memory setup → time → **spawns worker threads** → reaches game
+  `Il2cppUserAssemblies` imports, `libScePosix` file I/O, and locale/ctype init
+  (~17 distinct unimplemented calls deep).
+- [ ] Next: load dependent `*.prx` (esp. `Il2cppUserAssemblies` — the game logic) and
+      bind cross-module imports; real stdio/file I/O to `/app0`; locale; per-thread TCB;
+      then the climb toward VideoOut + AGC.
 - **Verify (programmatic, GREEN):** `tests/test_trap_linux.cpp` (map + identify 4
   representative imports) and `tests/test_boot_linux.cpp` (jump into real entry,
   assert it reaches an import trap). Both headless, exit-code = truth.

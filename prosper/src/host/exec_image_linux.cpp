@@ -17,7 +17,11 @@ namespace prosper {
 namespace {
     const Module* g_mod = nullptr;
     uint64_t g_base = 0, g_stub_base = 0, g_stub_size = 0, g_nstubs = 0;
-    sigjmp_buf g_jb;
+    // Per-thread recovery point: only the thread that armed it can be longjmp'd back
+    // (siglongjmp across threads is undefined). Guest worker threads that fault have no
+    // armed point, so we terminate the process cleanly instead of corrupting state.
+    thread_local sigjmp_buf g_jb;
+    thread_local bool g_armed = false;
     volatile sig_atomic_t g_trap_kind = 0;   // 0 none, 2 SEGV/BUS, 3 ILL
     volatile int          g_trap_sig = 0;
     void*    g_fault_addr = nullptr;
@@ -35,7 +39,10 @@ namespace {
         g_rsi = (uint64_t)g[REG_RSI]; g_rdx = (uint64_t)g[REG_RDX];
         g_trap_sig = sig;
         g_trap_kind = (sig == SIGILL) ? 3 : 2;
-        siglongjmp(g_jb, 1);
+        if (g_armed) siglongjmp(g_jb, 1);
+        // Fault on a thread with no recovery point (e.g. a guest worker thread during
+        // bring-up): terminate cleanly rather than longjmp across threads.
+        _exit(90);
     }
 
     std::string trap_detail() {
@@ -134,7 +141,7 @@ BootResult run_entry(const LoadedImage& img) {
     memcpy((void*)top, vec, sizeof(vec));
     uint64_t sp = top, rdi = sp, rsi = 0;
 
-    g_trap_kind = 0; g_fault_addr = nullptr; g_fault_rip = 0;
+    g_trap_kind = 0; g_fault_addr = nullptr; g_fault_rip = 0; g_armed = true;
     if (sigsetjmp(g_jb, 1) == 0) {
         register uint64_t e  asm("rax") = img.entry;
         register uint64_t s  asm("r8")  = sp;
