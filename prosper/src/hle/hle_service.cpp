@@ -42,6 +42,12 @@ HLE(s_pad_readstate)  { if (a1) memset(PW(a1), 0, 0x30); return 0; }
 // --- app content ---
 HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
 
+// Common/message dialogs: report FINISHED immediately so the game's "wait until dismissed" loop
+// exits and it proceeds (we have no interactive dialog UI yet). Status enum: NONE=0, INITIALIZED=1,
+// RUNNING=2, FINISHED=3. GetResult -> zeroed struct = OK/no button pressed.
+HLE(s_dialog_finished) { return 3; }
+HLE(s_dialog_result)   { if (a0) memset(PW(a0), 0, 0x40); return 0; }
+
 void register_service_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     // user service
@@ -76,6 +82,14 @@ void register_service_hle() {
     R("sceAppContentAppParamGetInt", s_appcontent_int);
     R("sceCommonDialogInitialize", s_ok);
     R("sceSystemServiceParamGetInt", s_appcontent_int);
+    // message dialog: auto-dismiss (report FINISHED) so the startup dialog flow completes
+    R("sceMsgDialogInitialize", s_ok);      R("sceMsgDialogTerminate", s_ok);
+    R("sceMsgDialogOpen", s_ok);            R("sceMsgDialogClose", s_ok);
+    R("sceMsgDialogUpdateStatus", s_dialog_finished);
+    R("sceMsgDialogGetStatus", s_dialog_finished);
+    R("sceMsgDialogGetResult", s_dialog_result);
+    R("sceSystemServiceHideSplashScreen", s_ok);
+    R("sceSystemServiceGetStatus", s_appcontent_int);
     #undef R
 }
 

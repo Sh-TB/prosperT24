@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <ctime>
 
 namespace prosper {
 
@@ -44,6 +45,10 @@ HLE(k_gettimeofday) {                                      // (struct timeval*, 
 }
 HLE(k_time) { uint64_t s = ns_now() / 1000000000ull + 1700000000ull; if (a0) *(int64_t*)P(a0) = (int64_t)s; return s; }
 HLE(k_clock) { return ns_now() / 1000; }   // clock(): CLOCKS_PER_SEC=1e6 -> microseconds
+// real sleeps so timed wait loops actually yield the CPU (and advance real time)
+HLE(k_usleep)   { uint64_t us = a0; struct timespec ts{ (time_t)(us / 1000000), (long)((us % 1000000) * 1000) }; nanosleep(&ts, nullptr); return 0; }
+HLE(k_sleep_s)  { struct timespec ts{ (time_t)a0, 0 }; nanosleep(&ts, nullptr); return (uint64_t)a0; }
+HLE(k_nanosleep){ if (a0) nanosleep((const struct timespec*)P(a0), a1 ? (struct timespec*)P(a1) : nullptr); return 0; }
 
 // --- assorted libkernel stubs ---
 HLE(k_ok)              { return 0; }                       // generic success no-op
@@ -72,6 +77,9 @@ void register_kernel_time_hle() {
     R("sceKernelReadTsc", k_read_tsc);
     R("sceKernelGetTscFrequency", k_tsc_freq);
     R("sceKernelClockGettime", k_clock_gettime);
+    R("sceKernelUsleep", k_usleep);   R("usleep", k_usleep);
+    R("sceKernelSleep", k_sleep_s);   R("sleep", k_sleep_s);
+    R("sceKernelNanosleep", k_nanosleep);  R("nanosleep", k_nanosleep);
     R("clock_gettime", k_clock_gettime);
     R("sceKernelGettimeofday", k_gettimeofday);
     R("gettimeofday", k_gettimeofday);
