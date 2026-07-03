@@ -15,6 +15,10 @@ namespace prosper {
 // Generic HLE handler signature (up to 6 integer/pointer args, SysV).
 using HleFn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
+// One unresolved import across the whole linked program (deduped by NID). Its index
+// is the stub slot number; the trap logger names calls via this table.
+struct ImportSlot { std::string lib, nid; };
+
 // Registry of implemented functions, keyed by NID.
 class Hle {
 public:
@@ -23,14 +27,18 @@ public:
     static const char* name_of(const std::string& nid);   // registered display name or ""
 };
 
-// Wire the unimplemented-call logger to the running module + name DB.
-void dispatch_init(const Module* m, NidDb* db);
+// Wire the unimplemented-call logger to the global stub-slot table + name DB.
+void dispatch_init(const std::vector<ImportSlot>* slots, NidDb* db);
 
 // Register the built-in HLE implementations (libc thunks, CRT no-ops, libkernel
 // primitives). Call before install_stubs.
 void register_builtin_hle();
 // libkernel primitives (pthread/sync/etc.); called by register_builtin_hle().
 void register_kernel_hle();
+// File I/O (stdio + POSIX fd, with /app0 path translation); called by register_builtin_hle().
+void register_file_hle();
+// Set the host directory backing the guest's "/app0" (the game data root).
+void set_app0_root(const std::string& root);
 // libkernel virtual/direct memory (Linux backing); called by register_kernel_hle().
 void register_kernel_mem_hle();
 // libkernel time/clock + C11 threads + assorted stubs; called by register_kernel_hle().

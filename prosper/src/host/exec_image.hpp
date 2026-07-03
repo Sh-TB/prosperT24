@@ -7,16 +7,20 @@
 // guest faults (null derefs from stubbed-out returns, etc.) and reports RIP.
 #pragma once
 #include "../self/module.hpp"
+#include "../hle/dispatch.hpp"   // ImportSlot
 #include <string>
+#include <vector>
 
 namespace prosper {
 
 // Map the (already relocated) image at img.base as executable. `false`+*err on failure.
-bool map_image(const Module& m, const LoadedImage& img, std::string* err);
+// Call once per module in a linked program.
+bool map_image(const LoadedImage& img, std::string* err);
 
-// Create the executable stub region at stub_base (must match bind_imports_to_stubs)
-// and populate one stub per import (handler tail-call or unimplemented logger).
-bool install_stubs(const Module& m, uint64_t stub_base, uint64_t stub_size, std::string* err);
+// Create the executable stub region at stub_base and populate one stub per slot:
+// implemented imports tail-jump to their C handler, unimplemented ones log + return 0.
+bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
+                   uint64_t stub_size, std::string* err);
 
 // Install the fault handler for genuine guest faults during a run.
 void install_trap_handler();

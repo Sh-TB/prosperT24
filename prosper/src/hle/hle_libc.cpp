@@ -6,6 +6,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <cstdio>
+#include <cstdarg>
 #ifdef _WIN32
 #include <malloc.h>   // _aligned_malloc
 #endif
@@ -68,6 +70,25 @@ HLE(h_posix_memalign) {
     return 0;
 }
 HLE(h_aligned_alloc)  { return (uint64_t)(uintptr_t)aligned_alloc_portable(a0, a1); }
+// C++ operators new/delete (the whole IL2CPP game is C++). new -> malloc; the aligned
+// forms take (size, align); nothrow forms take an extra tag arg we ignore.
+HLE(h_new)         { return (uint64_t)(uintptr_t)malloc(a0 ? a0 : 1); }
+HLE(h_new_align)   { return (uint64_t)(uintptr_t)aligned_alloc_portable(a1 ? a1 : 16, a0 ? a0 : 1); }
+HLE(h_delete)      { free(P(a0)); return 0; }
+
+// --- stdio ---
+// v*printf receive a guest-built va_list (a pointer to __va_list_tag under the SysV
+// ABI, which the host shares) — we can forward it directly.
+HLE(h_vsnprintf) { va_list ap; if (a3) memcpy(&ap, P(a3), sizeof(va_list)); return (uint64_t)(int64_t)vsnprintf((char*)P(a0), (size_t)a1, (const char*)P(a2), ap); }
+HLE(h_vsprintf)  { va_list ap; if (a2) memcpy(&ap, P(a2), sizeof(va_list)); return (uint64_t)(int64_t)vsprintf((char*)P(a0), (const char*)P(a1), ap); }
+// Variadic forms: forward the register args best-effort (handles the common
+// integer/pointer/≤4-arg case; float/stack args are a later refinement).
+HLE(h_snprintf)  { return (uint64_t)(int64_t)snprintf((char*)P(a0), (size_t)a1, (const char*)P(a2), a3, a4, a5); }
+HLE(h_sprintf)   { return (uint64_t)(int64_t)sprintf((char*)P(a0), (const char*)P(a1), a2, a3, a4, a5); }
+HLE(h_printf)    { return (uint64_t)(int64_t)printf((const char*)P(a0), a1, a2, a3, a4, a5); }
+HLE(h_puts)      { int r = fputs((const char*)P(a0), stdout); fputc('\n', stdout); return (uint64_t)(int64_t)r; }
+HLE(h_putchar)   { return (uint64_t)(int64_t)putchar((int)a0); }
+HLE(h_fputs)     { return (uint64_t)(int64_t)fputs((const char*)P(a0), a1 ? (FILE*)P(a1) : stdout); }
 
 // C++/CRT lifecycle: we don't run global destructors, so registration is a no-op.
 HLE(h_atexit)      { return 0; }
@@ -105,6 +126,22 @@ void register_builtin_hle() {
     R("strchr", h_strchr);   R("strrchr", h_strrchr); R("strstr", h_strstr);
     R("malloc", h_malloc);   R("calloc", h_calloc);   R("realloc", h_realloc); R("free", h_free);
     R("memalign", h_memalign); R("posix_memalign", h_posix_memalign); R("aligned_alloc", h_aligned_alloc);
+    // operator new / new[] (+ nothrow), and aligned variants
+    R("_Znwm", h_new); R("_Znam", h_new);
+    R("_ZnwmRKSt9nothrow_t", h_new); R("_ZnamRKSt9nothrow_t", h_new);
+    R("_ZnwmSt11align_val_t", h_new_align); R("_ZnamSt11align_val_t", h_new_align);
+    R("_ZnwmSt11align_val_tRKSt9nothrow_t", h_new_align); R("_ZnamSt11align_val_tRKSt9nothrow_t", h_new_align);
+    // operator delete / delete[] (+ sized, aligned, nothrow) -> free
+    R("_ZdlPv", h_delete); R("_ZdaPv", h_delete);
+    R("_ZdlPvm", h_delete); R("_ZdaPvm", h_delete);
+    R("_ZdlPvSt11align_val_t", h_delete); R("_ZdaPvSt11align_val_t", h_delete);
+    R("_ZdlPvmSt11align_val_t", h_delete); R("_ZdaPvmSt11align_val_t", h_delete);
+    R("_ZdlPvRKSt9nothrow_t", h_delete); R("_ZdaPvRKSt9nothrow_t", h_delete);
+    // stdio
+    R("vsnprintf", h_vsnprintf); R("vsprintf", h_vsprintf);
+    R("snprintf", h_snprintf);   R("sprintf", h_sprintf);
+    R("printf", h_printf);       R("puts", h_puts);
+    R("putchar", h_putchar);     R("fputs", h_fputs);
     R("atexit", h_atexit);   R("__cxa_atexit", h_cxa_atexit); R("__cxa_finalize", h_cxa_finalize);
     R("__cxa_guard_acquire", h_guard_acquire);
     R("__cxa_guard_release", h_guard_release);
@@ -113,6 +150,7 @@ void register_builtin_hle() {
     R("__cxa_decrement_exception_refcount", h_cxa_dec_refcount);
     R("__cxa_increment_exception_refcount", h_cxa_inc_refcount);
     #undef R
+    register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)
     register_kernel_hle();   // libkernel primitives (pthread/sync/...)
 }
 

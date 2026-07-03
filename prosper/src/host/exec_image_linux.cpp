@@ -15,7 +15,6 @@
 namespace prosper {
 
 namespace {
-    const Module* g_mod = nullptr;
     uint64_t g_base = 0, g_stub_base = 0, g_stub_size = 0, g_nstubs = 0;
     // Per-thread recovery point: only the thread that armed it can be longjmp'd back
     // (siglongjmp across threads is undefined). Guest worker threads that fault have no
@@ -66,7 +65,7 @@ namespace {
     }
 }
 
-bool map_image(const Module& m, const LoadedImage& img, std::string* err) {
+bool map_image(const LoadedImage& img, std::string* err) {
     auto fail = [&](const char* s){ if (err) *err = s; return false; };
     void* want = (void*)(img.base + img.min_vaddr);
     size_t sz  = img.mem.size();
@@ -75,17 +74,18 @@ bool map_image(const Module& m, const LoadedImage& img, std::string* err) {
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (got == MAP_FAILED || got != want) return fail("mmap image at guest base failed");
     memcpy(got, img.mem.data(), sz);
-    g_mod = &m; g_base = img.base;
+    if (!g_base) g_base = img.base;   // main image, for fault-offset reporting
     return true;
 }
 
-bool install_stubs(const Module& m, uint64_t stub_base, uint64_t stub_size, std::string* err) {
+bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
+                   uint64_t stub_size, std::string* err) {
     auto fail = [&](const char* s){ if (err) *err = s; return false; };
     if (stub_size < 24) return fail("stub_size too small (need >= 24)");
     if (!g_nid_db) g_nid_db = new NidDb();
-    dispatch_init(&m, g_nid_db);
+    dispatch_init(&slots, g_nid_db);
 
-    uint64_t n = m.imports.size();
+    uint64_t n = slots.size();
     uint64_t region = page_up(n * stub_size);
     void* want = (void*)stub_base;
     void* got = mmap(want, region, PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -95,11 +95,11 @@ bool install_stubs(const Module& m, uint64_t stub_base, uint64_t stub_size, std:
     uint8_t* base = (uint8_t*)got;
     for (uint64_t i = 0; i < n; i++) {
         uint8_t* slot = base + i * stub_size;
-        HleFn fn = Hle::lookup(m.imports[i].nid);
+        HleFn fn = Hle::lookup(slots[i].nid);
         if (fn) emit_impl(slot, (uint64_t)fn);
         else    emit_unimpl(slot, (uint32_t)i, (uint64_t)&prosper_on_unimpl);
     }
-    g_mod = &m; g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = n;
+    g_stub_base = stub_base; g_stub_size = stub_size; g_nstubs = n;
     return true;
 }
 

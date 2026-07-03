@@ -80,9 +80,18 @@ Turn the file into a resident, relocated guest image in host memory.
   virtual+direct memory setup → time → **spawns worker threads** → reaches game
   `Il2cppUserAssemblies` imports, `libScePosix` file I/O, and locale/ctype init
   (~17 distinct unimplemented calls deep).
-- [ ] Next: load dependent `*.prx` (esp. `Il2cppUserAssemblies` — the game logic) and
-      bind cross-module imports; real stdio/file I/O to `/app0`; locale; per-thread TCB;
-      then the climb toward VideoOut + AGC.
+- [x] **Multi-module dynamic linker** (`src/loader/linker.cpp`): loads the main exe +
+      dependent PRX (esp. **`Il2cppUserAssemblies` — the game's compiled C#**) into one
+      address space, builds a global export table, resolves imports to real cross-module
+      targets or dedup'd HLE stub slots. (3 modules, 914 imports, 11 cross-module.)
+- [x] C++ runtime: `operator new`/`delete` (all variants) → host heap.
+- [x] stdio: `printf`/`puts`/`snprintf`/`v*` (va_list forwarded) → host.
+- [x] File I/O (`src/hle/hle_file.cpp`): stdio `FILE*` + POSIX fd + `sceKernelOpen/…`,
+      with **`/app0` → dump-dir path translation** (real asset loading).
+- **Now**: the game's own IL2CPP code executes; boot advances through crt → C++/threads →
+  memory → stdio → file I/O → locale/ctype init (`_Getpctype`).
+- [ ] Next: locale/ctype tables; per-thread TCB; the remaining libkernel/libScePosix; then
+      **`libSceVideoOut` (window/swapchain)** and **`libSceAgc` → Vulkan + shader recompiler**.
 - **Verify (programmatic, GREEN):** `tests/test_trap_linux.cpp` (map + identify 4
   representative imports) and `tests/test_boot_linux.cpp` (jump into real entry,
   assert it reaches an import trap). Both headless, exit-code = truth.

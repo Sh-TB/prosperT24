@@ -1,8 +1,8 @@
-// test_trap_linux — M2/M3: map the real eboot executable, install HLE stubs, and
-// verify that "calling" an import routes through dispatch: the unimplemented logger
-// records it (by index -> lib::nid) and returns 0. Proves map + relocate + stub +
-// dispatch end to end.
+// test_trap_linux — verify the link + map + stub + dispatch chain. Links just the main
+// executable (no HLE registered, so every import becomes an unimplemented stub slot),
+// then "calls" representative slots and checks each is identified by lib::nid and returns 0.
 #include "../src/self/module.hpp"
+#include "../src/loader/linker.hpp"
 #include "../src/host/exec_image.hpp"
 #include "../src/hle/dispatch.hpp"
 #include <cstdio>
@@ -14,37 +14,31 @@ static int g_fail = 0, g_pass = 0;
     printf("  [FAIL] %s:%d  ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 int main(int argc, char** argv) {
-    const char* path = (argc >= 2) ? argv[1] : "../../PPSA24651-app0/eboot.bin";
-    printf("== test_trap_linux: %s ==\n", path);
+    std::string dump = (argc >= 2) ? argv[1] : "../../PPSA24651-app0";
+    printf("== test_trap_linux: %s ==\n", dump.c_str());
 
+    Program prog;
     std::string err;
-    auto mo = Module::load(path, &err);
-    CHECK(mo.has_value(), "load: %s", err.c_str());
-    if (!mo) return 1;
-    Module& m = *mo;
-
-    const uint64_t BASE = 0x400000000ull, STUB_BASE = 0x500000000ull, STUB_SZ = 32;
-    LoadedImage img = build_image(m, BASE);
-    bind_imports_to_stubs(m, img, STUB_BASE, STUB_SZ);
-    CHECK(apply_relocations(m, img) > 50000, "too few relocs applied");
-    CHECK(map_image(m, img, &err), "map_image: %s", err.c_str());
-    CHECK(install_stubs(m, STUB_BASE, STUB_SZ, &err), "install_stubs: %s", err.c_str());
+    // No HLE registered -> all imports become stub slots we can trap on.
+    if (!link_program({ { dump + "/eboot.bin", 0x400000000ull } }, 0x600000000ull, prog, &err)) {
+        printf("  [FAIL] link: %s\n", err.c_str()); return 1;
+    }
+    CHECK(prog.slots.size() > 500, "expected many stub slots, got %zu", prog.slots.size());
+    for (auto& img : prog.imgs) CHECK(map_image(img, &err), "map: %s", err.c_str());
+    CHECK(install_stubs(prog.slots, prog.stub_base, prog.stub_size, &err), "install_stubs: %s", err.c_str());
     install_trap_handler();
 
-    auto find = [&](const char* lib) -> long {
-        for (size_t i = 0; i < m.imports.size(); i++) if (m.imports[i].lib_name == lib) return (long)i;
-        return -1;
-    };
     for (const char* lib : {"libkernel", "libSceAgc", "libc", "libSceVideoOut"}) {
-        long idx = find(lib);
-        CHECK(idx >= 0, "no import for %s", lib);
-        if (idx < 0) continue;
+        long slot = -1;
+        for (size_t i = 0; i < prog.slots.size(); i++) if (prog.slots[i].lib == lib) { slot = (long)i; break; }
+        CHECK(slot >= 0, "no stub slot for %s", lib);
+        if (slot < 0) continue;
         reset_call_log();
-        uint64_t ret = invoke_stub((uint64_t)idx);           // acts as a guest call
-        CHECK(ret == 0, "%s stub should return 0 (unimplemented), got %llu", lib, (unsigned long long)ret);
-        CHECK(call_order().size() == 1 && call_order()[0] == (uint32_t)idx,
-              "%s: dispatch did not record import #%ld", lib, idx);
-        printf("  dispatched import[%ld] %s::%s -> 0\n", idx, lib, m.imports[idx].nid.c_str());
+        uint64_t ret = invoke_stub((uint64_t)slot);
+        CHECK(ret == 0, "%s stub should return 0, got %llu", lib, (unsigned long long)ret);
+        CHECK(call_order().size() == 1 && call_order()[0] == (uint32_t)slot,
+              "%s: dispatch did not record slot %ld", lib, slot);
+        printf("  dispatched %s::%s -> 0\n", lib, prog.slots[slot].nid.c_str());
     }
 
     printf("\n== %d passed, %d failed ==\n", g_pass, g_fail);

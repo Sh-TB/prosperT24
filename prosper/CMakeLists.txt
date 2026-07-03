@@ -51,11 +51,11 @@ if(TARGET prosper_core)
     add_executable(test_trap_linux tests/test_trap_linux.cpp)
     target_link_libraries(test_trap_linux PRIVATE prosper_core)
     add_test(NAME trap_identifies_imports
-             COMMAND test_trap_linux "${GAME_DUMP}/eboot.bin")
+             COMMAND test_trap_linux "${GAME_DUMP}")
 
     add_executable(test_boot_linux tests/test_boot_linux.cpp)
     target_link_libraries(test_boot_linux PRIVATE prosper_core)
     add_test(NAME boot_reaches_first_syscall
-             COMMAND test_boot_linux "${GAME_DUMP}/eboot.bin")
+             COMMAND test_boot_linux "${GAME_DUMP}")
   endif()
 endif()
