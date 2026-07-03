@@ -13,6 +13,52 @@
 #include <malloc.h>   // _aligned_malloc
 #endif
 
+// setjmp/longjmp — the guest's Boehm GC calls setjmp to flush callee-saved registers to a
+// buffer so it can scan them as GC roots (and the runtime uses it for exception unwinding).
+// A stub returning 0 silently breaks that. We implement the real thing: because our HLE
+// stubs *tail-jump* into the handler (movabs rax,fn; jmp rax — rsp and all callee-saved regs
+// are exactly the guest caller's), setjmp entered here sees the caller's true context. We
+// save only the SysV callee-saved set + rsp + return address (64 bytes) — well within the
+// guest's FreeBSD jmp_buf — and never touch the signal mask (matched pair, self-consistent).
+#if defined(__linux__) && defined(__x86_64__)
+extern "C" uint64_t prosper_setjmp(void*);
+extern "C" void     prosper_longjmp(void*, uint64_t);
+__asm__(
+    ".text\n"
+    ".globl prosper_setjmp\n.p2align 4\n"
+    "prosper_setjmp:\n"
+    "    movq (%rsp), %rax\n"        // guest return address (stub jmp'd here, so [rsp]=caller ret)
+    "    movq %rbx,  0(%rdi)\n"
+    "    movq %rbp,  8(%rdi)\n"
+    "    movq %r12, 16(%rdi)\n"
+    "    movq %r13, 24(%rdi)\n"
+    "    movq %r14, 32(%rdi)\n"
+    "    movq %r15, 40(%rdi)\n"
+    "    leaq 8(%rsp), %rcx\n"        // caller's rsp (after our eventual ret)
+    "    movq %rcx, 48(%rdi)\n"
+    "    movq %rax, 56(%rdi)\n"
+    "    xorl %eax, %eax\n"           // first return: 0
+    "    ret\n"
+    ".globl prosper_longjmp\n.p2align 4\n"
+    "prosper_longjmp:\n"
+    "    movq  0(%rdi), %rbx\n"
+    "    movq  8(%rdi), %rbp\n"
+    "    movq 16(%rdi), %r12\n"
+    "    movq 24(%rdi), %r13\n"
+    "    movq 32(%rdi), %r14\n"
+    "    movq 40(%rdi), %r15\n"
+    "    movq 48(%rdi), %rsp\n"
+    "    movq %rsi, %rax\n"           // return the longjmp value...
+    "    testq %rax, %rax\n"
+    "    jnz 1f\n"
+    "    movl $1, %eax\n"             // ...but never 0 (setjmp must see nonzero)
+    "1:  jmp *56(%rdi)\n"
+);
+#else
+extern "C" uint64_t prosper_setjmp(void*)          { return 0; }
+extern "C" void     prosper_longjmp(void*, uint64_t) {}
+#endif
+
 namespace prosper {
 // Portable aligned allocation (POSIX posix_memalign / Windows _aligned_malloc).
 // NOTE: on Windows these need _aligned_free; the guest doesn't run on Windows yet,
@@ -194,6 +240,9 @@ void register_builtin_hle() {
     R("_ZSt13_Execute_onceRSt9once_flagPFiPvS1_PS1_ES1_", h_execute_once);  // std::call_once core
     R("__cxa_decrement_exception_refcount", h_cxa_dec_refcount);
     R("__cxa_increment_exception_refcount", h_cxa_inc_refcount);
+    // setjmp/longjmp family (real register-saving impl; used by Boehm GC root scanning)
+    R("setjmp", prosper_setjmp);   R("_setjmp", prosper_setjmp);   R("sigsetjmp", prosper_setjmp);
+    R("longjmp", prosper_longjmp); R("_longjmp", prosper_longjmp);  R("siglongjmp", prosper_longjmp);
     #undef R
     register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)
     register_service_hle();  // PS5 system services (user/NP/pad/mouse/appcontent)

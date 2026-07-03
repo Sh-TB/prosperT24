@@ -11,10 +11,13 @@
 #include <pthread.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #ifdef __linux__
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <signal.h>
+#include <ucontext.h>
 #endif
 
 namespace prosper {
@@ -229,8 +232,78 @@ HLE(k_sema_signal) { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n
 HLE(k_sema_poll)   { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
     pthread_mutex_lock(&s->m); bool ok = s->count >= need; if (ok) s->count -= need; pthread_mutex_unlock(&s->m); return ok ? 0 : 0x80020023; }
 
+// ---- Async exception delivery = the IL2CPP GC's stop-the-world thread suspension ----
+// The runtime installs a handler (sceKernelInstallExceptionHandler) for exception type 0x1e,
+// then to stop the world it calls sceKernelRaiseException(thread, 0x1e) on each thread. On
+// real hardware that asynchronously interrupts the target thread and runs its handler ON that
+// thread; the handler captures the thread's registers (for GC root scanning) and blocks until
+// resumed. We reproduce this exactly with a real-time signal: pthread_sigqueue delivers it to
+// the target thread, and our SA_SIGINFO handler synthesises a FreeBSD amd64 mcontext from the
+// interrupted ucontext (so the guest handler sees the real registers) and runs the guest
+// handler on that thread. A stubbed RaiseException left every thread un-acked -> deadlock.
+namespace {
+uint64_t g_exc_handlers[128] = {0};   // guest handler fn ptr, indexed by exception type
+#ifdef __linux__
+int  g_exc_sig = -1;
+void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
+    int type = si->si_value.sival_int;
+    if (type < 0 || type >= 128 || !g_exc_handlers[type]) return;
+    auto* uc = (ucontext_t*)uc_;
+    greg_t* g = uc->uc_mcontext.gregs;
+    // FreeBSD amd64 mcontext_t: rdi@0x08 rsi@0x10 rdx@0x18 rcx@0x20 r8@0x28 r9@0x30 rax@0x38
+    // rbx@0x40 rbp@0x48 r10@0x50 r11@0x58 r12@0x60 r13@0x68 r14@0x70 r15@0x78 rip@0xA0 rsp@0xB8
+    static __thread uint8_t ctx[0x400];
+    memset(ctx, 0, sizeof ctx);
+    auto WQ = [&](int off, uint64_t v) { *(uint64_t*)(ctx + off) = v; };
+    WQ(0x08, g[REG_RDI]); WQ(0x10, g[REG_RSI]); WQ(0x18, g[REG_RDX]); WQ(0x20, g[REG_RCX]);
+    WQ(0x28, g[REG_R8]);  WQ(0x30, g[REG_R9]);  WQ(0x38, g[REG_RAX]); WQ(0x40, g[REG_RBX]);
+    WQ(0x48, g[REG_RBP]); WQ(0x50, g[REG_R10]); WQ(0x58, g[REG_R11]); WQ(0x60, g[REG_R12]);
+    WQ(0x68, g[REG_R13]); WQ(0x70, g[REG_R14]); WQ(0x78, g[REG_R15]);
+    WQ(0xA0, g[REG_RIP]); WQ(0xB8, g[REG_RSP]);
+    // Run the guest handler on this (the target) thread: handler(type, &mcontext). It captures
+    // the registers, acks via SuspendSemaphore, and blocks on ResumeSemaphore until resumed.
+    ((void (*)(uint64_t, void*))(uintptr_t)g_exc_handlers[type])((uint64_t)type, ctx);
+}
+void ensure_exc_sig() {
+    if (g_exc_sig != -1) return;
+    g_exc_sig = SIGRTMIN + 4;                    // free RT signal (not our SIGSEGV/ILL/BUS)
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = exc_delivery_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(g_exc_sig, &sa, nullptr);
+}
+#else
+void ensure_exc_sig() {}
+#endif
+} // namespace
+
+HLE(k_install_exc_handler) {   // (exceptionType, handler, ...)
+    ensure_exc_sig();
+    if (a0 < 128) g_exc_handlers[a0] = a1;
+    if (getenv("PROSPER_SYNCLOG"))
+        fprintf(stderr, "[exc] install type=0x%llx handler=0x%llx\n",
+                (unsigned long long)a0, (unsigned long long)a1);
+    return 0;
+}
+HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionType, arg)
+    ensure_exc_sig();
+    if (getenv("PROSPER_SYNCLOG"))
+        fprintf(stderr, "[exc] T%ld raise target=0x%llx type=0x%llx\n",
+                sctid(), (unsigned long long)a0, (unsigned long long)a1);
+#ifdef __linux__
+    if (a0 && a1 < 128 && g_exc_handlers[a1]) {
+        union sigval sv; sv.sival_int = (int)a1;
+        pthread_sigqueue((pthread_t)a0, g_exc_sig, sv);
+    }
+#endif
+    return 0;
+}
+
 void register_kernel_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+    R("sceKernelInstallExceptionHandler", k_install_exc_handler);
+    R("sceKernelRaiseException", k_raise_exception);
     R("scePthreadMutexattrInit", k_mutexattr_init);
     R("scePthreadMutexattrSettype", k_mutexattr_settype);
     R("scePthreadMutexattrSetprotocol", k_mutexattr_setprotocol);
