@@ -195,20 +195,22 @@ HLE(k_virtual_query) {
 // wait address is a real host address we can pass to Linux futex(2). Signature inferred
 // as wait(addr, expectedValue32, ...) / wake(addr, count). First calls log their args so
 // we can confirm the ABI.
+namespace { bool synclog() { static int v = getenv("PROSPER_SYNCLOG") ? 1 : 0; return v; } }
 HLE(k_wait_on_address) {
-    static std::atomic<int> logn{0};
-    if (logn++ < 6) MLOG("wait_on_address(addr=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx)\n",
-                         (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
     if (!a0) return 0;
-    syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, (uint32_t)a1, nullptr, nullptr, 0);
+    if (synclog()) fprintf(stderr, "[sync] T%ld WAIT.enter  addr=0x%llx *addr=0x%x exp=0x%llx\n",
+                           (long)syscall(SYS_gettid), (unsigned long long)a0, *(uint32_t*)a0, (unsigned long long)a1);
+    long r = syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, (uint32_t)a1, nullptr, nullptr, 0);
+    if (synclog()) fprintf(stderr, "[sync] T%ld WAIT.exit   addr=0x%llx r=%ld\n",
+                           (long)syscall(SYS_gettid), (unsigned long long)a0, r);
     return 0;
 }
 HLE(k_wake_by_address) {
-    static std::atomic<int> logn{0};
-    if (logn++ < 6) MLOG("wake_by_address(addr=0x%llx a1=0x%llx)\n", (unsigned long long)a0, (unsigned long long)a1);
     if (!a0) return 0;
     int n = a1 ? (int)a1 : INT_MAX;
-    syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, n, nullptr, nullptr, 0);
+    long w = syscall(SYS_futex, (uint32_t*)a0, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, n, nullptr, nullptr, 0);
+    if (synclog()) fprintf(stderr, "[sync] T%ld WAKE       addr=0x%llx n=%d woke=%ld\n",
+                           (long)syscall(SYS_gettid), (unsigned long long)a0, n, w);
     return 0;
 }
 

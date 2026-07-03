@@ -130,11 +130,21 @@ Turn the file into a resident, relocated guest image in host memory.
       `pthread_getattr_np` so the GC gets accurate stack bounds. (Correctness, not a fake.)
 - **Now: the engine fully initializes** — spawns a **14-thread job-system pool** (all correctly
   parked on the futex awaiting work). The main thread is parked on a `sync_on_address` address.
-- [ ] **Frontier (correctness): the main thread's futex wake never arrives.** Confirm the exact
-      `sceKernelWaitOnAddress`/`WakeByAddress` ABI (observed args: `wait(addr,0,0,0)`,
-      `wake(addr,1)`) and implement the precise semantics — do NOT hack a forced wake. Likely a
-      producer/consumer where an earlier stubbed call made the main thread take a wrong path, or
-      a futex expected-value/lost-wakeup subtlety. Diagnose which address + who should wake it.
+- [x] Confirmed `sceKernelWaitOnAddress`/`WakeByAddress` ABI (`wait(addr,expected,size,timeout)`,
+      `wake(addr,count)`) — my `FUTEX_WAIT(addr,expected)` matches; verified via `PROSPER_SYNCLOG`.
+- [x] Instrumentation: `PROSPER_SYNCLOG` logs every wait/wake (tid, addr, value) + every
+      `pthread_create` (entry, arg, name). Invaluable for concurrency diagnosis.
+- **Diagnosed the deadlock precisely (via synclog + gdb):** the runtime creates 13 eboot
+  `AssetGarbageCollectorHelper` threads (all handshake + park correctly) and **one special IL2CPP
+  thread** (wrapper `Il2cpp+0x170570`: store tid → `pthread_detach` → run body). The main thread
+  finishes 13 handshakes, then waits on a semaphore during `il2cpp_init`. That special thread is
+  the **GC thread** — it ran its body and is now blocked in `pthread_cond_wait` deep in the Boehm
+  GC core (`Il2cpp+0x4870/0x514e/0x4a6f/0x7ed3`). So: **GC-thread startup handshake deadlock** —
+  main waits for the GC thread to reach ready; the GC thread waits on a condvar for a trigger.
+- [ ] **Frontier (correctness):** work out the GC's exact startup handshake (Boehm GC threading
+      init) — which cond/predicate the GC thread waits on and who must signal it, and whether our
+      thread start ordering drops a signal. Fix the real protocol; no forced wakes. Tools ready:
+      `PROSPER_SYNCLOG`, `boot_trace`, gdb (`ptrace_scope=0`).
 
 ### M4 — Window + VideoOut + graphics-device init
 - [ ] `libSceVideoOut` → open an SDL3 window + Vulkan swapchain (headless offscreen for tests).

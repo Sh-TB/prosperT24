@@ -112,6 +112,9 @@ HLE(k_attr_getstacksize) {
 HLE(k_pthread_create) {
     auto entry = (void* (*)(void*))(uintptr_t)a2;
     void* arg  = (void*)(uintptr_t)a3;
+    if (getenv("PROSPER_SYNCLOG"))
+        fprintf(stderr, "[thread] create entry=0x%llx arg=0x%llx name=%s\n",
+                (unsigned long long)a2, (unsigned long long)a3, a4 ? (const char*)(uintptr_t)a4 : "");
     pthread_t tid;
 #ifdef __linux__
     pthread_attr_t la; bool own = false;
