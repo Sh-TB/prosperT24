@@ -9,15 +9,32 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Agentic-first: binaries must run with no PATH/DLL setup so CI (ctest) is hermetic.
+# On mingw, statically link the GCC/C++ runtimes.
+if(MINGW OR (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"))
+  add_link_options(-static -static-libgcc -static-libstdc++)
+endif()
+
 # --- tools ---------------------------------------------------------------
 # self_dump: SELF/ELF inspector and NID import extractor (M0).
 add_executable(self_dump tools/self_dump/self_dump.cpp)
 
-# --- library / loader (M1+) ---------------------------------------------
-# Sources land here as the roadmap progresses; keep the target defined so the
-# build graph is stable.
+# --- core library (M1+) --------------------------------------------------
+# Loader / HLE / kernel / gpu sources accrete here per the roadmap.
 file(GLOB_RECURSE PROSPER_SRC CONFIGURE_DEPENDS src/*.cpp)
 if(PROSPER_SRC)
-  add_executable(prosper ${PROSPER_SRC})
-  target_include_directories(prosper PRIVATE src)
+  add_library(prosper_core STATIC ${PROSPER_SRC})
+  target_include_directories(prosper_core PUBLIC src)
+endif()
+
+# --- tests (agentic-first: self-checking, exit-code = truth) -------------
+enable_testing()
+# Path to the (gitignored) local game dump; override with -DGAME_DUMP=...
+set(GAME_DUMP "${CMAKE_SOURCE_DIR}/../PPSA24651-app0" CACHE PATH "Local PS5 game dump root")
+
+if(TARGET prosper_core)
+  add_executable(test_module tests/test_module.cpp)
+  target_link_libraries(test_module PRIVATE prosper_core)
+  add_test(NAME module_loads_eboot
+           COMMAND test_module "${GAME_DUMP}/eboot.bin")
 endif()

@@ -29,14 +29,21 @@ presented, framebuffer CRC == golden" is. Each change adds the check that proves
 - [x] `self_dump`: SELF/ELF parser, VA mapping, dynamic tags, NID import extraction.
 - [x] Full HLE work-list: every imported library + function count (see FINDINGS.md).
 
-### M1 — Loader
+### M1 — Loader  🟡 (core done & tested; deps/TLS/real-mmap pending)
 Turn the file into a resident, relocated guest image in host memory.
-- [ ] Reserve guest VA region; map `PT_LOAD` segments with correct protections.
-- [ ] Apply relocations (`R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/TLS).
+- [x] Parse SELF→ELF; build VA→file map; collect segments/dynamic/symbols/relocs/imports
+      (`src/self/module.{hpp,cpp}`).
+- [x] Build flat image at a chosen guest base; per-segment protection records.
+- [x] Apply relocations (`R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`). *(TLS relocs deferred to M3.)*
+- [x] Bind imports to stub slots (mechanism for M2's trap stubs).
+- [x] Locate entry; assert it lands in an executable segment with real code.
+- [ ] Real host backing: `mmap`(`MAP_FIXED`)/`VirtualAlloc` behind the image (M2, Linux).
 - [ ] Load dependent `*.prx`; build module graph; unify address space.
-- [ ] Locate entry, `sce_process_param`, TLS templates.
-- **Verify:** print the guest memory map; disassemble bytes at `entry` and confirm
-  a sane function prologue (via `objdump`/capstone).
+- [ ] TLS templates, `sce_process_param` wiring.
+- **Verify (programmatic, GREEN):** `tests/test_module.cpp` — 24/24 checks against the
+  real `eboot.bin`: identity, segment/import counts (612 imports / 35 libs), reloc
+  counts, and spot-checked relocation results (JUMP_SLOT→stub, RELATIVE→base+addend)
+  read back from the built image. Runs hermetically via `ctest` (static binary).
 
 ### M2 — HLE stub framework + first execution
 - [ ] NID hash (SHA1+salt) + name↔NID database for readable logs.
