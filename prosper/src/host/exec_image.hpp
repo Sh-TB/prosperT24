@@ -44,6 +44,7 @@ struct BootResult {
 void register_thread_stack(uint64_t tid, void* base, uint64_t size);
 // Report the calling guest thread's registered stack bounds (false if not registered).
 bool guest_stack_for_current_thread(void** base, size_t* size);
+bool guest_stack_for_thread(uint64_t tid, void** base, size_t* size);
 
 // Run dependent-module init functions (C++ global ctors etc.) before entry. Each is
 // called under a per-thread recovery point; a faulting init is skipped (best-effort).

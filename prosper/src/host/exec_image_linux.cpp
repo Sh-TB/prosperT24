@@ -141,13 +141,15 @@ void register_thread_stack(uint64_t tid, void* base, uint64_t size) {
     std::lock_guard<std::mutex> lk(g_smx);
     g_stacks[tid] = { (uint64_t)base, size };
 }
-bool guest_stack_for_current_thread(void** base, size_t* size) {
-    uint64_t tid = (uint64_t)pthread_self();
+bool guest_stack_for_thread(uint64_t tid, void** base, size_t* size) {
     std::lock_guard<std::mutex> lk(g_smx);
     auto it = g_stacks.find(tid);
     if (it == g_stacks.end()) return false;
     *base = (void*)it->second.first; *size = (size_t)it->second.second;
     return true;
+}
+bool guest_stack_for_current_thread(void** base, size_t* size) {
+    return guest_stack_for_thread((uint64_t)pthread_self(), base, size);
 }
 
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {

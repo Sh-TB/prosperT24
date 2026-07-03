@@ -98,12 +98,17 @@ HLE(k_attr_noop)        { return 0; }
 // Query the CURRENT thread's real attributes into the caller's attr object (the GC needs
 // accurate stack bounds to scan roots; bad bounds make IL2CPP's GC init assert).
 HLE(k_attr_get) {
+    // scePthreadAttrGet(ScePthread thread, ScePthreadAttr* attr): fill *attr with the given
+    // thread's attributes. a0 = thread handle (== the host pthread_t we store), a1 = attr handle.
+    // (Bug fixed: the attr is arg1, not arg0 — reading arg0 left the real attr empty, so the GC's
+    // GC_get_stack_base got a 0 stack base -> "Bad stack base in GC_register_my_thread".)
 #ifdef __linux__
-    if (a0 && *(void**)a0) {
-        auto* at = (pthread_attr_t*)*(void**)a0;
-        void* base; size_t sz;
-        if (guest_stack_for_current_thread(&base, &sz))
-            pthread_attr_setstack(at, base, sz);   // real, tracked stack for this thread
+    if (a1 && *(void**)a1) {
+        auto* at = (pthread_attr_t*)*(void**)a1;
+        void* base = nullptr; size_t sz = 0;
+        bool ok = (a0 && guest_stack_for_thread(a0, &base, &sz)) ||
+                  guest_stack_for_current_thread(&base, &sz);
+        if (ok) pthread_attr_setstack(at, base, sz);   // real, tracked stack for that thread
         // else: leave the attr as-is (avoid the fragile pthread_getattr_np)
     }
 #endif
@@ -261,6 +266,10 @@ void exc_delivery_handler(int, siginfo_t* si, void* uc_) {
     WQ(0x48, g[REG_RBP]); WQ(0x50, g[REG_R10]); WQ(0x58, g[REG_R11]); WQ(0x60, g[REG_R12]);
     WQ(0x68, g[REG_R13]); WQ(0x70, g[REG_R14]); WQ(0x78, g[REG_R15]);
     WQ(0xA0, g[REG_RIP]); WQ(0xB8, g[REG_RSP]);
+    // The Sony exception context carries the thread's stack pointer at offset 0xf8; the GC's
+    // suspend handler copies context[0xf8] into the thread's GC-table entry as the sp it scans
+    // from (GC_push_all_stacks aborts "sp not set!" if it's 0). Populate it with the real rsp.
+    WQ(0xF8, g[REG_RSP]);
     // Run the guest handler on this (the target) thread: handler(type, &mcontext). It captures
     // the registers, acks via SuspendSemaphore, and blocks on ResumeSemaphore until resumed.
     if (g_exc_log) { const char m[] = "[exc] handler ENTER on target\n"; (void)!write(2, m, sizeof m - 1); }
