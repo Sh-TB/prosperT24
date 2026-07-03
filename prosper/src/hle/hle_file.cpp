@@ -38,6 +38,29 @@ namespace {
 
 void set_app0_root(const std::string& root) { g_app0 = root; }
 
+// Translate a host (Linux) struct stat into the FreeBSD/Orbis SceKernelStat layout the
+// guest expects: 0x78 bytes, different field order. Writing the host layout (144 bytes,
+// different offsets) both gives wrong values AND overruns the guest's 0x78-byte buffer
+// (smashing an adjacent stack canary). Fields per FreeBSD 9 <sys/stat.h>.
+namespace {
+    void to_sce_stat(const struct stat& s, uint8_t* out) {
+        memset(out, 0, 0x78);
+        *(uint32_t*)(out + 0x00) = (uint32_t)s.st_dev;
+        *(uint32_t*)(out + 0x04) = (uint32_t)s.st_ino;
+        *(uint16_t*)(out + 0x08) = (uint16_t)s.st_mode;    // type+perm bits match Linux
+        *(uint16_t*)(out + 0x0a) = (uint16_t)s.st_nlink;
+        *(uint32_t*)(out + 0x0c) = (uint32_t)s.st_uid;
+        *(uint32_t*)(out + 0x10) = (uint32_t)s.st_gid;
+        *(uint32_t*)(out + 0x14) = (uint32_t)s.st_rdev;
+        *(int64_t*)(out + 0x18)  = s.st_atim.tv_sec; *(int64_t*)(out + 0x20) = s.st_atim.tv_nsec;
+        *(int64_t*)(out + 0x28)  = s.st_mtim.tv_sec; *(int64_t*)(out + 0x30) = s.st_mtim.tv_nsec;
+        *(int64_t*)(out + 0x38)  = s.st_ctim.tv_sec; *(int64_t*)(out + 0x40) = s.st_ctim.tv_nsec;
+        *(int64_t*)(out + 0x48)  = s.st_size;
+        *(int64_t*)(out + 0x50)  = s.st_blocks;
+        *(uint32_t*)(out + 0x58) = (uint32_t)s.st_blksize;
+    }
+}
+
 // --- stdio FILE* ---
 HLE(f_fopen)   { std::string h = translate(CS(a0)); return (uint64_t)(uintptr_t)fopen(h.c_str(), CS(a1)); }
 HLE(f_fclose)  { return a0 ? (uint64_t)(int64_t)fclose((FILE*)P(a0)) : 0; }
@@ -59,8 +82,8 @@ HLE(f_close) { return (uint64_t)(int64_t)::close((int)a0); }
 HLE(f_read)  { return (uint64_t)(int64_t)::read((int)a0, P(a1), (size_t)a2); }
 HLE(f_write) { return (uint64_t)(int64_t)::write((int)a0, P(a1), (size_t)a2); }
 HLE(f_lseek) { return (uint64_t)(int64_t)::lseek((int)a0, (off_t)a1, (int)a2); }
-HLE(f_stat)  { std::string h = translate(CS(a0)); struct stat st; int r = ::stat(h.c_str(), &st); if (r == 0 && a1) memcpy(P(a1), &st, sizeof(st)); return (uint64_t)(int64_t)r; }
-HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); if (r == 0 && a1) memcpy(P(a1), &st, sizeof(st)); return (uint64_t)(int64_t)r; }
+HLE(f_stat)  { std::string h = translate(CS(a0)); struct stat st; int r = ::stat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
+HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_access){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::access(h.c_str(), (int)a1); }
 
 void register_file_hle() {
