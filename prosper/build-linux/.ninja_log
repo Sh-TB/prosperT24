@@ -1,0 +1,20 @@
+# ninja log v5
+560	725	1783088736167966700	test_trap_linux	7b057dfa33250c38
+51	531	1783088735975731900	CMakeFiles/test_trap_linux.dir/tests/test_trap_linux.cpp.o	8379974c360a0c78
+10	32	0	/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/CMakeFiles/cmake.verify_globs	2df051ae21967330
+37	543	1783088532077866600	CMakeFiles/test_module.dir/tests/test_module.cpp.o	8476f22d80f0f318
+33	795	1783088532330377500	CMakeFiles/self_dump.dir/tools/self_dump/self_dump.cpp.o	9c87d85995755afb
+501	559	1783088736006398600	libprosper_core.a	d01b3e2cce5f3dd6
+50	480	1783088735922726500	CMakeFiles/prosper_core.dir/src/host/exec_image_linux.cpp.o	a0f0af69a946aee4
+801	951	1783088532487503800	self_dump	fc282e3b5ba35052
+35	1019	1783088532555008700	CMakeFiles/prosper_core.dir/src/self/module.cpp.o	81941dc2d6a0ae62
+560	725	1783088736167966700	test_module	1088f45fc2bb0210
+12	37	0	/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/CMakeFiles/cmake.verify_globs	2df051ae21967330
+66	488	1783088910034881100	CMakeFiles/test_boot_linux.dir/tests/test_boot_linux.cpp.o	ffdd1e0c87b3dc35
+63	498	1783088910043384500	CMakeFiles/prosper_core.dir/src/host/exec_image_linux.cpp.o	a0f0af69a946aee4
+65	521	1783088910066999300	CMakeFiles/test_trap_linux.dir/tests/test_trap_linux.cpp.o	8379974c360a0c78
+501	555	1783088910103772000	libprosper_core.a	d01b3e2cce5f3dd6
+556	720	1783088910263995400	test_boot_linux	4bc2e37d7487708e
+556	722	1783088910266124900	test_module	1088f45fc2bb0210
+556	744	1783088910288521400	test_trap_linux	7b057dfa33250c38
+11	30	0	/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/CMakeFiles/cmake.verify_globs	2df051ae21967330

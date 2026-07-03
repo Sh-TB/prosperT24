@@ -45,12 +45,20 @@ Turn the file into a resident, relocated guest image in host memory.
   counts, and spot-checked relocation results (JUMP_SLOT→stub, RELATIVE→base+addend)
   read back from the built image. Runs hermetically via `ctest` (static binary).
 
-### M2 — HLE stub framework + first execution
-- [ ] NID hash (SHA1+salt) + name↔NID database for readable logs.
-- [ ] Import resolver binds every undefined symbol to a generated logging-trap stub.
-- [ ] Minimal host bootstrap: stack, TLS, thread 0; jump to entry.
-- **Verify:** the guest **starts executing** and stops at the first unimplemented
-  Sony call, logging its real name. This is the "it's alive" moment.
+### M2 — First execution  🟢 (core done; readable names + real dispatch next)
+- [x] Real host backing: `mmap(MAP_FIXED_NOREPLACE)` maps the relocated image at
+      its guest base as executable; import stub region mapped `PROT_NONE`
+      (`src/host/exec_image_linux.cpp`).
+- [x] Import trap: `SIGSEGV` handler identifies the faulting stub → `lib::NID`.
+- [x] Minimal bootstrap: SysV initial stack + `argc/argv` block; jump to entry.
+- [x] **Guest executes**: `eboot` crt runs and traps at its **first Sony call**
+      (`libc::bzQExy189ZI`). *This is the "it's alive" moment.* ✅
+- [ ] NID hash (SHA1+salt+base64) + name↔NID DB so traps read as real function names.
+- [ ] Turn traps into a real HLE **dispatch** (call → handler → return) instead of halt.
+- [ ] TLS setup (`%fs` base) — needed before much libc/libkernel runs.
+- **Verify (programmatic, GREEN):** `tests/test_trap_linux.cpp` (map + identify 4
+  representative imports) and `tests/test_boot_linux.cpp` (jump into real entry,
+  assert it reaches an import trap). Both headless, exit-code = truth.
 
 ### M3 — Kernel + libc/posix (reach Unity init)
 - [ ] Memory: flexible/direct memory, `mmap`/`VirtualAlloc`, protections.

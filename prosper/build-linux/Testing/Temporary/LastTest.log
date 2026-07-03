@@ -1,0 +1,64 @@
+Start testing: Jul 03 16:30 CEST
+----------------------------------------------------------
+1/3 Testing: module_loads_eboot
+1/3 Test: module_loads_eboot
+Command: "/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/test_module" "/mnt/c/Users/matti/repos/ps5ys/prosper/../PPSA24651-app0/eboot.bin"
+Directory: /mnt/c/Users/matti/repos/ps5ys/prosper/build-linux
+"module_loads_eboot" start time: Jul 03 16:30 CEST
+Output:
+----------------------------------------------------------
+== test_module: /mnt/c/Users/matti/repos/ps5ys/prosper/../PPSA24651-app0/eboot.bin ==
+
+== 24 passed, 0 failed ==
+<end of output>
+Test time =   0.11 sec
+----------------------------------------------------------
+Test Passed.
+"module_loads_eboot" end time: Jul 03 16:30 CEST
+"module_loads_eboot" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/3 Testing: trap_identifies_imports
+2/3 Test: trap_identifies_imports
+Command: "/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/test_trap_linux" "/mnt/c/Users/matti/repos/ps5ys/prosper/../PPSA24651-app0/eboot.bin"
+Directory: /mnt/c/Users/matti/repos/ps5ys/prosper/build-linux
+"trap_identifies_imports" start time: Jul 03 16:30 CEST
+Output:
+----------------------------------------------------------
+== test_trap_linux: /mnt/c/Users/matti/repos/ps5ys/prosper/../PPSA24651-app0/eboot.bin ==
+  trapped import[6] -> libkernel::+BzXYkqYeLE
+  trapped import[520] -> libSceAgc::fPSCdQxgpSw
+  trapped import[0] -> libc::bzQExy189ZI
+  trapped import[97] -> libSceVideoOut::HXzjK9yI30k
+
+== 15 passed, 0 failed ==
+<end of output>
+Test time =   0.13 sec
+----------------------------------------------------------
+Test Passed.
+"trap_identifies_imports" end time: Jul 03 16:30 CEST
+"trap_identifies_imports" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/3 Testing: boot_reaches_first_syscall
+3/3 Test: boot_reaches_first_syscall
+Command: "/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/test_boot_linux" "/mnt/c/Users/matti/repos/ps5ys/prosper/../PPSA24651-app0/eboot.bin"
+Directory: /mnt/c/Users/matti/repos/ps5ys/prosper/build-linux
+"boot_reaches_first_syscall" start time: Jul 03 16:30 CEST
+Output:
+----------------------------------------------------------
+== test_boot_linux: /mnt/c/Users/matti/repos/ps5ys/prosper/../PPSA24651-app0/eboot.bin ==
+  entry = 0x400000070  jumping in...
+  -> kind=1  detail='libc::bzQExy189ZI'
+     fault_addr=0x500000000  guest_rip=0x500000000 (base+0x100000000)
+
+== PASS: guest executed and trapped at first Sony call: libc::bzQExy189ZI ==
+<end of output>
+Test time =   0.12 sec
+----------------------------------------------------------
+Test Passed.
+"boot_reaches_first_syscall" end time: Jul 03 16:30 CEST
+"boot_reaches_first_syscall" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Jul 03 16:30 CEST

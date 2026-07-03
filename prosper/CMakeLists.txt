@@ -37,4 +37,17 @@ if(TARGET prosper_core)
   target_link_libraries(test_module PRIVATE prosper_core)
   add_test(NAME module_loads_eboot
            COMMAND test_module "${GAME_DUMP}/eboot.bin")
+
+  # M2: real memory mapping + import trap (Linux only).
+  if(UNIX AND NOT APPLE)
+    add_executable(test_trap_linux tests/test_trap_linux.cpp)
+    target_link_libraries(test_trap_linux PRIVATE prosper_core)
+    add_test(NAME trap_identifies_imports
+             COMMAND test_trap_linux "${GAME_DUMP}/eboot.bin")
+
+    add_executable(test_boot_linux tests/test_boot_linux.cpp)
+    target_link_libraries(test_boot_linux PRIVATE prosper_core)
+    add_test(NAME boot_reaches_first_syscall
+             COMMAND test_boot_linux "${GAME_DUMP}/eboot.bin")
+  endif()
 endif()
