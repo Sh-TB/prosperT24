@@ -9,9 +9,25 @@
 #include "nid.hpp"
 #include "../host/exec_image.hpp"
 #include <pthread.h>
+#include <cstdio>
+#include <cstdlib>
 #ifdef __linux__
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
+
+namespace prosper {
+namespace { bool sclog() { static int v = getenv("PROSPER_SYNCLOG") ? 1 : 0; return v; }
+    long sctid() {
+#ifdef __linux__
+        return (long)syscall(SYS_gettid);
+#else
+        return 0;
+#endif
+    }
+}
+}
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
@@ -56,9 +72,11 @@ HLE(k_condattr_init)    { if (a0) { auto* c = (pthread_condattr_t*)calloc(1, siz
 HLE(k_condattr_destroy) { if (a0 && *(void**)a0) { free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
 HLE(k_cond_init)      { if (!a0) return 0x16; auto* c = (pthread_cond_t*)calloc(1, sizeof(pthread_cond_t)); pthread_cond_init(c, nullptr); *(void**)a0 = c; return 0; }
 HLE(k_cond_destroy)   { if (a0 && *(void**)a0) { pthread_cond_destroy((pthread_cond_t*)*(void**)a0); free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
-HLE(k_cond_signal)    { if (a0 && *(void**)a0) pthread_cond_signal((pthread_cond_t*)*(void**)a0); return 0; }
-HLE(k_cond_broadcast) { if (a0 && *(void**)a0) pthread_cond_broadcast((pthread_cond_t*)*(void**)a0); return 0; }
-HLE(k_cond_wait)      { if (a0 && *(void**)a0 && a1 && *(void**)a1) pthread_cond_wait((pthread_cond_t*)*(void**)a0, (pthread_mutex_t*)*(void**)a1); return 0; }
+HLE(k_cond_signal)    { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.signal    cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (a0 && *(void**)a0) pthread_cond_signal((pthread_cond_t*)*(void**)a0); return 0; }
+HLE(k_cond_broadcast) { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.broadcast cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); if (a0 && *(void**)a0) pthread_cond_broadcast((pthread_cond_t*)*(void**)a0); return 0; }
+HLE(k_cond_wait)      { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.ent  cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0);
+    if (a0 && *(void**)a0 && a1 && *(void**)a1) pthread_cond_wait((pthread_cond_t*)*(void**)a0, (pthread_mutex_t*)*(void**)a1);
+    if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return 0; }
 
 // --- thread identity ---
 // Return the real host thread handle as the Sony ScePthread — unique and stable per
@@ -194,14 +212,19 @@ HLE(k_ef_poll)    { // (ef, pattern, waitMode, resultPat*)
 namespace { struct Sema { pthread_mutex_t m; pthread_cond_t c; int64_t count; }; }
 HLE(k_sema_create) { // (sema*, name, attr, initCount, maxCount, opt)
     auto* s = (Sema*)calloc(1, sizeof(Sema));
-    pthread_mutex_init(&s->m, nullptr); pthread_cond_init(&s->c, nullptr); s->count = (int64_t)a3;
+    pthread_mutex_init(&s->m, nullptr); pthread_cond_init(&s->c, nullptr); s->count = (int64_t)(int32_t)a3;
     if (a0) *(void**)(uintptr_t)a0 = s;
+    if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.create  sema=0x%llx name='%s' init=%lld max=%lld\n",
+                         sctid(), (unsigned long long)(uintptr_t)s, a1 ? (const char*)(uintptr_t)a1 : "",
+                         (long long)(int32_t)a3, (long long)(int32_t)a4);
     return 0;
 }
 HLE(k_sema_delete) { if (a0) free((void*)(uintptr_t)a0); return 0; }
 HLE(k_sema_wait)   { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
+    if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.wait     sema=0x%llx need=%lld\n", sctid(), (unsigned long long)a0, (long long)need);
     pthread_mutex_lock(&s->m); while (s->count < need) pthread_cond_wait(&s->c, &s->m); s->count -= need; pthread_mutex_unlock(&s->m); return 0; }
 HLE(k_sema_signal) { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t n = a1 ? (int64_t)a1 : 1;
+    if (sclog()) fprintf(stderr, "[sync2] T%ld SEMA.signal   sema=0x%llx n=%lld\n", sctid(), (unsigned long long)a0, (long long)n);
     pthread_mutex_lock(&s->m); s->count += n; pthread_cond_broadcast(&s->c); pthread_mutex_unlock(&s->m); return 0; }
 HLE(k_sema_poll)   { auto* s = (Sema*)(uintptr_t)a0; if (!s) return 0; int64_t need = a1 ? (int64_t)a1 : 1;
     pthread_mutex_lock(&s->m); bool ok = s->count >= need; if (ok) s->count -= need; pthread_mutex_unlock(&s->m); return ok ? 0 : 0x80020023; }
