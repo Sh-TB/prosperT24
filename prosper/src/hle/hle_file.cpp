@@ -83,6 +83,13 @@ HLE(f_close) { return (uint64_t)(int64_t)::close((int)a0); }
 HLE(f_read)  { return (uint64_t)(int64_t)::read((int)a0, P(a1), (size_t)a2); }
 HLE(f_write) { return (uint64_t)(int64_t)::write((int)a0, P(a1), (size_t)a2); }
 HLE(f_lseek) { return (uint64_t)(int64_t)::lseek((int)a0, (off_t)a1, (int)a2); }
+#ifndef _WIN32
+HLE(f_pread)  { return (uint64_t)(int64_t)::pread((int)a0, P(a1), (size_t)a2, (off_t)a3); }
+HLE(f_pwrite) { return (uint64_t)(int64_t)::pwrite((int)a0, P(a1), (size_t)a2, (off_t)a3); }
+#else
+HLE(f_pread)  { return (uint64_t)-1; }
+HLE(f_pwrite) { return (uint64_t)-1; }
+#endif
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct stat st; int r = ::stat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_access){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::access(h.c_str(), (int)a1); }
@@ -115,6 +122,8 @@ void register_file_hle() {
     R("sceKernelWrite", f_write); R("sceKernelLseek", f_lseek);  R("sceKernelStat", f_stat);
     R("sceKernelFstat", f_fstat);
     // directory / unlink (real host ops, /app0-translated)
+    R("pread", f_pread);          R("sceKernelPread", f_pread);
+    R("pwrite", f_pwrite);        R("sceKernelPwrite", f_pwrite);
     R("mkdir", f_mkdir);          R("sceKernelMkdir", f_mkdir);
     R("rmdir", f_rmdir);          R("sceKernelRmdir", f_rmdir);
     R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);

@@ -317,6 +317,15 @@ HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionTyp
 
 void set_exc_raise_counter(volatile int* counter) { g_exc_counter = counter; }
 
+HLE(k_is_stack) {   // sceKernelIsStack(void* addr): is addr within the current thread's stack?
+#ifdef __linux__
+    void* base = nullptr; size_t sz = 0;
+    if (guest_stack_for_current_thread(&base, &sz) &&
+        a0 >= (uint64_t)(uintptr_t)base && a0 < (uint64_t)(uintptr_t)base + sz)
+        return 1;
+#endif
+    return 0;
+}
 HLE(k_dlsym) {   // sceKernelDlsym(SceKernelModule handle, const char* name, void** funcAddr)
     // We don't resolve dynamic symbols through the HLE layer. Return ESRCH ("not found") but leave
     // *funcAddr untouched — callers pre-seed it with a fallback and keep that on failure. (The old
@@ -331,6 +340,7 @@ void register_kernel_hle() {
     R("sceKernelInstallExceptionHandler", k_install_exc_handler);
     R("sceKernelRaiseException", k_raise_exception);
     R("sceKernelDlsym", k_dlsym);
+    R("sceKernelIsStack", k_is_stack);
     R("scePthreadMutexattrInit", k_mutexattr_init);
     R("scePthreadMutexattrSettype", k_mutexattr_settype);
     R("scePthreadMutexattrSetprotocol", k_mutexattr_setprotocol);

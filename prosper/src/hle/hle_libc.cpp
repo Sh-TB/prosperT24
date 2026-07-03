@@ -180,6 +180,8 @@ static float  m_powf(float x,float y){return powf(x,y);}   static double m_pow(d
 static float  m_fmodf(float x,float y){return fmodf(x,y);} static double m_fmod(double x,double y){return fmod(x,y);}
 static float  m_atan2f(float x,float y){return atan2f(x,y);}static double m_atan2(double x,double y){return atan2(x,y);}
 static float  m_hypotf(float x,float y){return hypotf(x,y);}static double m_hypot(double x,double y){return hypot(x,y);}
+static void   m_sincosf(float x, float* s, float* c)   { *s = sinf(x); *c = cosf(x); }
+static void   m_sincos (double x, double* s, double* c){ *s = sin(x);  *c = cos(x);  }
 
 HLE(h_vsnprintf) { va_list ap; if (a3) memcpy(&ap, P(a3), sizeof(va_list)); return (uint64_t)(int64_t)vsnprintf((char*)P(a0), (size_t)a1, (const char*)P(a2), ap); }
 HLE(h_vsprintf)  { va_list ap; if (a2) memcpy(&ap, P(a2), sizeof(va_list)); return (uint64_t)(int64_t)vsprintf((char*)P(a0), (const char*)P(a1), ap); }
@@ -301,6 +303,7 @@ void register_builtin_hle() {
     R("log10", m_log10); R("log2", m_log2); R("sqrt", m_sqrt); R("cbrt", m_cbrt); R("pow", m_pow);
     R("floor", m_floor); R("ceil", m_ceil); R("round", m_round); R("trunc", m_trunc);
     R("fmod", m_fmod); R("fabs", m_fabs); R("hypot", m_hypot);
+    R("sincosf", m_sincosf); R("sincos", m_sincos);
     #undef R
     register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)
     register_service_hle();  // PS5 system services (user/NP/pad/mouse/appcontent)
