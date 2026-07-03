@@ -22,12 +22,17 @@ namespace {
     volatile int          g_trap_sig = 0;
     void*    g_fault_addr = nullptr;
     uint64_t g_fault_rip = 0;
+    uint64_t g_rbp = 0, g_rsp = 0, g_rax = 0, g_rdi = 0, g_rsi = 0, g_rdx = 0;
     NidDb*   g_nid_db = nullptr;
 
     void fault_handler(int sig, siginfo_t* si, void* uctx) {
         g_fault_addr = si->si_addr;
         auto* uc = (ucontext_t*)uctx;
-        g_fault_rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+        auto& g = uc->uc_mcontext.gregs;
+        g_fault_rip = (uint64_t)g[REG_RIP];
+        g_rbp = (uint64_t)g[REG_RBP]; g_rsp = (uint64_t)g[REG_RSP];
+        g_rax = (uint64_t)g[REG_RAX]; g_rdi = (uint64_t)g[REG_RDI];
+        g_rsi = (uint64_t)g[REG_RSI]; g_rdx = (uint64_t)g[REG_RDX];
         g_trap_sig = sig;
         g_trap_kind = (sig == SIGILL) ? 3 : 2;
         siglongjmp(g_jb, 1);
@@ -120,7 +125,12 @@ BootResult run_entry(const LoadedImage& img) {
     memcpy((void*)arg0, argstr, sizeof(argstr));
     top &= ~(uint64_t)0xf;
     uint64_t vec[] = { 1, arg0, 0, 0, 0, 0 };   // argc, argv0, NULL, envp NULL, auxv AT_NULL
-    top -= sizeof(vec); top &= ~(uint64_t)0xf;
+    top -= sizeof(vec); top &= ~(uint64_t)0xf;   // 16-aligned base for the vector
+    // The Sony crt _start pushes an odd number of words before its first call, so it
+    // expects entry rsp ≡ 8 (mod 16) (like a normal callee), NOT 16-aligned. Placing
+    // the vector 8 below a 16-boundary makes every downstream call correctly aligned,
+    // so alignment-sensitive SIMD (vmovaps) in callees doesn't #GP.
+    top -= 8;
     memcpy((void*)top, vec, sizeof(vec));
     uint64_t sp = top, rdi = sp, rsi = 0;
 
@@ -140,6 +150,8 @@ BootResult run_entry(const LoadedImage& img) {
         r.detail = trap_detail();
         r.fault_addr = (uint64_t)g_fault_addr;
         r.fault_rip = g_fault_rip;
+        r.rbp = g_rbp; r.rsp = g_rsp; r.rax = g_rax;
+        r.rdi = g_rdi; r.rsi = g_rsi; r.rdx = g_rdx;
     }
     return r;
 }

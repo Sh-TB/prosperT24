@@ -29,9 +29,10 @@ uint64_t invoke_stub(uint64_t idx);
 
 // Result of running the guest.
 struct BootResult {
-    int          kind = 0;      // 0 = returned, 2 = faulted (SIGSEGV/BUS)
+    int          kind = 0;      // 0 = returned, 2 = faulted (SIGSEGV/BUS), 3 = SIGILL
     std::string  detail;        // fault description
     uint64_t     fault_addr = 0, fault_rip = 0;
+    uint64_t     rbp = 0, rsp = 0, rax = 0, rdi = 0, rsi = 0, rdx = 0; // regs at fault
 };
 // Set up a SysV-style stack + argc/argv, jump to img.entry, run until it returns or
 // faults. Unimplemented imports are logged along the way (see dispatch.hpp).

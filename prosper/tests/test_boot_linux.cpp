@@ -34,12 +34,21 @@ int main(int argc, char** argv) {
 
     dump_call_log(stdout);
     printf("\n  run ended: kind=%d  %s\n", r.kind, r.detail.c_str());
+    printf("  regs @fault: rbp=0x%llx rsp=0x%llx rax=0x%llx rdi=0x%llx rsi=0x%llx rdx=0x%llx\n",
+           (unsigned long long)r.rbp, (unsigned long long)r.rsp, (unsigned long long)r.rax,
+           (unsigned long long)r.rdi, (unsigned long long)r.rsi, (unsigned long long)r.rdx);
 
+    // Regression guard: correct stack alignment lets the crt clear its SIMD static-init
+    // and reach libkernel thread/mutex initialization. If alignment regresses, the boot
+    // dies in the SIMD init and never calls into libkernel.
     size_t n = call_order().size();
-    if (n >= 1) {
-        printf("\n== PASS: guest executed and made %zu distinct Sony call(s) via dispatch ==\n", n);
+    bool reached_libkernel = false;
+    for (uint32_t idx : call_order())
+        if (idx < m.imports.size() && m.imports[idx].lib_name == "libkernel") reached_libkernel = true;
+    if (n >= 1 && reached_libkernel) {
+        printf("\n== PASS: guest ran through crt/global-init into libkernel (%zu distinct calls) ==\n", n);
         return 0;
     }
-    printf("\n== FAIL: guest made no Sony calls (dispatch/boot broken) ==\n");
+    printf("\n== FAIL: boot did not reach libkernel init (n=%zu, libkernel=%d) ==\n", n, reached_libkernel);
     return 2;
 }
