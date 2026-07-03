@@ -317,10 +317,20 @@ HLE(k_raise_exception) {       // (targetThread /*host pthread_t*/, exceptionTyp
 
 void set_exc_raise_counter(volatile int* counter) { g_exc_counter = counter; }
 
+HLE(k_dlsym) {   // sceKernelDlsym(SceKernelModule handle, const char* name, void** funcAddr)
+    // We don't resolve dynamic symbols through the HLE layer. Return ESRCH ("not found") but leave
+    // *funcAddr untouched — callers pre-seed it with a fallback and keep that on failure. (The old
+    // path returned success; nulling the out pointer here broke a caller that then invoked it.)
+    if (getenv("PROSPER_SYNCLOG"))
+        fprintf(stderr, "[dlsym] unresolved '%s' -> ESRCH (fallback kept)\n", a1 ? (const char*)(uintptr_t)a1 : "?");
+    return 0x80020003;   // SCE_KERNEL_ERROR_ESRCH
+}
+
 void register_kernel_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("sceKernelInstallExceptionHandler", k_install_exc_handler);
     R("sceKernelRaiseException", k_raise_exception);
+    R("sceKernelDlsym", k_dlsym);
     R("scePthreadMutexattrInit", k_mutexattr_init);
     R("scePthreadMutexattrSettype", k_mutexattr_settype);
     R("scePthreadMutexattrSetprotocol", k_mutexattr_setprotocol);

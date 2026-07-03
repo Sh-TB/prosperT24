@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cctype>
+#include <cmath>
+#include <cerrno>
 #ifdef _WIN32
 #include <malloc.h>   // _aligned_malloc
 #endif
@@ -138,6 +140,47 @@ HLE(h_delete)      { free(P(a0)); return 0; }
 // --- stdio ---
 // v*printf receive a guest-built va_list (a pointer to __va_list_tag under the SysV
 // ABI, which the host shares) — we can forward it directly.
+// --- byte ops / search (integer/pointer args → plain HLE thunks) ---
+HLE(h_bcmp)    { return (uint64_t)(int64_t)memcmp(CP(a0), CP(a1), a2); }   // bcmp == memcmp for equality
+HLE(h_bsearch) { // (key, base, nmemb, size, compar) — compar is a guest fn ptr; SysV ABI matches host
+    return (uint64_t)(uintptr_t)bsearch(CP(a0), CP(a1), a2, a3,
+                                        (int (*)(const void*, const void*))(uintptr_t)a4); }
+// _init_env / malloc_stats_fast: legitimately no-ops here (no PS5 process env vars; no malloc stats
+// sink). Registered so they resolve as real, intentional no-ops rather than logged "unimplemented".
+HLE(h_init_env)         { return 0; }
+HLE(h_malloc_stats_fast){ return 0; }
+// __error / __errno_location: FreeBSD/POSIX errno accessor — returns the address of the current
+// thread's errno. Guest threads ARE host pthreads, so the host's thread-local &errno is exactly
+// right, and it stays consistent with the errno our file/mem HLE thunks set. (A null stub here
+// would make the guest deref a null errno pointer.)
+HLE(h_errno_location)   { return (uint64_t)(uintptr_t)&errno; }
+
+// --- math (float/double args + returns travel in XMM regs). The HLE stub tail-jumps preserving
+// every register, so a handler with the correct native signature reads/writes the right regs and
+// is an exact host thunk. Registered by name; only the ones the guest imports actually bind. ---
+static float  m_sinf(float x){return sinf(x);}   static double m_sin(double x){return sin(x);}
+static float  m_cosf(float x){return cosf(x);}   static double m_cos(double x){return cos(x);}
+static float  m_tanf(float x){return tanf(x);}   static double m_tan(double x){return tan(x);}
+static float  m_asinf(float x){return asinf(x);} static double m_asin(double x){return asin(x);}
+static float  m_acosf(float x){return acosf(x);} static double m_acos(double x){return acos(x);}
+static float  m_atanf(float x){return atanf(x);} static double m_atan(double x){return atan(x);}
+static float  m_expf(float x){return expf(x);}   static double m_exp(double x){return exp(x);}
+static float  m_exp2f(float x){return exp2f(x);} static double m_exp2(double x){return exp2(x);}
+static float  m_logf(float x){return logf(x);}   static double m_log(double x){return log(x);}
+static float  m_log10f(float x){return log10f(x);}static double m_log10(double x){return log10(x);}
+static float  m_log2f(float x){return log2f(x);} static double m_log2(double x){return log2(x);}
+static float  m_sqrtf(float x){return sqrtf(x);} static double m_sqrt(double x){return sqrt(x);}
+static float  m_cbrtf(float x){return cbrtf(x);} static double m_cbrt(double x){return cbrt(x);}
+static float  m_floorf(float x){return floorf(x);}static double m_floor(double x){return floor(x);}
+static float  m_ceilf(float x){return ceilf(x);} static double m_ceil(double x){return ceil(x);}
+static float  m_roundf(float x){return roundf(x);}static double m_round(double x){return round(x);}
+static float  m_truncf(float x){return truncf(x);}static double m_trunc(double x){return trunc(x);}
+static float  m_fabsf(float x){return fabsf(x);} static double m_fabs(double x){return fabs(x);}
+static float  m_powf(float x,float y){return powf(x,y);}   static double m_pow(double x,double y){return pow(x,y);}
+static float  m_fmodf(float x,float y){return fmodf(x,y);} static double m_fmod(double x,double y){return fmod(x,y);}
+static float  m_atan2f(float x,float y){return atan2f(x,y);}static double m_atan2(double x,double y){return atan2(x,y);}
+static float  m_hypotf(float x,float y){return hypotf(x,y);}static double m_hypot(double x,double y){return hypot(x,y);}
+
 HLE(h_vsnprintf) { va_list ap; if (a3) memcpy(&ap, P(a3), sizeof(va_list)); return (uint64_t)(int64_t)vsnprintf((char*)P(a0), (size_t)a1, (const char*)P(a2), ap); }
 HLE(h_vsprintf)  { va_list ap; if (a2) memcpy(&ap, P(a2), sizeof(va_list)); return (uint64_t)(int64_t)vsprintf((char*)P(a0), (const char*)P(a1), ap); }
 // Variadic forms: forward the register args best-effort (handles the common
@@ -243,6 +286,21 @@ void register_builtin_hle() {
     // setjmp/longjmp family (real register-saving impl; used by Boehm GC root scanning)
     R("setjmp", prosper_setjmp);   R("_setjmp", prosper_setjmp);   R("sigsetjmp", prosper_setjmp);
     R("longjmp", prosper_longjmp); R("_longjmp", prosper_longjmp);  R("siglongjmp", prosper_longjmp);
+    // byte ops / search / env
+    R("bcmp", h_bcmp);   R("bsearch", h_bsearch);
+    R("_init_env", h_init_env);   R("malloc_stats_fast", h_malloc_stats_fast);
+    R("__error", h_errno_location);  R("__errno_location", h_errno_location);  R("___errno", h_errno_location);
+    // math (real host thunks; float args in XMM survive the tail-jump stub)
+    R("sinf", m_sinf); R("cosf", m_cosf); R("tanf", m_tanf); R("asinf", m_asinf); R("acosf", m_acosf);
+    R("atanf", m_atanf); R("atan2f", m_atan2f); R("expf", m_expf); R("exp2f", m_exp2f); R("logf", m_logf);
+    R("log10f", m_log10f); R("log2f", m_log2f); R("sqrtf", m_sqrtf); R("cbrtf", m_cbrtf); R("powf", m_powf);
+    R("floorf", m_floorf); R("ceilf", m_ceilf); R("roundf", m_roundf); R("truncf", m_truncf);
+    R("fmodf", m_fmodf); R("fabsf", m_fabsf); R("hypotf", m_hypotf);
+    R("sin", m_sin); R("cos", m_cos); R("tan", m_tan); R("asin", m_asin); R("acos", m_acos);
+    R("atan", m_atan); R("atan2", m_atan2); R("exp", m_exp); R("exp2", m_exp2); R("log", m_log);
+    R("log10", m_log10); R("log2", m_log2); R("sqrt", m_sqrt); R("cbrt", m_cbrt); R("pow", m_pow);
+    R("floor", m_floor); R("ceil", m_ceil); R("round", m_round); R("trunc", m_trunc);
+    R("fmod", m_fmod); R("fabs", m_fabs); R("hypot", m_hypot);
     #undef R
     register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)
     register_service_hle();  // PS5 system services (user/NP/pad/mouse/appcontent)

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <string>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -85,6 +86,22 @@ HLE(f_lseek) { return (uint64_t)(int64_t)::lseek((int)a0, (off_t)a1, (int)a2); }
 HLE(f_stat)  { std::string h = translate(CS(a0)); struct stat st; int r = ::stat(h.c_str(), &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_fstat) { struct stat st; int r = ::fstat((int)a0, &st); if (r == 0 && a1) to_sce_stat(st, (uint8_t*)P(a1)); return (uint64_t)(int64_t)r; }
 HLE(f_access){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::access(h.c_str(), (int)a1); }
+HLE(f_mkdir) { std::string h = translate(CS(a0));   // sceKernelMkdir(path, mode)
+#ifdef _WIN32
+    return (uint64_t)(int64_t)::_mkdir(h.c_str());
+#else
+    int r = ::mkdir(h.c_str(), (mode_t)(a1 ? a1 : 0777));
+    return (uint64_t)(int64_t)(r == 0 || errno == EEXIST ? 0 : r);   // treat "already exists" as success
+#endif
+}
+HLE(f_rmdir) { std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::rmdir(h.c_str()); }
+HLE(f_unlink){ std::string h = translate(CS(a0)); return (uint64_t)(int64_t)::
+#ifdef _WIN32
+    _unlink
+#else
+    unlink
+#endif
+    (h.c_str()); }
 
 void register_file_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
@@ -97,6 +114,10 @@ void register_file_hle() {
     R("sceKernelOpen", f_open);   R("sceKernelClose", f_close);  R("sceKernelRead", f_read);
     R("sceKernelWrite", f_write); R("sceKernelLseek", f_lseek);  R("sceKernelStat", f_stat);
     R("sceKernelFstat", f_fstat);
+    // directory / unlink (real host ops, /app0-translated)
+    R("mkdir", f_mkdir);          R("sceKernelMkdir", f_mkdir);
+    R("rmdir", f_rmdir);          R("sceKernelRmdir", f_rmdir);
+    R("unlink", f_unlink);        R("sceKernelUnlink", f_unlink);
     #undef R
 }
 
