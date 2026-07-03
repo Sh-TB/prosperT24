@@ -141,10 +141,18 @@ Turn the file into a resident, relocated guest image in host memory.
   the **GC thread** — it ran its body and is now blocked in `pthread_cond_wait` deep in the Boehm
   GC core (`Il2cpp+0x4870/0x514e/0x4a6f/0x7ed3`). So: **GC-thread startup handshake deadlock** —
   main waits for the GC thread to reach ready; the GC thread waits on a condvar for a trigger.
-- [ ] **Frontier (correctness):** work out the GC's exact startup handshake (Boehm GC threading
-      init) — which cond/predicate the GC thread waits on and who must signal it, and whether our
-      thread start ordering drops a signal. Fix the real protocol; no forced wakes. Tools ready:
-      `PROSPER_SYNCLOG`, `boot_trace`, gdb (`ptrace_scope=0`).
+- [x] Instrumented cond vars + sceKernel semaphores. Revealed the GC's cooperative
+      thread-suspension: **`SuspendSemaphore`/`ResumeSemaphore`** (init=0). PS5 can't use
+      signal-based suspension, so Boehm/IL2CPP GC suspends threads via these semaphores.
+- **Deadlock structure (precise):** main, in `il2cpp_init`, blocks in `0x1280c0` acquiring a
+  runtime lock `L = *(r14+0x90)` (`call 0x1e2390` @0x1285fc) — a **mutex held by another thread**.
+  The GC thread is parked on `SuspendSemaphore` (needs a resume). So a thread holds `L` across a
+  GC stop-the-world suspend, and main wants `L` → classic stop-the-world lock-ordering deadlock.
+- [ ] **Frontier (correctness):** determine (a) whether a GC collection is being triggered
+      *during init* and, if so, why (premature — likely GC heap accounting fed by our memory HLE),
+      and (b) which thread holds `L` and how the suspend/resume protocol should let it release.
+      Fix the real cause (e.g. correct GC heap sizing so it doesn't collect mid-init, or correct
+      the suspend/resume semantics) — no forced unlocks. Tools: `PROSPER_SYNCLOG`, `boot_trace`, gdb.
 
 ### M4 — Window + VideoOut + graphics-device init
 - [ ] `libSceVideoOut` → open an SDL3 window + Vulkan swapchain (headless offscreen for tests).
