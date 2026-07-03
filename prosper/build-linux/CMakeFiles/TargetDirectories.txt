@@ -1,8 +1,0 @@
-/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/CMakeFiles/self_dump.dir
-/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/CMakeFiles/prosper_core.dir
-/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/CMakeFiles/test_module.dir
-/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/CMakeFiles/test_trap_linux.dir
-/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/CMakeFiles/test_boot_linux.dir
-/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/CMakeFiles/test.dir
-/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/CMakeFiles/edit_cache.dir
-/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/CMakeFiles/rebuild_cache.dir

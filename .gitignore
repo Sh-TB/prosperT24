@@ -8,6 +8,8 @@ eboot.bin
 # ---- Build output ----
 /prosper/build/
 build/
+build-*/
+prosper/build-*/
 *.o
 *.obj
 *.exe

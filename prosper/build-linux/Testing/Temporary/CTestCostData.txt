@@ -1,4 +1,0 @@
-module_loads_eboot 2 0.0559789
-trap_identifies_imports 1 0.125397
-boot_reaches_first_syscall 1 0.122115
----
