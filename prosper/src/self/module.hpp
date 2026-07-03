@@ -60,6 +60,8 @@ struct Module {
     size_t   elf_base = 0;          // offset of inner ELF header in `file`
     uint16_t e_type = 0, e_machine = 0;
     uint64_t e_entry = 0;
+    // Module initialization (C++ global ctors etc.): DT_INIT + DT_INIT_ARRAY.
+    uint64_t init_va = 0, init_array_va = 0, init_array_sz = 0;
 
     std::vector<Segment> segments;  // all program headers (file-backed ones have file_off)
     std::vector<Segment> loads;     // just the ones that occupy VA space

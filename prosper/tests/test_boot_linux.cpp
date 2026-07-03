@@ -44,9 +44,10 @@ int main(int argc, char** argv) {
     volatile int* p = (volatile int*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     *p = 0; dispatch_set_progress(p);
 
-    printf("  entry=0x%llx  running guest in a child process...\n", (unsigned long long)prog.entry);
+    printf("  entry=0x%llx  %zu dependent-module init fns  running guest in a child...\n",
+           (unsigned long long)prog.entry, prog.init_fns.size());
     pid_t pid = fork();
-    if (pid == 0) { run_entry(prog.imgs[0]); _exit(0); }
+    if (pid == 0) { run_guest_inits(prog.init_fns); run_entry(prog.imgs[0]); _exit(0); }
     for (int i = 0; i < 200; i++) { int st; if (waitpid(pid, &st, WNOHANG) == pid) break; struct timespec ts{0, 50 * 1000 * 1000}; nanosleep(&ts, nullptr); }
     int st; if (waitpid(pid, &st, WNOHANG) == 0) { kill(pid, SIGKILL); waitpid(pid, &st, 0); }
 

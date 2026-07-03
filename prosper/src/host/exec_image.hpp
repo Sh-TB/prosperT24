@@ -38,6 +38,11 @@ struct BootResult {
     uint64_t     fault_addr = 0, fault_rip = 0;
     uint64_t     rbp = 0, rsp = 0, rax = 0, rdi = 0, rsi = 0, rdx = 0; // regs at fault
 };
+// Run dependent-module init functions (C++ global ctors etc.) before entry. Each is
+// called under a per-thread recovery point; a faulting init is skipped (best-effort).
+// Returns the number that ran without faulting.
+size_t run_guest_inits(const std::vector<uint64_t>& fns);
+
 // Set up a SysV-style stack + argc/argv, jump to img.entry, run until it returns or
 // faults. Unimplemented imports are logged along the way (see dispatch.hpp).
 BootResult run_entry(const LoadedImage& img);

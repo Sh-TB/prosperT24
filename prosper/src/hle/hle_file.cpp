@@ -24,13 +24,15 @@ namespace prosper {
 
 namespace {
     std::string g_app0;   // host directory backing guest "/app0"
+    bool filelog() { static int v = getenv("PROSPER_FILELOG") ? 1 : 0; return v; }
     std::string translate(const char* guest) {
         if (!guest) return {};
         std::string p = guest;
         if (g_app0.empty()) { if (const char* e = getenv("PROSPER_APP0")) g_app0 = e; }
         // Map /app0[/...] -> <root>[/...]; leave other absolute paths as-is.
-        if (p.rfind("/app0", 0) == 0) return g_app0 + p.substr(5);
-        return p;
+        std::string h = (p.rfind("/app0", 0) == 0) ? g_app0 + p.substr(5) : p;
+        if (filelog()) fprintf(stderr, "[file] open '%s' -> '%s'\n", guest, h.c_str());
+        return h;
     }
 }
 

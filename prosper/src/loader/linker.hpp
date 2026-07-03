@@ -18,6 +18,7 @@ struct Program {
     std::vector<std::unique_ptr<Module>> mods;   // unique_ptr: stable addresses for imports[]
     std::vector<LoadedImage>             imgs;    // parallel to mods
     std::vector<ImportSlot>              slots;   // unresolved imports -> stub slots
+    std::vector<uint64_t>                init_fns; // dependent-module init fns, in call order
     uint64_t entry = 0;                            // main module entry
     uint64_t stub_base = 0, stub_size = 32;
 

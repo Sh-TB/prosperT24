@@ -107,6 +107,9 @@ std::optional<Module> Module::load(const std::string& path, std::string* err) {
             case 0x17: m.jmprel_va = d.d_val; break;
             case 2:  m.jmprel_sz = d.d_val; break;
             case 3:  m.pltgot_va = d.d_val; break;
+            case 0xc:  m.init_va = d.d_val; break;         // DT_INIT
+            case 0x19: m.init_array_va = d.d_val; break;   // DT_INIT_ARRAY
+            case 0x1b: m.init_array_sz = d.d_val; break;   // DT_INIT_ARRAYSZ
             case 0x6100003f: m.symtabsz = d.d_val; break;
             case 0x61000035: if (!m.strtab_va) m.strtab_va = d.d_val; break;
             case 0x61000039: if (!m.symtab_va) m.symtab_va = d.d_val; break;

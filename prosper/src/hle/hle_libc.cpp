@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdarg>
+#include <cctype>
 #ifdef _WIN32
 #include <malloc.h>   // _aligned_malloc
 #endif
@@ -90,6 +91,34 @@ HLE(h_puts)      { int r = fputs((const char*)P(a0), stdout); fputc('\n', stdout
 HLE(h_putchar)   { return (uint64_t)(int64_t)putchar((int)a0); }
 HLE(h_fputs)     { return (uint64_t)(int64_t)fputs((const char*)P(a0), a1 ? (FILE*)P(a1) : stdout); }
 
+// --- locale / ctype (Dinkumware CRT: _Getpctype/_Getpt{o,}lower return table ptrs) ---
+// Tables have 257 entries; element [-1] is the EOF slot, so we return base+1 and the
+// guest indexes [c] for c in 0..255 (and [-1] for EOF). Classification bits follow the
+// common MSVCRT/Dinkumware layout; built from the host's ctype so they're correct.
+namespace {
+    short g_ctype[257], g_tolow[257], g_toup[257];
+    bool  g_ctype_built = false;
+    void build_ctype() {
+        if (g_ctype_built) return;
+        g_ctype[0] = g_tolow[0] = g_toup[0] = 0;   // EOF slot
+        for (int c = 0; c < 256; c++) {
+            short m = 0;
+            if (isupper(c)) m |= 0x01; if (islower(c)) m |= 0x02; if (isdigit(c)) m |= 0x04;
+            if (isspace(c)) m |= 0x08; if (ispunct(c)) m |= 0x10; if (iscntrl(c)) m |= 0x20;
+            if (c == ' ' || c == '\t') m |= 0x40; if (isxdigit(c)) m |= 0x80;
+            g_ctype[c + 1] = m;
+            g_tolow[c + 1] = (short)tolower(c);
+            g_toup[c + 1]  = (short)toupper(c);
+        }
+        g_ctype_built = true;
+    }
+}
+HLE(h_getpctype)  { build_ctype(); return (uint64_t)(uintptr_t)(g_ctype + 1); }
+HLE(h_getptolow)  { build_ctype(); return (uint64_t)(uintptr_t)(g_tolow + 1); }
+HLE(h_getptoup)   { build_ctype(); return (uint64_t)(uintptr_t)(g_toup + 1); }
+HLE(h_mbcurmax)   { static int one = 1; return (uint64_t)(uintptr_t)&one; }   // __ctype_get_mb_cur_max ptr/val
+HLE(h_setlocale)  { static char c[] = "C"; return (uint64_t)(uintptr_t)c; }
+
 // C++/CRT lifecycle: we don't run global destructors, so registration is a no-op.
 HLE(h_atexit)      { return 0; }
 HLE(h_cxa_atexit)  { return 0; }
@@ -142,6 +171,9 @@ void register_builtin_hle() {
     R("snprintf", h_snprintf);   R("sprintf", h_sprintf);
     R("printf", h_printf);       R("puts", h_puts);
     R("putchar", h_putchar);     R("fputs", h_fputs);
+    // locale / ctype
+    R("_Getpctype", h_getpctype); R("_Getptolower", h_getptolow); R("_Getptoupper", h_getptoup);
+    R("__ctype_get_mb_cur_max", h_mbcurmax); R("setlocale", h_setlocale);
     R("atexit", h_atexit);   R("__cxa_atexit", h_cxa_atexit); R("__cxa_finalize", h_cxa_finalize);
     R("__cxa_guard_acquire", h_guard_acquire);
     R("__cxa_guard_release", h_guard_release);

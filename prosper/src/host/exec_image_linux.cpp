@@ -120,6 +120,18 @@ uint64_t invoke_stub(uint64_t idx) {
     return fn();
 }
 
+size_t run_guest_inits(const std::vector<uint64_t>& fns) {
+    size_t ok = 0;
+    for (uint64_t f : fns) {
+        g_trap_kind = 0; g_armed = true;
+        if (sigsetjmp(g_jb, 1) == 0) { ((void (*)())(uintptr_t)f)(); ok++; }
+        g_armed = false;
+        if (g_trap_kind) fprintf(stderr, "[prosper] init fn 0x%llx faulted (%s); continuing\n",
+                                 (unsigned long long)f, trap_detail().c_str());
+    }
+    return ok;
+}
+
 BootResult run_entry(const LoadedImage& img) {
     const size_t STK = 16 * 1024 * 1024;
     void* stk = mmap(nullptr, STK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
