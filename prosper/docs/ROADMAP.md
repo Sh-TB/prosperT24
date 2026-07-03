@@ -160,11 +160,17 @@ Turn the file into a resident, relocated guest image in host memory.
       arg0 → "Bad stack base in GC_register_my_thread"). Boot now runs deep into il2cpp_init; the
       guest main() prints its args. (The earlier "marshaling" abort read was a wrong-rodata-offset
       artifact — the real messages were GC errors.)
-- [ ] **Frontier (correctness): null deref in IL2CPP type resolution.** Main faults SIGSEGV addr=0x18
-      at `Il2cpp+0xa62036`: it reads `rax=[type+0xc0]` (null) then derefs `[rax+0x18]`. Deep in a
-      recursive type/metadata-resolution chain (il2cpp_init → 0x16ab1f → 0x19a124 → 0x1691ec →
-      0x16b981 → 0x16ba41 → … → 0xc0fec7 → 0xd8d65b → 0xa62036). Find which type has a null field at
-      +0xc0 and why (metadata not populated / wrong HLE value). Tools: `boot_trace`, gdb.
+- [x] **IL2CPP init COMPLETES.** The rgctx null-deref was bypassed by making `sceKernelDlsym` honest
+      (return ESRCH for "scriptingGetMem" instead of fake success, keeping the caller's fallback) —
+      the game then takes the correct path and finishes `il2cpp_init`.
+- [x] **Runtime startup runs.** Auto-dismiss `sceMsgDialog`, hide splash, real `sceKernelUsleep`.
+- [x] **Reaches the GPU pipeline.** Headless libSceAgc/libSceVideoOut + event queues (hle_graphics.cpp,
+      hle_kernel_time.cpp): the game opens the display, drives its flip/render loop, and enters the
+      GPU memory/command path. Guest `main()` prints; boots through the entire non-graphics runtime.
+- [ ] **FRONTIER — the graphics stack (M4/M5).** Fault at `eboot+0x3a938c` reading a table at a GPU
+      virtual address `0x100000000`. Needs the real GPU work: unified GPU-memory model, **libSceAgc →
+      Vulkan** command-buffer translation, an **RDNA2 shader recompiler**, and **libSceVideoOut** window/
+      swapchain. Recommended start: real libSceVideoOut (window + Vulkan swapchain), then AGC cmd decode.
 
 ### M4 — Window + VideoOut + graphics-device init
 - [ ] `libSceVideoOut` → open an SDL3 window + Vulkan swapchain (headless offscreen for tests).
