@@ -1,0 +1,82 @@
+// hle_service.cpp — HLE of PS5 system services (user, NP/online, pad, mouse, app content,
+// dialogs). Bring-up policy: openers return a valid positive handle; queries zero their
+// output struct and report a sane "not signed in / no device" state and success, so the
+// game gets consistent values instead of uninitialized memory.
+#include "dispatch.hpp"
+#include "nid.hpp"
+#include <cstdint>
+#include <cstring>
+#include <cstdio>
+#include <atomic>
+
+namespace prosper {
+
+#define HLE(name) static uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, \
+                                       uint64_t a3, uint64_t a4, uint64_t a5)
+#define PW(x) ((void*)(uintptr_t)(x))
+
+namespace { std::atomic<uint64_t> g_handle{1}; }
+
+// --- user service ---
+HLE(s_user_initial)   { if (a0) *(int32_t*)PW(a0) = 1; return 0; }           // GetInitialUser -> userId 1
+HLE(s_user_idlist)    { if (a0) { int32_t* p = (int32_t*)PW(a0); p[0] = 1; for (int i = 1; i < 4; i++) p[i] = -1; } return 0; }
+// Bounded, non-padding write (strncpy would zero-pad the whole a2-byte buffer -> a
+// stack-smash if a2 is large/garbage). snprintf writes only the string + NUL.
+HLE(s_user_name)      { if (a1) snprintf((char*)PW(a1), a2 ? (size_t)a2 : 17, "%s", "Player"); return 0; }
+HLE(s_user_int_out)   { if (a1) *(int32_t*)PW(a1) = 0; return 0; }           // accessibility getters -> 0
+HLE(s_ok)             { return 0; }
+
+// --- NP / online (single-player: report signed-out / unreachable, success) ---
+HLE(s_np_state)       { if (a1) *(int32_t*)PW(a1) = 1; return 0; }           // SCE_NP_STATE_SIGNED_OUT
+HLE(s_np_reach)       { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
+HLE(s_np_accountid)   { if (a1) *(uint64_t*)PW(a1) = 0; return 0; }
+HLE(s_np_country)     { if (a1) memset(PW(a1), 0, 4); return 0; }
+
+// --- pad / mouse (report a device that exists but has no input) ---
+HLE(s_open)           { return g_handle++; }                                 // scePadOpen/sceMouseOpen -> handle
+// Conservative output sizes so we don't smash a smaller caller buffer.
+HLE(s_pad_info)       { if (a1) memset(PW(a1), 0, 0x20); return 0; }          // controller info -> zeroed
+HLE(s_pad_read)       { if (a1) memset(PW(a1), 0, 0x30); return 0; }          // pad state -> neutral
+HLE(s_pad_readstate)  { if (a1) memset(PW(a1), 0, 0x30); return 0; }
+
+// --- app content ---
+HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
+
+void register_service_hle() {
+    #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+    // user service
+    R("sceUserServiceGetInitialUser", s_user_initial);
+    R("sceUserServiceGetLoginUserIdList", s_user_idlist);
+    R("sceUserServiceGetUserName", s_user_name);
+    R("sceUserServiceGetAccessibilityVibration", s_user_int_out);
+    R("sceUserServiceGetAccessibilityPressAndHoldDelay", s_user_int_out);
+    R("sceUserServiceGetAccessibilityZoomEnabled", s_user_int_out);
+    R("sceUserServiceInitialize", s_ok);
+    R("sceUserServiceTerminate", s_ok);
+    // NP
+    R("sceNpGetState", s_np_state);
+    R("sceNpGetNpReachabilityState", s_np_reach);
+    R("sceNpGetAccountIdA", s_np_accountid);
+    R("sceNpGetAccountCountryA", s_np_country);
+    R("sceNpCheckCallback", s_ok);
+    R("sceNpRegisterStateCallback", s_ok);
+    // pad / mouse
+    R("scePadInit", s_ok);
+    R("scePadOpen", s_open);
+    R("scePadClose", s_ok);
+    R("scePadGetControllerInformation", s_pad_info);
+    R("scePadDeviceClassGetExtendedInformation", s_pad_info);
+    R("scePadReadState", s_pad_readstate);
+    R("scePadRead", s_pad_read);
+    R("sceMouseInit", s_ok);
+    R("sceMouseOpen", s_open);
+    R("sceMouseRead", s_pad_read);
+    // app content / dialogs
+    R("sceAppContentInitialize", s_ok);
+    R("sceAppContentAppParamGetInt", s_appcontent_int);
+    R("sceCommonDialogInitialize", s_ok);
+    R("sceSystemServiceParamGetInt", s_appcontent_int);
+    #undef R
+}
+
+} // namespace prosper

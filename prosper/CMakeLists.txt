@@ -46,8 +46,11 @@ if(TARGET prosper_core)
   add_test(NAME nid_hash_matches_imports
            COMMAND test_nid "${GAME_DUMP}/eboot.bin")
 
-  # M2: real memory mapping + import trap (Linux only).
+  # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux only).
   if(UNIX AND NOT APPLE)
+    add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
+    target_link_libraries(boot_trace PRIVATE prosper_core)
+
     add_executable(test_trap_linux tests/test_trap_linux.cpp)
     target_link_libraries(test_trap_linux PRIVATE prosper_core)
     add_test(NAME trap_identifies_imports

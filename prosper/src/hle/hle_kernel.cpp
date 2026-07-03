@@ -84,6 +84,19 @@ HLE(k_pthread_join)   { void* rv = nullptr; pthread_join((pthread_t)a0, a1 ? &rv
 HLE(k_pthread_detach) { pthread_detach((pthread_t)a0); return 0; }
 HLE(k_pthread_exit)   { pthread_exit((void*)(uintptr_t)a0); return 0; }
 
+// --- thread-local storage keys (IL2CPP uses these heavily) -> host pthread keys ---
+HLE(k_key_create) {
+    if (!a0) return 0x16;
+    pthread_key_t k;
+    int r = pthread_key_create(&k, (void (*)(void*))(uintptr_t)a1);
+    if (r) return (uint64_t)r;
+    *(uint32_t*)(uintptr_t)a0 = (uint32_t)k;   // hand the guest our host key
+    return 0;
+}
+HLE(k_key_delete)    { pthread_key_delete((pthread_key_t)a0); return 0; }
+HLE(k_getspecific)   { return (uint64_t)(uintptr_t)pthread_getspecific((pthread_key_t)a0); }
+HLE(k_setspecific)   { return (uint64_t)(int64_t)pthread_setspecific((pthread_key_t)a0, (void*)(uintptr_t)a1); }
+
 void register_kernel_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     R("scePthreadMutexattrInit", k_mutexattr_init);
@@ -119,6 +132,12 @@ void register_kernel_hle() {
     R("scePthreadAttrSetdetachstate", k_attr_noop);
     R("scePthreadAttrGetschedparam", k_attr_noop);
     R("scePthreadAttrGetstacksize", k_attr_noop);
+    // TLS keys (POSIX + Sony names -> host pthread keys)
+    R("pthread_key_create", k_key_create);   R("scePthreadKeyCreate", k_key_create);
+    R("pthread_key_delete", k_key_delete);   R("scePthreadKeyDelete", k_key_delete);
+    R("pthread_getspecific", k_getspecific); R("scePthreadGetspecific", k_getspecific);
+    R("pthread_setspecific", k_setspecific); R("scePthreadSetspecific", k_setspecific);
+    R("pthread_self", k_pthread_self);
     #undef R
     register_kernel_mem_hle();    // virtual/direct memory
     register_kernel_time_hle();   // time/clock + C11 threads + stubs

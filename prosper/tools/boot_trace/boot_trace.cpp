@@ -1,0 +1,57 @@
+// boot_trace — link the game's modules, boot the guest, and report how far it got:
+// the unimplemented-call trace (via stderr from dispatch) plus, on a fault, the register
+// state and an rbp-chain backtrace classified by module. The primary bring-up debugging
+// tool. Linux only. Usage: boot_trace <dump-root>
+#include "loader/linker.hpp"
+#include "host/exec_image.hpp"
+#include "hle/dispatch.hpp"
+#include <cstdio>
+#include <string>
+
+using namespace prosper;
+
+// Module bases (keep in sync with the inputs below).
+static const uint64_t EBOOT = 0x400000000ull, IL2CPP = 0x440000000ull, PS5UTIL = 0x4c0000000ull, STUB = 0x600000000ull;
+static const char* cls(uint64_t a) {
+    if (a >= EBOOT   && a < IL2CPP)  return "eboot";
+    if (a >= IL2CPP  && a < PS5UTIL) return "Il2cpp";
+    if (a >= PS5UTIL && a < 0x500000000ull) return "PS5Util";
+    if (a >= STUB    && a < 0x610000000ull) return "STUB";
+    return "mapped/host";
+}
+static uint64_t bof(uint64_t a) {
+    if (a >= EBOOT   && a < IL2CPP)  return a - EBOOT;
+    if (a >= IL2CPP  && a < PS5UTIL) return a - IL2CPP;
+    if (a >= PS5UTIL && a < 0x500000000ull) return a - PS5UTIL;
+    return a;
+}
+
+int main(int argc, char** argv) {
+    std::string d = (argc >= 2) ? argv[1] : "../../PPSA24651-app0";
+    Program p; std::string e;
+    std::vector<LinkInput> in = {
+        { d + "/eboot.bin", EBOOT },
+        { d + "/Media/Modules/Il2cppUserAssemblies.prx", IL2CPP },
+        { d + "/Media/Modules/PS5Util.prx", PS5UTIL },
+    };
+    if (!link_program(in, STUB, p, &e)) { printf("link failed: %s\n", e.c_str()); return 1; }
+    printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns\n",
+           p.mods.size(), p.total_imports, p.resolved_cross_module, p.slots.size(), p.init_fns.size());
+
+    register_builtin_hle();
+    set_app0_root(d);
+    for (auto& img : p.imgs) if (!map_image(img, &e)) { printf("map failed: %s\n", e.c_str()); return 1; }
+    if (!install_stubs(p.slots, p.stub_base, p.stub_size, &e)) { printf("stubs failed: %s\n", e.c_str()); return 1; }
+    install_trap_handler();
+    run_guest_inits(p.init_fns);
+
+    BootResult r = run_entry(p.imgs[0]);
+    printf("\n=== RUN ENDED: kind=%d  %s ===\n", r.kind, r.detail.c_str());
+    printf("  rip=%s+0x%llx  fault_addr=0x%llx\n  rax=0x%llx rbx=? rdi=0x%llx rsi=0x%llx rdx=0x%llx rbp=0x%llx rsp=0x%llx\n",
+           cls(r.fault_rip), (unsigned long long)bof(r.fault_rip), (unsigned long long)r.fault_addr,
+           (unsigned long long)r.rax, (unsigned long long)r.rdi, (unsigned long long)r.rsi,
+           (unsigned long long)r.rdx, (unsigned long long)r.rbp, (unsigned long long)r.rsp);
+    printf("  backtrace (%zu frames):\n", r.backtrace.size());
+    for (uint64_t a : r.backtrace) printf("    %-12s +0x%llx\n", cls(a), (unsigned long long)bof(a));
+    return 0;
+}

@@ -39,6 +39,8 @@ void register_kernel_hle();
 void register_file_hle();
 // Set the host directory backing the guest's "/app0" (the game data root).
 void set_app0_root(const std::string& root);
+// PS5 system services (user/NP/pad/mouse/appcontent/dialog); called by register_builtin_hle().
+void register_service_hle();
 // libkernel virtual/direct memory (Linux backing); called by register_kernel_hle().
 void register_kernel_mem_hle();
 // libkernel time/clock + C11 threads + assorted stubs; called by register_kernel_hle().

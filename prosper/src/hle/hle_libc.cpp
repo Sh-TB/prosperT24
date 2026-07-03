@@ -183,6 +183,7 @@ void register_builtin_hle() {
     R("__cxa_increment_exception_refcount", h_cxa_inc_refcount);
     #undef R
     register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)
+    register_service_hle();  // PS5 system services (user/NP/pad/mouse/appcontent)
     register_kernel_hle();   // libkernel primitives (pthread/sync/...)
 }
 

@@ -97,11 +97,20 @@ Turn the file into a resident, relocated guest image in host memory.
 - **The game's `main()` runs and prints output** (`"Argument Count = 1 … /app0/eboot.bin"`),
   then initializes PS5 services: user (accessibility), NP/online state, **controller
   (`scePadOpen`)**, mouse, AppContent, CommonDialog.
-- [ ] Current crash: eboot init (`eboot+0x146ed30` subtree) jumps through an uninitialized
-      function pointer into mapped memory — trace which init/callback is missing.
-- [ ] Then: per-thread TCB; implement the service functions that return handles/objects
-      (scePadOpen, user/NP); then **`libSceVideoOut` (window/swapchain)** and
-      **`libSceAgc` → Vulkan + RDNA2 shader recompiler** (first frame).
+- [x] PS5 system services (`src/hle/hle_service.cpp`): user (initial user, name, accessibility),
+      NP/online (signed-out state, account), pad/mouse (open→handle, zeroed state), app content,
+      dialogs — openers return handles, queries zero their output + report sane state.
+- [x] pthread TLS **keys** (`pthread_key_create`/`get`/`setspecific`) → host pthread keys (IL2CPP TLS).
+- [x] `boot_trace` debug tool (`tools/boot_trace/`): links all modules, boots, prints the
+      unimplemented-call trace + register state + module-classified rbp backtrace on fault.
+- **Now**: boots deep into the **IL2CPP runtime** (backtrace: main→eboot→Il2cpp+0x107752→…→0x13ade0).
+- [ ] **Current frontier**: genuine stack corruption inside IL2CPP runtime init (fn `Il2cpp+0x13ade0`;
+      its stack canary fails → `__stack_chk_fail` → `ud2`/SIGILL). Suspect a HLE data-size/ABI
+      mismatch feeding a stack buffer, or missing **TLS (`%fs`)**. Next: set up guest TLS with
+      `%fs`-swap trampolines at the HLE boundary (the big remaining foundational piece), and
+      trace `0x13ade0`'s callees for the corrupting write.
+- [ ] Then: **`libSceVideoOut` (window/swapchain)** and **`libSceAgc` → Vulkan + RDNA2 shader
+      recompiler** (first frame).
 - **Verify (programmatic, GREEN):** `tests/test_trap_linux.cpp` (map + identify 4
   representative imports) and `tests/test_boot_linux.cpp` (jump into real entry,
   assert it reaches an import trap). Both headless, exit-code = truth.
