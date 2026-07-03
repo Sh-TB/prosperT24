@@ -104,13 +104,24 @@ Turn the file into a resident, relocated guest image in host memory.
 - [x] `boot_trace` debug tool (`tools/boot_trace/`): links all modules, boots, prints the
       unimplemented-call trace + register state + module-classified rbp backtrace on fault.
 - **Now**: boots deep into the **IL2CPP runtime** (backtrace: main→eboot→Il2cpp+0x107752→…→0x13ade0).
-- [ ] **Current frontier**: genuine stack corruption inside IL2CPP runtime init (fn `Il2cpp+0x13ade0`;
-      its stack canary fails → `__stack_chk_fail` → `ud2`/SIGILL). Suspect a HLE data-size/ABI
-      mismatch feeding a stack buffer, or missing **TLS (`%fs`)**. Next: set up guest TLS with
-      `%fs`-swap trampolines at the HLE boundary (the big remaining foundational piece), and
-      trace `0x13ade0`'s callees for the corrupting write.
-- [ ] Then: **`libSceVideoOut` (window/swapchain)** and **`libSceAgc` → Vulkan + RDNA2 shader
-      recompiler** (first frame).
+- [x] Root-caused & fixed the IL2CPP-init stack smash: `fstat` was memcpy'ing 144-byte Linux
+      `struct stat` into the guest's **0x78-byte FreeBSD `SceKernelStat`** buffer, smashing a
+      canary. Now translated to the correct FreeBSD layout (`hle_file.cpp:to_sce_stat`).
+- **Now: IL2CPP loads the game's C# metadata.** The guest opens
+  `/app0/Media/Metadata/global-metadata.dat`, `/dev/urandom`, dev-log paths, and reaches
+  **IL2CPP internal-call / type resolution**, initializing event flags, semaphores, an
+  exception handler, thread-stack queries, `setjmp`, `dlsym`.
+- [x] GC thread-stack queries (`scePthreadAttrGet`/`Getstackaddr`/`Getstacksize`) via
+      `pthread_getattr_np` (real bounds for IL2CPP's GC root scanning).
+- [ ] **Current frontier — graphics required.** IL2CPP aborts during internal-call resolution
+      on `UnityEngine.GL::Internal_SetRTSimple_Injected` (SetRenderTarget) at `Il2cpp+0x110ea`.
+      The rendering icalls are registered when the engine's **graphics device initializes**, so
+      the boot now genuinely needs the GPU path. This is the transition to M4/M5.
+### M4 — Window + VideoOut + graphics-device init  ← NEXT
+- [ ] `libSceVideoOut` → open an SDL3 window + Vulkan swapchain (headless offscreen for tests).
+- [ ] Enough `libSceAgc`/`AgcDriver` + video-out for the engine's graphics device to init and
+      register its rendering internal calls (unblocks the IL2CPP abort).
+### M5 — AGC → Vulkan + shader recompiler → first frame
 - **Verify (programmatic, GREEN):** `tests/test_trap_linux.cpp` (map + identify 4
   representative imports) and `tests/test_boot_linux.cpp` (jump into real entry,
   assert it reaches an import trap). Both headless, exit-code = truth.

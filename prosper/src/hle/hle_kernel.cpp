@@ -2,6 +2,9 @@
 // pthreads (guest ABI == host SysV ABI). Sony pthread types are opaque pointer
 // handles: scePthreadMutexInit(&handle, &attr, name) allocates the object and stores
 // the pointer through the caller's handle slot, returning 0 on success.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   // pthread_getattr_np
+#endif
 #include "dispatch.hpp"
 #include "nid.hpp"
 #include <pthread.h>
@@ -71,6 +74,30 @@ HLE(k_attr_destroy)     { if (a0 && *(void**)a0) { pthread_attr_destroy((pthread
 HLE(k_attr_setstacksize){ if (a0 && *(void**)a0 && a1 >= 16384) pthread_attr_setstacksize((pthread_attr_t*)*(void**)a0, a1); return 0; }
 HLE(k_attr_noop)        { return 0; }
 
+// Query the CURRENT thread's real attributes into the caller's attr object (the GC needs
+// accurate stack bounds to scan roots; bad bounds make IL2CPP's GC init assert).
+HLE(k_attr_get) {
+    if (a0 && *(void**)a0) pthread_getattr_np(pthread_self(), (pthread_attr_t*)*(void**)a0);
+    return 0;
+}
+// scePthreadAttrGetstackaddr(attr, void** addr) — Sony reports the stack *base* (low addr).
+HLE(k_attr_getstackaddr) {
+    if (a0 && *(void**)a0 && a1) {
+        void* base = nullptr; size_t sz = 0;
+        pthread_attr_getstack((pthread_attr_t*)*(void**)a0, &base, &sz);
+        *(void**)(uintptr_t)a1 = base;
+    }
+    return 0;
+}
+HLE(k_attr_getstacksize) {
+    if (a0 && *(void**)a0 && a1) {
+        void* base = nullptr; size_t sz = 0;
+        pthread_attr_getstack((pthread_attr_t*)*(void**)a0, &base, &sz);
+        *(size_t*)(uintptr_t)a1 = sz;
+    }
+    return 0;
+}
+
 // --- thread creation: run the guest entry on a real host thread (ABI matches) ---
 HLE(k_pthread_create) {
     pthread_attr_t* at = (a1 && *(void**)a1) ? (pthread_attr_t*)*(void**)a1 : nullptr;
@@ -131,7 +158,10 @@ void register_kernel_hle() {
     R("scePthreadAttrSetschedparam", k_attr_noop);
     R("scePthreadAttrSetdetachstate", k_attr_noop);
     R("scePthreadAttrGetschedparam", k_attr_noop);
-    R("scePthreadAttrGetstacksize", k_attr_noop);
+    R("scePthreadAttrGet", k_attr_get);
+    R("scePthreadAttrGetstackaddr", k_attr_getstackaddr);
+    R("scePthreadAttrGetstacksize", k_attr_getstacksize);
+    R("scePthreadGetstack", k_attr_getstackaddr);
     // TLS keys (POSIX + Sony names -> host pthread keys)
     R("pthread_key_create", k_key_create);   R("scePthreadKeyCreate", k_key_create);
     R("pthread_key_delete", k_key_delete);   R("scePthreadKeyDelete", k_key_delete);
