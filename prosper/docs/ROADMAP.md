@@ -154,11 +154,17 @@ Turn the file into a resident, relocated guest image in host memory.
       `SuspendSemaphore`. Implemented real async exception delivery (`pthread_sigqueue` RT signal →
       SA_SIGINFO handler synthesises a FreeBSD mcontext → runs the guest handler on the target
       thread) + real `setjmp`/`longjmp` (GC root-register flush). Boot now runs far past GC init.
-- [ ] **Frontier (correctness): IL2CPP marshaling abort.** A worker aborts at `Il2cpp+0x110d3`
-      (`ud2` after guest abort): *"field 'Instructions' of type 'InstructionArray': Reference type
-      field marshaling is not supported"*. Real PS5 shouldn't hit this → find why our env drives
-      IL2CPP into marshaling this type (branch at 0x110ad; wrong metadata value / eager marshaling /
-      speculative type-load on a worker). Disassemble the marshal-info builder around 0x110xx.
+- [x] **SOLVED — GC stack scanning** (two more fixes after the deadlock): exception context sp is
+      at offset **0xf8** (set context[0xf8]=rsp; fixes "GC_push_all_stacks: sp not set!"); and
+      **scePthreadAttrGet(thread, attr)** takes the attr in **arg1** not arg0 (k_attr_get was reading
+      arg0 → "Bad stack base in GC_register_my_thread"). Boot now runs deep into il2cpp_init; the
+      guest main() prints its args. (The earlier "marshaling" abort read was a wrong-rodata-offset
+      artifact — the real messages were GC errors.)
+- [ ] **Frontier (correctness): null deref in IL2CPP type resolution.** Main faults SIGSEGV addr=0x18
+      at `Il2cpp+0xa62036`: it reads `rax=[type+0xc0]` (null) then derefs `[rax+0x18]`. Deep in a
+      recursive type/metadata-resolution chain (il2cpp_init → 0x16ab1f → 0x19a124 → 0x1691ec →
+      0x16b981 → 0x16ba41 → … → 0xc0fec7 → 0xd8d65b → 0xa62036). Find which type has a null field at
+      +0xc0 and why (metadata not populated / wrong HLE value). Tools: `boot_trace`, gdb.
 
 ### M4 — Window + VideoOut + graphics-device init
 - [ ] `libSceVideoOut` → open an SDL3 window + Vulkan swapchain (headless offscreen for tests).
