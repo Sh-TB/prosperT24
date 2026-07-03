@@ -46,6 +46,10 @@ if(TARGET prosper_core)
   add_test(NAME nid_hash_matches_imports
            COMMAND test_nid "${GAME_DUMP}/eboot.bin")
 
+  add_executable(test_hle_registered tests/test_hle_registered.cpp)
+  target_link_libraries(test_hle_registered PRIVATE prosper_core)
+  add_test(NAME hle_functions_registered COMMAND test_hle_registered)
+
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux only).
   if(UNIX AND NOT APPLE)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)

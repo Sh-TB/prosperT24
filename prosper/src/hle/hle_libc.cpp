@@ -182,6 +182,17 @@ static float  m_atan2f(float x,float y){return atan2f(x,y);}static double m_atan
 static float  m_hypotf(float x,float y){return hypotf(x,y);}static double m_hypot(double x,double y){return hypot(x,y);}
 static void   m_sincosf(float x, float* s, float* c)   { *s = sinf(x); *c = cosf(x); }
 static void   m_sincos (double x, double* s, double* c){ *s = sin(x);  *c = cos(x);  }
+static double m_ldexp(double x,int n){return ldexp(x,n);}    static float  m_ldexpf(float x,int n){return ldexpf(x,n);}
+static double m_frexp(double x,int* e){return frexp(x,e);}   static float  m_frexpf(float x,int* e){return frexpf(x,e);}
+static double m_modf(double x,double* i){return modf(x,i);}  static float  m_modff(float x,float* i){return modff(x,i);}
+static double m_copysign(double x,double y){return copysign(x,y);} static float m_copysignf(float x,float y){return copysignf(x,y);}
+static double m_fmin(double x,double y){return fmin(x,y);}   static float  m_fminf(float x,float y){return fminf(x,y);}
+static double m_fmax(double x,double y){return fmax(x,y);}   static float  m_fmaxf(float x,float y){return fmaxf(x,y);}
+static double m_sinh(double x){return sinh(x);}   static float m_sinhf(float x){return sinhf(x);}
+static double m_cosh(double x){return cosh(x);}   static float m_coshf(float x){return coshf(x);}
+static double m_tanh(double x){return tanh(x);}   static float m_tanhf(float x){return tanhf(x);}
+static double m_log1p(double x){return log1p(x);} static float m_log1pf(float x){return log1pf(x);}
+static double m_expm1(double x){return expm1(x);} static float m_expm1f(float x){return expm1f(x);}
 
 HLE(h_vsnprintf) { va_list ap; if (a3) memcpy(&ap, P(a3), sizeof(va_list)); return (uint64_t)(int64_t)vsnprintf((char*)P(a0), (size_t)a1, (const char*)P(a2), ap); }
 HLE(h_vsprintf)  { va_list ap; if (a2) memcpy(&ap, P(a2), sizeof(va_list)); return (uint64_t)(int64_t)vsprintf((char*)P(a0), (const char*)P(a1), ap); }
@@ -304,6 +315,12 @@ void register_builtin_hle() {
     R("floor", m_floor); R("ceil", m_ceil); R("round", m_round); R("trunc", m_trunc);
     R("fmod", m_fmod); R("fabs", m_fabs); R("hypot", m_hypot);
     R("sincosf", m_sincosf); R("sincos", m_sincos);
+    R("ldexp", m_ldexp); R("ldexpf", m_ldexpf); R("frexp", m_frexp); R("frexpf", m_frexpf);
+    R("modf", m_modf); R("modff", m_modff); R("copysign", m_copysign); R("copysignf", m_copysignf);
+    R("fmin", m_fmin); R("fminf", m_fminf); R("fmax", m_fmax); R("fmaxf", m_fmaxf);
+    R("sinh", m_sinh); R("sinhf", m_sinhf); R("cosh", m_cosh); R("coshf", m_coshf);
+    R("tanh", m_tanh); R("tanhf", m_tanhf); R("log1p", m_log1p); R("log1pf", m_log1pf);
+    R("expm1", m_expm1); R("expm1f", m_expm1f);
     #undef R
     register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)
     register_service_hle();  // PS5 system services (user/NP/pad/mouse/appcontent)

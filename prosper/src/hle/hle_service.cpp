@@ -46,7 +46,7 @@ HLE(s_appcontent_int) { if (a1) *(int32_t*)PW(a1) = 0; return 0; }
 // exits and it proceeds (we have no interactive dialog UI yet). Status enum: NONE=0, INITIALIZED=1,
 // RUNNING=2, FINISHED=3. GetResult -> zeroed struct = OK/no button pressed.
 HLE(s_dialog_finished) { return 3; }
-HLE(s_dialog_result)   { if (a0) memset(PW(a0), 0, 0x40); return 0; }
+HLE(s_dialog_result)   { if (a0) memset(PW(a0), 0, 0x30); return 0; }  // SceMsgDialogResult ~0x30 (don't overflow)
 
 void register_service_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)

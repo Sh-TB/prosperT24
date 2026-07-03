@@ -46,14 +46,15 @@ HLE(g_vo_open)        { return (uint64_t)(int64_t)(++g_vo_handle + 0x1000); }  /
 HLE(g_vo_close)       { return 0; }
 HLE(g_vo_submitflip)  { g_flip_count++; return 0; }                            // accept the flip
 HLE(g_vo_flippending) { return 0; }                                            // never pending -> can submit next
-HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our simulated flip count
-    if (a1) { uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x58);
-              *(uint64_t*)(s + 0x00) = g_flip_count;      // flipArg / count
-              *(uint64_t*)(s + 0x08) = g_flip_count;      // processed
-              *(int64_t*) (s + 0x10) = (int64_t)g_flip_count; }
+HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our simulated flip count.
+    // SceVideoOutFlipStatus is exactly 0x40 bytes — writing more smashes the caller's stack canary!
+    if (a1) { uint8_t* s = (uint8_t*)(uintptr_t)a1; memset(s, 0, 0x40);
+              *(uint64_t*)(s + 0x00) = g_flip_count;          // count
+              *(int64_t*) (s + 0x18) = (int64_t)g_flip_count; // flipArg
+              *(int32_t*) (s + 0x38) = 0; }                   // currentBuffer
     return 0;
 }
-HLE(g_vo_resstatus)   { if (a1) memset((void*)(uintptr_t)a1, 0, 0x30); return 0; }  // resolution status -> zeroed
+HLE(g_vo_resstatus)   { if (a1) memset((void*)(uintptr_t)a1, 0, 0x20); return 0; }  // SceVideoOutResolutionStatus ~0x20
 
 void register_graphics_hle() {
     #define RN(nid, fn) Hle::register_fn(nid, (HleFn)(fn), nid)   // raw NID (graphics libs undocumented)
