@@ -1,0 +1,25 @@
+# ---- Game dump: copyrighted, huge, NEVER commit ----
+/PPSA24651-app0/
+*.prx
+*.sprx
+*.self
+eboot.bin
+
+# ---- Build output ----
+/prosper/build/
+build/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.lib
+compile_commands.json
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
