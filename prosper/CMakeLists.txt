@@ -65,6 +65,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_command_processor PRIVATE prosper_core)
   add_test(NAME command_processor_apply COMMAND test_command_processor)
 
+  # Render-state extraction: fold a stream into a GpuState, then interpret RDNA2 registers.
+  add_executable(test_render_state tests/test_render_state.cpp)
+  target_link_libraries(test_render_state PRIVATE prosper_core)
+  add_test(NAME render_state_extract COMMAND test_render_state)
+
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux only).
   if(UNIX AND NOT APPLE)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
