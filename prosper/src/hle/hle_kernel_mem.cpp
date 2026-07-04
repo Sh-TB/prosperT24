@@ -124,8 +124,21 @@ HLE(k_alloc_dmem) {
     uint64_t sz = align_up(a2, align);
     uint64_t off = align_up(g_dmem_off.fetch_add(sz), align);
     { std::lock_guard<std::mutex> lk(g_dmx); g_dmem.push_back({ off, off + sz, (int)a4 }); }
-    if (a5) *(uint64_t*)a5 = off;
+    if (a5 > 0xffff) *(uint64_t*)a5 = off;   // only write through a plausible out-pointer
     MLOG("alloc_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a2, (unsigned long long)off);
+    return 0;
+}
+
+// sceKernelAllocateMainDirectMemory(size_t len, size_t align, int memType, off_t* physOut) — a
+// DIFFERENT signature (4 args) from AllocateDirectMemory: physOut is arg3, not arg5. Aliasing them
+// to one handler wrote the result through arg5 (uninitialized garbage, e.g. 0xa) -> crash.
+HLE(k_alloc_main_dmem) {
+    uint64_t align = a1 ? a1 : 0x4000;
+    uint64_t sz = align_up(a0, align);
+    uint64_t off = align_up(g_dmem_off.fetch_add(sz), align);
+    { std::lock_guard<std::mutex> lk(g_dmx); g_dmem.push_back({ off, off + sz, (int)a2 }); }
+    if (a3 > 0xffff) *(uint64_t*)a3 = off;
+    MLOG("alloc_main_dmem len=0x%llx -> phys=0x%llx\n", (unsigned long long)a0, (unsigned long long)off);
     return 0;
 }
 
@@ -224,7 +237,7 @@ void register_kernel_mem_hle() {
     R("sceKernelMapNamedFlexibleMemory", k_map_flexible);
     R("sceKernelMapFlexibleMemory", k_map_flexible);
     R("sceKernelAllocateDirectMemory", k_alloc_dmem);
-    R("sceKernelAllocateMainDirectMemory", k_alloc_dmem);
+    R("sceKernelAllocateMainDirectMemory", k_alloc_main_dmem);  // 4-arg signature (physOut at arg3)
     R("sceKernelMapDirectMemory", k_map_dmem);
     R("sceKernelMapNamedDirectMemory", k_map_dmem);
     R("sceKernelMunmap", k_munmap);
