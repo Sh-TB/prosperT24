@@ -16,6 +16,8 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
+#include <cstddef>
+#include <utility>
 
 namespace prosper {
 
@@ -67,24 +69,48 @@ HLE(g_vo_flipstatus)  { // (handle, SceVideoOutFlipStatus* status): report our s
 }
 HLE(g_vo_resstatus)   { if (a1) memset((void*)(uintptr_t)a1, 0, 0x20); return 0; }  // SceVideoOutResolutionStatus ~0x20
 
-// Diagnostic: log args + guest callsite of the (undocumented) libSceAgc / libSceAgcDriver calls so
-// we can reverse-engineer the AGC object model + GPU-VA scheme (gated on PROSPER_GFXLOG). Behaviour
-// is identical to the unimplemented stub — returns 0, changes no control flow — it is purely
-// observable. This is the RE bootstrap for the real AGC->Vulkan work (M4/M5), NOT faked output.
+// Diagnostic tracer for the (undocumented) libSceAgc / libSceAgcDriver calls: logs the NID, the guest
+// callsite, and all six args (gated on PROSPER_GFXLOG). Behaviour is identical to the unimplemented
+// stub — returns 0, changes no control flow — it is purely observable. This is the RE bootstrap for
+// the real AGC->Vulkan work (M4/M5), NOT faked output.
 //
-// The return address is the guest callsite (our stub tail-jumps here, so [rsp] at entry — hence
-// __builtin_return_address(0) — is the guest's return address into eboot, base 0x400000000). It
-// disambiguates which AGC function was called, complementing the per-NID unimpl log.
-HLE(g_glog) {
+// Per-NID identification: each NID is bound to a distinct template thunk `glog_thunk<I>` that knows
+// its own name (kAgcNids[I]). The guest reaches the thunk via our stub's tail-jump, so at thunk entry
+// [rsp] is the guest return address into eboot (base 0x400000000) — __builtin_return_address(0) gives
+// the exact callsite. Result: `PROSPER_GFXLOG=1 boot_trace <dump>` emits a self-describing dataset
+// (NID + callsite + args per call) — everything needed to RE the AGC object model.
+namespace {
+// The libSceAgc/AgcDriver NIDs the game calls (observed via boot_trace's unimplemented log). The
+// first four are AgcDriver; the rest are libSceAgc functions used during GfxDevicePS5SharedData init
+// whose null results currently leave GPU objects zeroed — the graphics blocker.
+const char* const kAgcNids[] = {
+    "MM4IZSEYytQ", "XlNp7jzGiPo", "Zw7uUVPulbw", "w2rJhmD+dsE",
+    "23LRUSvYu1M", "BfBDZGbti7A", "TRO721eVt4g", "MWiElSNE8j8", "-KRzWekV120", "wr23dPKyWc0",
+    "VmW0Tdpy420", "ZvwO9euwYzc", "vcmNN+AAXnY", "d-6uF9sZDIU", "+kSrjIVxKFE", "H7uZqCoNuWk",
+    "f3dg2CSgRKY", "hvUfkUIQcOE", "6lNcCp+fxi4", "vRoArM9zaIk", "0fWWK5uG9rQ", "3KDcnM3lrcU",
+    "57labkp+rSQ", "LtTouSCZjHM", "V++UgBtQhn0", "aJf+j5yntiU", "fPSCdQxgpSw", "i1jyy49AjXU",
+};
+constexpr size_t kAgcNidCount = sizeof(kAgcNids) / sizeof(kAgcNids[0]);
+
+uint64_t glog_impl(const char* nid, void* ra,
+                   uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     gfx_tick();
-    if (getenv("PROSPER_GFXLOG")) {
-        void* ra = __builtin_return_address(0);
-        fprintf(stderr, "[gfx] agc call from eboot+0x%llx  a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
-                (unsigned long long)((uint64_t)ra - 0x400000000ull),
+    if (getenv("PROSPER_GFXLOG"))
+        fprintf(stderr, "[gfx] libSceAgc::%s  from eboot+0x%llx  a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx\n",
+                nid, (unsigned long long)((uint64_t)ra - 0x400000000ull),
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
                 (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
-    }
     return 0;
+}
+template <size_t I>
+__attribute__((noinline)) uint64_t glog_thunk(uint64_t a0, uint64_t a1, uint64_t a2,
+                                              uint64_t a3, uint64_t a4, uint64_t a5) {
+    return glog_impl(kAgcNids[I], __builtin_return_address(0), a0, a1, a2, a3, a4, a5);
+}
+template <size_t... Is>
+void register_agc_tracers(std::index_sequence<Is...>) {
+    (Hle::register_fn(kAgcNids[Is], (HleFn)&glog_thunk<Is>, kAgcNids[Is]), ...);
+}
 }
 
 void register_graphics_hle() {
@@ -93,19 +119,8 @@ void register_graphics_hle() {
     // libSceAgc getters whose results the guest dereferences → return stable zeroed objects.
     RN("2JtWUUiYBXs", g_agc_dev);
     RN("wRbq6ZjNop4", g_agc_ctx);
-    // AgcDriver + AGC calls: log args + callsite (GFXLOG) to reverse-engineer the AGC object model.
-    RN("MM4IZSEYytQ", g_glog); RN("XlNp7jzGiPo", g_glog); RN("Zw7uUVPulbw", g_glog); RN("w2rJhmD+dsE", g_glog);
-    // All libSceAgc functions the game calls during GfxDevicePS5SharedData init (observed via
-    // boot_trace's unimplemented log). Routing them through g_glog makes their args/callsites
-    // observable (behaviour unchanged: still returns 0) so the AGC object model can be RE'd. These
-    // are the ~24 fns whose null results currently leave GPU objects zeroed -> the graphics blocker.
-    const char* agc_nids[] = {
-        "23LRUSvYu1M", "BfBDZGbti7A", "TRO721eVt4g", "MWiElSNE8j8", "-KRzWekV120", "wr23dPKyWc0",
-        "VmW0Tdpy420", "ZvwO9euwYzc", "vcmNN+AAXnY", "d-6uF9sZDIU", "+kSrjIVxKFE", "H7uZqCoNuWk",
-        "f3dg2CSgRKY", "hvUfkUIQcOE", "6lNcCp+fxi4", "vRoArM9zaIk", "0fWWK5uG9rQ", "3KDcnM3lrcU",
-        "57labkp+rSQ", "LtTouSCZjHM", "V++UgBtQhn0", "aJf+j5yntiU", "fPSCdQxgpSw", "i1jyy49AjXU",
-    };
-    for (const char* n : agc_nids) RN(n, g_glog);
+    // All traced libSceAgc/AgcDriver NIDs → per-NID logging thunks (still return 0; observable only).
+    register_agc_tracers(std::make_index_sequence<kAgcNidCount>{});
     // libSceVideoOut display / flip
     R("sceVideoOutOpen", g_vo_open);            R("sceVideoOutClose", g_vo_close);
     R("sceVideoOutSubmitFlip", g_vo_submitflip);R("sceVideoOutIsFlipPending", g_vo_flippending);

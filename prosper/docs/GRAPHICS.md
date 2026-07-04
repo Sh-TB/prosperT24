@@ -61,19 +61,21 @@ guest memory at each pointer-looking one, at fault time on the stopped thread (r
 breakpoints race in this multithreaded, signal-scheduled guest). `pltm eboot.bin known_names.txt
 <got_off>` maps a GOT slot to its import NID/name.
 
-**AGC call tracing (RE bootstrap for M4).** All ~24 libSceAgc functions the game calls are now routed
-through `g_glog` (behaviour unchanged — still returns 0), so `PROSPER_GFXLOG=1 ./build-linux/boot_trace
-<dump>` logs every AGC call's **guest callsite (`eboot+0x…`) + args a0–a5**. A run logs ~148 AGC calls
-before the fault. Stable callsites worth decoding first (offsets are ASLR-free, args' high addresses
-are heap/GPU-VA that vary per run):
-- `eboot+0x14e6661` — fires 3× with `a0=obj, a3=obj, a4=obj-0x48` (the `CreateWorkload` per-object
-  init; `obj` is the very object whose null field later faults). Prime target: this AGC call is what
-  should populate `obj`.
-- `eboot+0x3ae3dc` — recurring (called many times) with small `a1` (0x28/0x4/…), `a2`, `a3=1` — looks
-  like a per-field setter/descriptor-add on the AGC object.
-- `eboot+0x3ad4d2` / `+0x3ad504` — earliest AGC calls (device/context level), large pointer args.
-Next: correlate each callsite's NID (via `pltm` on the callsite's GOT ref) + args to the AGC API to
-build the real object model, then implement the initializers to construct valid GPU objects.
+**AGC call tracing (RE bootstrap for M4).** All 28 libSceAgc/AgcDriver NIDs the game calls are routed
+through per-NID logging thunks (`glog_thunk<I>` in `hle_graphics.cpp`; behaviour unchanged — still
+returns 0). `PROSPER_GFXLOG=1 ./build-linux/boot_trace <dump>` now emits a **self-describing** line per
+call: `libSceAgc::<NID>  from eboot+0x<callsite>  a0..a5`. ~148 AGC calls fire before the fault.
+Call-frequency profile of one run (NID ×count — the hot ones are the AGC command/descriptor ops to
+understand first; args' high addresses are heap/GPU-VA that vary per run, but NIDs + callsites are
+stable):
+- `f3dg2CSgRKY` ×36 — hottest; a per-op/per-command call.
+- `d-6uF9sZDIU` ×25, `ZvwO9euwYzc` ×25 — next hottest, paired.
+- `TRO721eVt4g` ×5 — `CreateWorkload` per-object init (`eboot+0x14e6661`, `a0=a3=obj, a4=obj-0x48`);
+  `obj` is the very object whose null field later faults, so this call (or `+kSrjIVxKFE` ×3, the
+  initializer at `eboot+0x3ae7d0`) is what should populate it.
+- device/context level (once each): `23LRUSvYu1M`, `BfBDZGbti7A`, `XlNp7jzGiPo`, `MM4IZSEYytQ`.
+Next: map each hot NID + arg pattern to the AGC API to build the real object model, then implement the
+initializers to construct valid GPU objects (correctness-first — no plausible-looking fakes).
 
 ## What's already in place (headless bring-up, correctness-first)
 
