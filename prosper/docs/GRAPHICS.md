@@ -21,6 +21,45 @@ threads eventually read a null sub-object pointer out of them and dereference it
 `eboot+0x3b5ea6` `[null+0x30]`, `eboot+0x149c99c` `[null+0x18]`). Zeroed placeholders no longer
 suffice — the game needs **real object graphs**, i.e. the actual graphics/audio subsystems.
 
+### The current deterministic terminal fault (verified 2026-07-03, corrects an earlier mis-diagnosis)
+
+`boot_trace` ends every run at the same place. The last log line is Unity's own:
+
+```
+todo: void GfxDevicePS5SharedData::CreateWorkload()
+=== RUN ENDED: SIGSEGV at addr=0x30 rip=eboot+0x3b5ea6  rdi=0x0 ===
+```
+
+So this is a **graphics-path fault inside `GfxDevicePS5SharedData::CreateWorkload()`**, *not* a
+boot-time C++/locale-construction mystery (an earlier working note wrongly framed it as a "rune
+facet never set during static init" — there is **no** eboot `init_array` at all: `init_array_va=0`,
+and the game initializes its C++ via IL2CPP + guarded function-local statics, so no static-init is
+being skipped). Chain, all verified by disassembly under gdb (`break run_entry` first):
+
+- `eboot+0x3b5ea0` is a `std::ctype`-style classify routine: `movzwl 0x2e(%rdi,%rcx,2),%esi` /
+  `mov (%rdi),%rax; movzwl (%rax,%rcx,2)` — `rdi` is the classification **table** pointer, indexed
+  by char code. It faults because `rdi == 0`.
+- Its caller `eboot+0x3afb90` loads that table as **`[facet+0x8]`** (`mov 0x8(%r14),%rdi` at
+  `+0x3afbc8`, where `r14` = the facet). So the offending facet's `+0x8` table field is **null**.
+- The facet pointer is `obj+0x38 + facet_index*0x70` (extractor `eboot+0x3b0210` returns
+  `rdi + esi*0x70`; caller `eboot+0x3a7b60` does `rdi += 0x38` first). I.e. `obj+0x38` is an inline
+  array of 0x70-byte facets; this is a `std::locale` built in the GfxDevice path.
+- **`_Getpctype` is NOT the culprit — it already works.** It is implemented (`h_getpctype` →
+  `build_ctype`, returns a real 257-entry table) and *does* bind and get called (confirmed: a
+  breakpoint on `prosper::h_getpctype` fires, called from `eboot+0x82e898`). So the classic-locale
+  ctype table exists; this *particular* locale/facet built in `CreateWorkload` just never gets its
+  `+0x8` table populated.
+
+**Open question for the next deep session:** which constructor builds this `CreateWorkload` locale
+and why its ctype facet's `[+0x8]` is left null (a facet-install path that should copy the classic
+table but doesn't — possibly a Dinkumware `_Locinfo`/`_Getcvt` path hitting another stubbed import,
+or a facet whose table is meant to come from a locale-name lookup we don't service). Fine gdb
+breakpoints here are unreliable — the guest is multithreaded under signal-based scheduling and
+register readouts race. Prefer: (a) instrument the HLE `setlocale`/`_Locinfo`/`localeconv` family to
+log every call + return during the `CreateWorkload` window, or (b) add a one-shot guest-memory probe
+in the fault handler that, on the `+0x3b5ea6` fault, walks back to the facet and logs its bytes
+deterministically (single-threaded at fault time) instead of via a live breakpoint.
+
 ## What's already in place (headless bring-up, correctness-first)
 
 - **Unified GPU memory (lazy)** — `exec_image_linux.cpp` fault handler backs any unmapped page in

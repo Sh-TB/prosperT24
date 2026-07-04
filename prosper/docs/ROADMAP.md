@@ -89,7 +89,10 @@ Turn the file into a resident, relocated guest image in host memory.
 - [x] File I/O (`src/hle/hle_file.cpp`): stdio `FILE*` + POSIX fd + `sceKernelOpen/…`,
       with **`/app0` → dump-dir path translation** (real asset loading).
 - **Now**: the game's own IL2CPP code executes; boot advances through crt → C++/threads →
-  memory → stdio → file I/O → locale/ctype init (`_Getpctype`).
+  memory → stdio → file I/O → locale/ctype init (`_Getpctype`, verified bound + called) → PS5
+  services → **graphics device init**, where it terminates in `GfxDevicePS5SharedData::CreateWorkload`
+  on a null `std::ctype` facet table (`eboot+0x3b5ea6`). See `docs/GRAPHICS.md` for the verified
+  chain — this is a graphics-path facet-construction gap, not the boot-time locale issue once assumed.
 - [x] Dependent-module `init_array` (C++ global ctors) now run before entry — the key
       unlock that let IL2CPP's runtime initialize.
 - [x] locale/ctype tables; `sync_on_address` futex (Linux `futex(2)`); C++ new/delete; stdio.
