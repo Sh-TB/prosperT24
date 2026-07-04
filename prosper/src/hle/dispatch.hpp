@@ -66,6 +66,19 @@ void set_exc_raise_counter(volatile int* counter);
 // libSceVideoOut). Tests use it to prove the boot advanced through the whole runtime into GPU/
 // display init. Defined in hle_graphics.cpp.
 void set_gfx_call_counter(volatile int* counter);
+// Per-module TLS template for the general-dynamic model (see linker.cpp / __tls_get_addr).
+// init_va = mapped tdata (guest==host addr); a per-thread block of memsz is allocated lazily,
+// filesz bytes copied from init_va, the rest zeroed. Indexed by module TLS id.
+struct TlsModuleDesc { uint64_t init_va = 0, filesz = 0, memsz = 0; };
+// Install the TLS templates (call AFTER images are mapped, so init_va is readable). Enables the
+// __tls_get_addr HLE to serve real per-thread TLS blocks for loaded modules (e.g. real libc.prx).
+void set_tls_modules(const TlsModuleDesc* descs, size_t count);
+
+// Guest address of the main module's SCE_PROCPARAM segment. sceKernelGetProcParam returns this;
+// real libc reads its heap/malloc config (sceLibcParam) from it, so a correct value is required for
+// real libc.prx's heap to initialize. Set from the eboot's PT_SCE_PROCPARAM segment after mapping.
+void set_proc_param(uint64_t guest_va);
+
 // Print the accumulated unimplemented-call trace (index, lib::nid [name], count).
 void dump_call_log(FILE* f);
 void reset_call_log();

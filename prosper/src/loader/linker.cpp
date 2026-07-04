@@ -22,6 +22,18 @@ bool link_program(const std::vector<LinkInput>& inputs, uint64_t stub_base,
     }
     out.entry = out.imgs[0].entry;
 
+    // Assign each module with a PT_TLS segment a TLS module id (>=1; 0 = "no TLS"), and record its
+    // per-thread template. init_va is the module's mapped tdata (guest base + tls_vaddr). Used by
+    // the general-dynamic TLS relocs (DTPMOD64) + __tls_get_addr (see hle_kernel.cpp).
+    out.tls_templates.push_back({});   // index 0 reserved / invalid
+    for (size_t i = 0; i < out.mods.size(); i++) {
+        Module& m = *out.mods[i];
+        if (m.tls_memsz == 0) continue;
+        out.imgs[i].tls_modid = (uint32_t)out.tls_templates.size();
+        out.tls_templates.push_back({ out.imgs[i].base + m.tls_vaddr,
+                                      m.tls_filesz, m.tls_memsz, m.tls_align });
+    }
+
     // --- Global export table: NID -> guest address (first definition wins). ---
     std::unordered_map<std::string, uint64_t> exports;
     for (size_t i = 0; i < out.mods.size(); i++) {

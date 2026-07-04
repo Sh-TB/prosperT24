@@ -10,6 +10,7 @@
 #include <setjmp.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <fcntl.h>
 #include <cstdio>
 #include <cstring>
@@ -27,11 +28,16 @@ namespace {
     // pthread_getattr_np.
     std::map<uint64_t, std::pair<uint64_t, uint64_t>> g_stacks;   // tid -> (base, size)
     std::mutex g_smx;
-    // Per-thread recovery point: only the thread that armed it can be longjmp'd back
-    // (siglongjmp across threads is undefined). Guest worker threads that fault have no
-    // armed point, so we terminate the process cleanly instead of corrupting state.
-    thread_local sigjmp_buf g_jb;
-    thread_local bool g_armed = false;
+    // Recovery point. Only the (single) thread that armed it — always the main thread running
+    // run_entry/run_guest_inits — can be longjmp'd back; guest worker faults have no armed point and
+    // terminate the process cleanly. We key "who armed" on the real kernel tid (SYS_gettid, a syscall
+    // that does NOT use %fs) rather than a thread_local flag, because real libc.prx runs its guest
+    // worker threads with a GUEST %fs — which makes any %fs-based thread_local (the old g_armed/g_jb)
+    // read GARBAGE on those threads (a false "armed" + a garbage jmp_buf -> longjmp-to-garbage storm).
+    // Plain globals + gettid sidestep %fs entirely.
+    sigjmp_buf g_jb;
+    volatile long g_armed_tid = 0;               // kernel tid that armed g_jb, 0 = none
+    inline long cur_tid() { return (long)syscall(SYS_gettid); }
     volatile sig_atomic_t g_trap_kind = 0;   // 0 none, 2 SEGV/BUS, 3 ILL
     volatile int          g_trap_sig = 0;
     void*    g_fault_addr = nullptr;
@@ -46,6 +52,7 @@ namespace {
     // time the faulting thread is stopped, so dumping guest memory around each register here is the
     // trustworthy way to inspect deep crashes (e.g. the null std::ctype facet at eboot+0x3b5ea6).
     bool g_faultmem = false;
+    bool g_faultlog = false;
     int  g_devnull_fd = -1;
 
     // Async-signal-safe readability probe: write() to /dev/null returns EFAULT (not a fault) for
@@ -101,12 +108,24 @@ namespace {
             uint64_t a = (uint64_t)si->si_addr;
             if (a >= GPU_VA_LO && a < GPU_VA_HI) {
                 void* page = (void*)(a & ~(uint64_t)0xfff);
-                if (mmap(page, 0x1000, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page) {
-                    g_lazy_pages++;
-                    return;   // re-execute the faulting instruction against the now-mapped page
+                bool ok = mmap(page, 0x1000, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page;
+                if (g_faultlog) {
+                    char b[128]; auto* uc = (ucontext_t*)uctx;
+                    int n = snprintf(b, sizeof b, "[fault] GPU-VA %s addr=0x%llx rip=0x%llx\n",
+                                     ok ? "mapped" : "MMAP-FAILED", (unsigned long long)a,
+                                     (unsigned long long)uc->uc_mcontext.gregs[REG_RIP]);
+                    write(2, b, n);
                 }
+                if (ok) { g_lazy_pages++; return; }  // re-execute against the now-mapped page
             }
+        }
+        if (g_faultlog) {
+            char b[128]; auto* uc = (ucontext_t*)uctx;
+            int n = snprintf(b, sizeof b, "[fault] sig=%d addr=%p rip=0x%llx armed=%d tid=%ld\n",
+                             sig, si->si_addr, (unsigned long long)uc->uc_mcontext.gregs[REG_RIP],
+                             (int)(g_armed_tid && cur_tid() == g_armed_tid), cur_tid());
+            write(2, b, n);
         }
         g_fault_addr = si->si_addr;
         auto* uc = (ucontext_t*)uctx;
@@ -123,7 +142,7 @@ namespace {
         g_trap_sig = sig;
         g_trap_kind = (sig == SIGILL) ? 3 : 2;
         dump_fault_mem();   // no-op unless PROSPER_FAULTMEM is set
-        if (g_armed) siglongjmp(g_jb, 1);
+        if (g_armed_tid && cur_tid() == g_armed_tid) siglongjmp(g_jb, 1);
         // Fault on a thread with no recovery point (a guest worker thread). Report where
         // (async-signal-safe write) then terminate cleanly instead of a cross-thread longjmp.
         {
@@ -195,13 +214,30 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     return true;
 }
 
+// Install a per-thread alternate signal stack so the fault handler can run even when the faulting
+// thread's own stack is exhausted (a guest stack overflow otherwise delivers SIGSEGV with no usable
+// stack -> the handler can't run -> the process cores uncatchably). Idempotent per thread. Worker
+// threads call this from their trampoline; the main thread from install_trap_handler.
+void install_sigaltstack() {
+    static thread_local uint8_t* alt = nullptr;
+    if (alt) return;
+    const size_t sz = 256 * 1024;              // generous: deep real-libc call chains
+    alt = (uint8_t*)malloc(sz);
+    if (!alt) return;
+    stack_t ss{}; ss.ss_sp = alt; ss.ss_size = sz; ss.ss_flags = 0;
+    sigaltstack(&ss, nullptr);
+}
+
 void install_trap_handler() {
     g_faultmem = getenv("PROSPER_FAULTMEM") != nullptr;   // read once (getenv is not signal-safe)
+    g_faultlog = getenv("PROSPER_FAULTLOG") != nullptr;
     if (g_faultmem && g_devnull_fd < 0)
         g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    install_sigaltstack();
     struct sigaction sa{};
     sa.sa_sigaction = fault_handler;
-    sa.sa_flags = SA_SIGINFO;
+    sa.sa_flags = SA_SIGINFO;   // (SA_ONSTACK disabled: siglongjmp from the alt stack tripped glibc's
+                                // %fs-guarded ____longjmp_chk -> jump-to-garbage fault storm)
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS,  &sa, nullptr);
@@ -233,9 +269,9 @@ bool guest_stack_for_current_thread(void** base, size_t* size) {
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {
     size_t ok = 0;
     for (uint64_t f : fns) {
-        g_trap_kind = 0; g_armed = true;
+        g_trap_kind = 0; g_armed_tid = cur_tid();
         if (sigsetjmp(g_jb, 1) == 0) { ((void (*)())(uintptr_t)f)(); ok++; }
-        g_armed = false;
+        g_armed_tid = 0;
         if (g_trap_kind) fprintf(stderr, "[prosper] init fn 0x%llx faulted (%s); continuing\n",
                                  (unsigned long long)f, trap_detail().c_str());
     }
@@ -265,7 +301,7 @@ BootResult run_entry(const LoadedImage& img) {
     memcpy((void*)top, vec, sizeof(vec));
     uint64_t sp = top, rdi = sp, rsi = 0;
 
-    g_trap_kind = 0; g_fault_addr = nullptr; g_fault_rip = 0; g_armed = true;
+    g_trap_kind = 0; g_fault_addr = nullptr; g_fault_rip = 0; g_armed_tid = cur_tid();
     if (sigsetjmp(g_jb, 1) == 0) {
         register uint64_t e  asm("rax") = img.entry;
         register uint64_t s  asm("r8")  = sp;
@@ -284,7 +320,7 @@ BootResult run_entry(const LoadedImage& img) {
         r.rbp = g_rbp; r.rsp = g_rsp; r.rax = g_rax;
         r.rdi = g_rdi; r.rsi = g_rsi; r.rdx = g_rdx;
         // Walk the rbp chain for a backtrace, guarded so a bad frame can't crash us.
-        g_armed = true;
+        g_armed_tid = cur_tid();
         if (sigsetjmp(g_jb, 1) == 0) {
             uint64_t bp = g_rbp;
             for (int i = 0; i < 24 && bp > 0x10000; i++) {
@@ -295,7 +331,7 @@ BootResult run_entry(const LoadedImage& img) {
                 bp = nbp;
             }
         }
-        g_armed = false;
+        g_armed_tid = 0;
     }
     return r;
 }

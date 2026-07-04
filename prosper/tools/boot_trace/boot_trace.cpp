@@ -11,28 +11,35 @@
 using namespace prosper;
 
 // Module bases (keep in sync with the inputs below).
-static const uint64_t EBOOT = 0x400000000ull, IL2CPP = 0x440000000ull, PS5UTIL = 0x4c0000000ull, STUB = 0x600000000ull;
+static const uint64_t EBOOT = 0x400000000ull, IL2CPP = 0x440000000ull, PS5UTIL = 0x4c0000000ull,
+                      LIBC = 0x500000000ull, STUB = 0x600000000ull;
 static const char* cls(uint64_t a) {
     if (a >= EBOOT   && a < IL2CPP)  return "eboot";
     if (a >= IL2CPP  && a < PS5UTIL) return "Il2cpp";
-    if (a >= PS5UTIL && a < 0x500000000ull) return "PS5Util";
+    if (a >= PS5UTIL && a < LIBC)    return "PS5Util";
+    if (a >= LIBC    && a < STUB)    return "libc.prx";
     if (a >= STUB    && a < 0x610000000ull) return "STUB";
     return "mapped/host";
 }
 static uint64_t bof(uint64_t a) {
     if (a >= EBOOT   && a < IL2CPP)  return a - EBOOT;
     if (a >= IL2CPP  && a < PS5UTIL) return a - IL2CPP;
-    if (a >= PS5UTIL && a < 0x500000000ull) return a - PS5UTIL;
+    if (a >= PS5UTIL && a < LIBC)    return a - PS5UTIL;
+    if (a >= LIBC    && a < STUB)    return a - LIBC;
     return a;
 }
 
 int main(int argc, char** argv) {
     std::string d = (argc >= 2) ? argv[1] : "../../PPSA24651-app0";
     Program p; std::string e;
+    // libc.prx loaded last => its init_array runs first (deepest dependency), before eboot's entry.
+    // Experimental (branch libc-prx-integration): route eboot's 145 libc imports to the REAL Sony
+    // libc instead of our HLE. Cross-module export beats the HLE stub slot (see linker.cpp pass 2).
     std::vector<LinkInput> in = {
         { d + "/eboot.bin", EBOOT },
         { d + "/Media/Modules/Il2cppUserAssemblies.prx", IL2CPP },
         { d + "/Media/Modules/PS5Util.prx", PS5UTIL },
+        { d + "/sce_module/libc.prx", LIBC },
     };
     if (!link_program(in, STUB, p, &e)) { printf("link failed: %s\n", e.c_str()); return 1; }
     printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns\n",
@@ -41,6 +48,11 @@ int main(int argc, char** argv) {
     register_builtin_hle();
     set_app0_root(d);
     for (auto& img : p.imgs) if (!map_image(img, &e)) { printf("map failed: %s\n", e.c_str()); return 1; }
+    { std::vector<TlsModuleDesc> td; for (auto& t : p.tls_templates) td.push_back({t.init_va, t.filesz, t.memsz});
+      set_tls_modules(td.data(), td.size()); }   // enable __tls_get_addr for loaded modules (real libc.prx)
+    // sceKernelGetProcParam -> eboot's SCE_PROCPARAM (real libc reads its heap/malloc config here).
+    for (auto& s : p.mods[0]->segments)
+        if (s.type == PT_SCE_PROCPARAM) { set_proc_param(EBOOT + s.vaddr); break; }
     if (!install_stubs(p.slots, p.stub_base, p.stub_size, &e)) { printf("stubs failed: %s\n", e.c_str()); return 1; }
     install_trap_handler();
     run_guest_inits(p.init_fns);

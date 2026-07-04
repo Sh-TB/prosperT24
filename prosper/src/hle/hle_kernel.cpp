@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
+#include <unordered_map>
 #ifdef __linux__
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -81,6 +83,40 @@ HLE(k_cond_wait)      { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.ent
     if (a0 && *(void**)a0 && a1 && *(void**)a1) pthread_cond_wait((pthread_cond_t*)*(void**)a0, (pthread_mutex_t*)*(void**)a1);
     if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return 0; }
 
+// --- read/write locks (opaque handle -> host pthread_rwlock_t). Real libc.prx uses these for its
+// internal state (locale, stdio, malloc arenas); stubbing them to no-ops leaves that state UNLOCKED
+// under the 15-thread IL2CPP pool -> data races. Real locking is a genuine correctness fix. ---
+HLE(k_rwlock_init) {
+    if (!a0) return 0x16;
+    auto* rw = (pthread_rwlock_t*)calloc(1, sizeof(pthread_rwlock_t));
+    pthread_rwlock_init(rw, nullptr);
+    *(void**)a0 = rw;   // store handle through caller's slot (a1=attr, a2=name ignored)
+    return 0;
+}
+HLE(k_rwlock_destroy) { if (a0 && *(void**)a0) { pthread_rwlock_destroy((pthread_rwlock_t*)*(void**)a0); free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
+HLE(k_rwlock_rdlock)  { if (a0 && *(void**)a0) pthread_rwlock_rdlock((pthread_rwlock_t*)*(void**)a0); return 0; }
+HLE(k_rwlock_wrlock)  { if (a0 && *(void**)a0) pthread_rwlock_wrlock((pthread_rwlock_t*)*(void**)a0); return 0; }
+HLE(k_rwlock_unlock)  { if (a0 && *(void**)a0) pthread_rwlock_unlock((pthread_rwlock_t*)*(void**)a0); return 0; }
+HLE(k_rwlock_tryrdlock){ return (a0 && *(void**)a0) ? (uint64_t)pthread_rwlock_tryrdlock((pthread_rwlock_t*)*(void**)a0) : 0x16; }
+HLE(k_rwlock_trywrlock){ return (a0 && *(void**)a0) ? (uint64_t)pthread_rwlock_trywrlock((pthread_rwlock_t*)*(void**)a0) : 0x16; }
+
+// scePthreadOnce(once_control*, init_routine): run init exactly once. We run it UNDER a lock so all
+// callers see it complete before returning (pthread_once semantics). A recursive mutex avoids
+// self-deadlock if an init routine itself calls scePthreadOnce. The once-control's first int is the
+// done-flag. init is a guest fn (guest ABI == host SysV) so it's callable directly.
+HLE(k_pthread_once) {
+    auto* ctl = (volatile int*)(uintptr_t)a0;
+    auto init = (void (*)())(uintptr_t)a1;
+    if (!ctl || !init) return 0x16;
+    static pthread_mutex_t om = []{ pthread_mutex_t m; pthread_mutexattr_t a;
+        pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&m, &a); pthread_mutexattr_destroy(&a); return m; }();
+    pthread_mutex_lock(&om);
+    if (*ctl == 0) { init(); *ctl = 1; }
+    pthread_mutex_unlock(&om);
+    return 0;
+}
+
 // --- thread identity ---
 // Return the real host thread handle as the Sony ScePthread — unique and stable per
 // thread, used as an opaque id (stored/compared, not dereferenced). A constant here
@@ -131,6 +167,9 @@ HLE(k_attr_getstacksize) {
     }
     return 0;
 }
+// scePthreadAttrGetaffinity(attr, SceKernelCpumask* mask): report all 8 PS5 cores available.
+// Returning 0 (the old stub) yields an EMPTY mask -> the guest may conclude no CPUs are usable.
+HLE(k_attr_getaffinity) { if (a1) *(uint64_t*)(uintptr_t)a1 = 0xff; return 0; }
 
 // --- thread creation: run the guest entry on a real host thread (ABI matches) ---
 // We give each worker a stack we allocate and TRACK, so GC/thread-stack queries get
@@ -144,6 +183,7 @@ struct ThreadStart { void* (*entry)(void*); void* arg; void* sbase; uint64_t ssz
 void* thread_trampoline(void* p) {
     auto* ts = (ThreadStart*)p;
     if (ts->sbase) register_thread_stack((uint64_t)pthread_self(), ts->sbase, ts->ssz);
+    install_sigaltstack();   // so a guest stack overflow on this worker is still catchable
     auto entry = ts->entry; void* arg = ts->arg; free(ts);
     return entry ? entry(arg) : nullptr;
 }
@@ -358,8 +398,48 @@ HLE(k_dlsym) {   // sceKernelDlsym(SceKernelModule handle, const char* name, voi
     return 0x80020003;   // SCE_KERNEL_ERROR_ESRCH
 }
 
+// --- General-dynamic TLS (__tls_get_addr) for loaded modules (e.g. the real libc.prx). ----------
+// PS5 .prx shared libs access thread-locals via __tls_get_addr(tls_index*), where the tls_index
+// {module_id, offset} was patched by our DTPMOD64/DTPOFF64 relocs. We keep a per-thread block per
+// module id, lazily allocated from the module's PT_TLS template (memsz block, filesz copied from
+// the init image, tbss zeroed). This is the general-dynamic model — no %fs needed (that's only for
+// the main exe's initial-exec TLS, which the current boot already tolerates).
+namespace { std::vector<TlsModuleDesc> g_tls_mods; }
+void set_tls_modules(const TlsModuleDesc* descs, size_t count) {
+    g_tls_mods.assign(descs, descs + count);
+}
+HLE(k_tls_get_addr) {   // __tls_get_addr(tls_index* ti): ti[0]=module id, ti[1]=offset-in-block
+    const uint64_t* ti = (const uint64_t*)(uintptr_t)a0;
+    if (!ti) return 0;
+    uint64_t modid = ti[0], off = ti[1];
+    thread_local std::unordered_map<uint64_t, void*> t_dtv;   // per-thread: module id -> block
+    auto it = t_dtv.find(modid);
+    if (it != t_dtv.end()) return (uint64_t)(uintptr_t)it->second + off;
+    size_t memsz = 64, filesz = 0; uint64_t init_va = 0;
+    if (modid < g_tls_mods.size()) {
+        memsz  = g_tls_mods[modid].memsz ? g_tls_mods[modid].memsz : 64;
+        filesz = g_tls_mods[modid].filesz;
+        init_va = g_tls_mods[modid].init_va;
+    }
+    void* blk = calloc(1, memsz);
+    if (init_va && filesz) memcpy(blk, (const void*)(uintptr_t)init_va, filesz);
+    t_dtv[modid] = blk;
+    return (uint64_t)(uintptr_t)blk + off;
+}
+
+// sceKernelGetProcParam: guest address of the main module's SCE_PROCPARAM. Real libc reads its
+// heap/malloc config (sceLibcParam) from here; without it, libc's heap never inits and malloc/
+// memalign return null (the branch's eboot+0x8065ee crash).
+namespace { uint64_t g_proc_param = 0; }
+void set_proc_param(uint64_t guest_va) { g_proc_param = guest_va; }
+HLE(k_get_proc_param) { return g_proc_param; }
+
 void register_kernel_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+    // ELF TLS accessor used by loaded .prx modules (raw NID + name).
+    Hle::register_fn("vNe1w4diLCs", (HleFn)k_tls_get_addr, "__tls_get_addr");
+    R("__tls_get_addr", k_tls_get_addr);
+    R("sceKernelGetProcParam", k_get_proc_param);
     R("sceKernelInstallExceptionHandler", k_install_exc_handler);
     R("sceKernelRaiseException", k_raise_exception);
     R("sceKernelDlsym", k_dlsym);
@@ -381,6 +461,15 @@ void register_kernel_hle() {
     R("scePthreadCondSignal", k_cond_signal);
     R("scePthreadCondBroadcast", k_cond_broadcast);
     R("scePthreadCondWait", k_cond_wait);
+    // read/write locks + once (Sony + POSIX names) — real host primitives (thread-safety fix).
+    R("scePthreadRwlockInit", k_rwlock_init);        R("pthread_rwlock_init", k_rwlock_init);
+    R("scePthreadRwlockDestroy", k_rwlock_destroy);  R("pthread_rwlock_destroy", k_rwlock_destroy);
+    R("scePthreadRwlockRdlock", k_rwlock_rdlock);    R("pthread_rwlock_rdlock", k_rwlock_rdlock);
+    R("scePthreadRwlockWrlock", k_rwlock_wrlock);    R("pthread_rwlock_wrlock", k_rwlock_wrlock);
+    R("scePthreadRwlockUnlock", k_rwlock_unlock);    R("pthread_rwlock_unlock", k_rwlock_unlock);
+    R("scePthreadRwlockTryrdlock", k_rwlock_tryrdlock);
+    R("scePthreadRwlockTrywrlock", k_rwlock_trywrlock);
+    R("scePthreadOnce", k_pthread_once);             R("pthread_once", k_pthread_once);
     R("scePthreadSelf", k_pthread_self);
     R("scePthreadEqual", k_pthread_equal);
     R("scePthreadYield", k_pthread_yield);
@@ -399,6 +488,9 @@ void register_kernel_hle() {
     R("scePthreadAttrGet", k_attr_get);
     R("scePthreadAttrGetstackaddr", k_attr_getstackaddr);
     R("scePthreadAttrGetstacksize", k_attr_getstacksize);
+    R("scePthreadAttrGetaffinity", k_attr_getaffinity);  // report 8 cores (not an empty mask)
+    R("scePthreadAttrSetaffinity", k_attr_noop);         // accept affinity requests (we don't pin)
+    R("scePthreadGetaffinity", k_attr_getaffinity);      R("scePthreadSetaffinity", k_attr_noop);
     R("scePthreadGetschedparam", k_attr_noop);  R("pthread_getschedparam", k_attr_noop);
     R("scePthreadSetschedparam", k_attr_noop);  R("scePthreadSetprio", k_attr_noop);
     R("scePthreadGetprio", k_attr_noop);
