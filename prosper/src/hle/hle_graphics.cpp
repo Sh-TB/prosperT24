@@ -32,10 +32,20 @@ uint64_t agc_singleton(int slot) {
     if (!objs[slot]) objs[slot] = calloc(1, 64 * 1024);
     return (uint64_t)(uintptr_t)objs[slot];
 }
+
+// Optional fork-safe counter bumped when the guest calls into the graphics libs (libSceAgc /
+// libSceVideoOut). Tests use it to assert the boot advanced all the way into GPU/display init — a
+// regression guard for the entire runtime bring-up (loader → IL2CPP → C# startup → services →
+// graphics). Forward-compatible: these calls keep happening as we implement more, so the guard
+// stays valid even once deeper blockers (e.g. the locale-facet fault) are fixed.
+volatile int* g_gfx_counter = nullptr;
+inline void gfx_tick() { if (g_gfx_counter) (*g_gfx_counter)++; }
 }
 
-HLE(g_agc_dev)  { return agc_singleton(0); }   // libSceAgc 2JtWUUiYBXs — object dereferenced at +0x38
-HLE(g_agc_ctx)  { return agc_singleton(1); }   // libSceAgc wRbq6ZjNop4 — object dereferenced at +0x38
+void set_gfx_call_counter(volatile int* counter) { g_gfx_counter = counter; }
+
+HLE(g_agc_dev)  { gfx_tick(); return agc_singleton(0); }   // libSceAgc 2JtWUUiYBXs — obj deref'd at +0x38
+HLE(g_agc_ctx)  { gfx_tick(); return agc_singleton(1); }   // libSceAgc wRbq6ZjNop4 — obj deref'd at +0x38
 
 // --- libSceVideoOut (display / frame presentation). Headless: accept opens/flips and simulate
 // flip completion so the game's render loop advances (submit -> wait completion -> submit next).
@@ -43,7 +53,7 @@ namespace {
     int g_vo_handle = 0;
     uint64_t g_flip_count = 0;   // incremented per SubmitFlip so GetFlipStatus shows progress
 }
-HLE(g_vo_open)        { return (uint64_t)(int64_t)(++g_vo_handle + 0x1000); }  // positive handle
+HLE(g_vo_open)        { gfx_tick(); return (uint64_t)(int64_t)(++g_vo_handle + 0x1000); }  // positive handle
 HLE(g_vo_close)       { return 0; }
 HLE(g_vo_submitflip)  { g_flip_count++; return 0; }                            // accept the flip
 HLE(g_vo_flippending) { return 0; }                                            // never pending -> can submit next
@@ -62,6 +72,7 @@ HLE(g_vo_resstatus)   { if (a1) memset((void*)(uintptr_t)a1, 0, 0x20); return 0;
 // behaviour, just observable — so it doesn't change control flow.
 static const char* g_glog_nid = nullptr;
 HLE(g_glog) {
+    gfx_tick();
     if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr, "[gfx] agc call a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx\n",
                 (unsigned long long)a0, (unsigned long long)a1,

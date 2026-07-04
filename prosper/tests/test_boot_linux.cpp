@@ -48,6 +48,11 @@ int main(int argc, char** argv) {
     // proves the deadlock fix + the exception-based thread suspension + stack scanning all work.
     volatile int* ex = (volatile int*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     *ex = 0; set_exc_raise_counter(ex);
+    // Fork-safe counter for graphics-lib calls (libSceAgc / libSceVideoOut). A non-zero count proves
+    // the boot ran the *entire* runtime — loader -> IL2CPP init -> C# startup -> PS5 services -> and
+    // into GPU/display initialization. Regression guard for the whole bring-up pipeline.
+    volatile int* gfx = (volatile int*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    *gfx = 0; set_gfx_call_counter(gfx);
 
     printf("  entry=0x%llx  %zu dependent-module init fns  running guest in a child...\n",
            (unsigned long long)prog.entry, prog.init_fns.size());
@@ -58,21 +63,26 @@ int main(int argc, char** argv) {
 
     int reached = *p;
     int raises  = *ex;
-    printf("  guest reached %d distinct unimplemented system calls; %d GC stop-the-world exception(s)\n",
-           reached, raises);
+    int gfxcalls = *gfx;
+    printf("  guest reached %d distinct unimplemented system calls; %d GC stop-the-world exception(s); %d graphics-lib call(s)\n",
+           reached, raises, gfxcalls);
     // (1) unimpl count *drops* as we implement more functions (boot then advances to new, deeper
     // calls). >=3 robustly proves the pipeline: link -> map -> stubs -> crt -> heap -> vmem -> game.
     const int THRESHOLD = 3;
     // (2) >=1 exception raise proves the boot got *through* the IL2CPP GC thread-suspension
     // handshake (the deadlock we fixed) and ran the exception-based stop-the-world + stack scan.
+    // (3) >=1 graphics-lib call proves the boot ran the whole runtime into GPU/display init — the
+    // deepest reproducible milestone. Forward-compatible: stays true as deeper blockers are fixed.
     bool pipeline = reached >= THRESHOLD;
     bool gc_stw   = raises  >= 1;
-    if (pipeline && gc_stw) {
-        printf("\n== PASS: booted into IL2CPP and through GC stop-the-world (%d>=%d unimpl, %d>=1 raise) ==\n",
-               reached, THRESHOLD, raises);
+    bool graphics = gfxcalls >= 1;
+    if (pipeline && gc_stw && graphics) {
+        printf("\n== PASS: booted through IL2CPP + GC stop-the-world into graphics init (%d>=%d unimpl, %d>=1 raise, %d>=1 gfx) ==\n",
+               reached, THRESHOLD, raises, gfxcalls);
         return 0;
     }
     if (!pipeline) printf("\n== FAIL: stalled early (%d < %d unimpl) ==\n", reached, THRESHOLD);
     if (!gc_stw)   printf("\n== FAIL: GC stop-the-world never ran (%d raises) — deadlock/GC regression? ==\n", raises);
+    if (!graphics) printf("\n== FAIL: never reached graphics init (%d gfx calls) — boot regressed before GPU/display ==\n", gfxcalls);
     return 2;
 }

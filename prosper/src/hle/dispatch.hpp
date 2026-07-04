@@ -62,6 +62,10 @@ void dispatch_set_progress(volatile int* counter);
 // stop-the-world). Also fork-safe. Used by tests to prove the boot reached — and got through —
 // the IL2CPP GC thread-suspension handshake (a regression guard for the deadlock/GC fixes).
 void set_exc_raise_counter(volatile int* counter);
+// Optional fork-safe counter bumped when the guest calls into the graphics libs (libSceAgc /
+// libSceVideoOut). Tests use it to prove the boot advanced through the whole runtime into GPU/
+// display init. Defined in hle_graphics.cpp.
+void set_gfx_call_counter(volatile int* counter);
 // Print the accumulated unimplemented-call trace (index, lib::nid [name], count).
 void dump_call_log(FILE* f);
 void reset_call_log();
