@@ -46,6 +46,7 @@ namespace {
     // time the faulting thread is stopped, so dumping guest memory around each register here is the
     // trustworthy way to inspect deep crashes (e.g. the null std::ctype facet at eboot+0x3b5ea6).
     bool g_faultmem = false;
+    bool g_faultlog = false;
     int  g_devnull_fd = -1;
 
     // Async-signal-safe readability probe: write() to /dev/null returns EFAULT (not a fault) for
@@ -101,12 +102,23 @@ namespace {
             uint64_t a = (uint64_t)si->si_addr;
             if (a >= GPU_VA_LO && a < GPU_VA_HI) {
                 void* page = (void*)(a & ~(uint64_t)0xfff);
-                if (mmap(page, 0x1000, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page) {
-                    g_lazy_pages++;
-                    return;   // re-execute the faulting instruction against the now-mapped page
+                bool ok = mmap(page, 0x1000, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page;
+                if (g_faultlog) {
+                    char b[128]; auto* uc = (ucontext_t*)uctx;
+                    int n = snprintf(b, sizeof b, "[fault] GPU-VA %s addr=0x%llx rip=0x%llx\n",
+                                     ok ? "mapped" : "MMAP-FAILED", (unsigned long long)a,
+                                     (unsigned long long)uc->uc_mcontext.gregs[REG_RIP]);
+                    write(2, b, n);
                 }
+                if (ok) { g_lazy_pages++; return; }  // re-execute against the now-mapped page
             }
+        }
+        if (g_faultlog) {
+            char b[128]; auto* uc = (ucontext_t*)uctx;
+            int n = snprintf(b, sizeof b, "[fault] sig=%d addr=%p rip=0x%llx armed=%d\n",
+                             sig, si->si_addr, (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], (int)g_armed);
+            write(2, b, n);
         }
         g_fault_addr = si->si_addr;
         auto* uc = (ucontext_t*)uctx;
@@ -211,12 +223,14 @@ void install_sigaltstack() {
 
 void install_trap_handler() {
     g_faultmem = getenv("PROSPER_FAULTMEM") != nullptr;   // read once (getenv is not signal-safe)
+    g_faultlog = getenv("PROSPER_FAULTLOG") != nullptr;
     if (g_faultmem && g_devnull_fd < 0)
         g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
     install_sigaltstack();
     struct sigaction sa{};
     sa.sa_sigaction = fault_handler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;   // run the handler on the alt stack (survives stack overflow)
+    sa.sa_flags = SA_SIGINFO;   // (SA_ONSTACK disabled: siglongjmp from the alt stack tripped glibc's
+                                // %fs-guarded ____longjmp_chk -> jump-to-garbage fault storm)
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS,  &sa, nullptr);
