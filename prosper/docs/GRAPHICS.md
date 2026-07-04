@@ -197,6 +197,18 @@ loading a real `.prx`, that init never runs and the global stays null. This is t
 The current stage-1 direct-`[sub+0x08]` write is a stopgap that `SetSource` later overwrites; it
 stands only as a documented WIP checkpoint.
 
+### Diagnostic result (2026-07-04): the graphics init is a chain of libSceAgc objects → SDK-gated
+
+A throwaway probe installed an empty-but-structurally-valid source object into the guest global and
+re-ran the boot. The fault moved only slightly — `0x3b1562 → 0x3b1533` — to the **same class** of
+null-deref (`[sub[esi]+0]` → `[+0x28]`) on the next sub-object/path. Conclusion: the AGC graphics
+init is a *chain* of libSceAgc-internal object installations; each empty scaffold reveals the next of
+the same kind. Building this chain correctly requires the real libSceAgc object layouts, i.e. **the
+AGC SDK headers** (or a real libSceAgc.prx). Continuing to hand-fabricate the object graph would
+violate correctness-first (endless chain of fakes that never reaches real rendering), so stage 2 is
+**parked pending the SDK headers**. Independent, provably-correct graphics-pipeline work (AGC command
+decode, shader recompiler, Vulkan backend — all unit-testable in isolation) proceeds meanwhile.
+
 ## Recommended implementation order
 
 1. **Real unified memory.** Make GPU allocations CPU/GPU-VA *aliased*: when the guest maps direct
