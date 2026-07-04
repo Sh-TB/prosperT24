@@ -50,6 +50,9 @@ int main(int argc, char** argv) {
     for (auto& img : p.imgs) if (!map_image(img, &e)) { printf("map failed: %s\n", e.c_str()); return 1; }
     { std::vector<TlsModuleDesc> td; for (auto& t : p.tls_templates) td.push_back({t.init_va, t.filesz, t.memsz});
       set_tls_modules(td.data(), td.size()); }   // enable __tls_get_addr for loaded modules (real libc.prx)
+    // sceKernelGetProcParam -> eboot's SCE_PROCPARAM (real libc reads its heap/malloc config here).
+    for (auto& s : p.mods[0]->segments)
+        if (s.type == PT_SCE_PROCPARAM) { set_proc_param(EBOOT + s.vaddr); break; }
     if (!install_stubs(p.slots, p.stub_base, p.stub_size, &e)) { printf("stubs failed: %s\n", e.c_str()); return 1; }
     install_trap_handler();
     run_guest_inits(p.init_fns);

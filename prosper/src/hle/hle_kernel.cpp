@@ -389,11 +389,19 @@ HLE(k_tls_get_addr) {   // __tls_get_addr(tls_index* ti): ti[0]=module id, ti[1]
     return (uint64_t)(uintptr_t)blk + off;
 }
 
+// sceKernelGetProcParam: guest address of the main module's SCE_PROCPARAM. Real libc reads its
+// heap/malloc config (sceLibcParam) from here; without it, libc's heap never inits and malloc/
+// memalign return null (the branch's eboot+0x8065ee crash).
+namespace { uint64_t g_proc_param = 0; }
+void set_proc_param(uint64_t guest_va) { g_proc_param = guest_va; }
+HLE(k_get_proc_param) { return g_proc_param; }
+
 void register_kernel_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     // ELF TLS accessor used by loaded .prx modules (raw NID + name).
     Hle::register_fn("vNe1w4diLCs", (HleFn)k_tls_get_addr, "__tls_get_addr");
     R("__tls_get_addr", k_tls_get_addr);
+    R("sceKernelGetProcParam", k_get_proc_param);
     R("sceKernelInstallExceptionHandler", k_install_exc_handler);
     R("sceKernelRaiseException", k_raise_exception);
     R("sceKernelDlsym", k_dlsym);
