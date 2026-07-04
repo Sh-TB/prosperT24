@@ -167,6 +167,9 @@ HLE(k_attr_getstacksize) {
     }
     return 0;
 }
+// scePthreadAttrGetaffinity(attr, SceKernelCpumask* mask): report all 8 PS5 cores available.
+// Returning 0 (the old stub) yields an EMPTY mask -> the guest may conclude no CPUs are usable.
+HLE(k_attr_getaffinity) { if (a1) *(uint64_t*)(uintptr_t)a1 = 0xff; return 0; }
 
 // --- thread creation: run the guest entry on a real host thread (ABI matches) ---
 // We give each worker a stack we allocate and TRACK, so GC/thread-stack queries get
@@ -485,6 +488,9 @@ void register_kernel_hle() {
     R("scePthreadAttrGet", k_attr_get);
     R("scePthreadAttrGetstackaddr", k_attr_getstackaddr);
     R("scePthreadAttrGetstacksize", k_attr_getstacksize);
+    R("scePthreadAttrGetaffinity", k_attr_getaffinity);  // report 8 cores (not an empty mask)
+    R("scePthreadAttrSetaffinity", k_attr_noop);         // accept affinity requests (we don't pin)
+    R("scePthreadGetaffinity", k_attr_getaffinity);      R("scePthreadSetaffinity", k_attr_noop);
     R("scePthreadGetschedparam", k_attr_noop);  R("pthread_getschedparam", k_attr_noop);
     R("scePthreadSetschedparam", k_attr_noop);  R("scePthreadSetprio", k_attr_noop);
     R("scePthreadGetprio", k_attr_noop);
