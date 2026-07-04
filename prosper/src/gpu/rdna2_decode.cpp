@@ -78,7 +78,13 @@ void decode_operands(Rdna2Inst& i) {
             i.n_src = 2; break;
         case Rdna2Format::SOPP:
             i.opcode = (w >> 16) & 0x7Fu; i.simm16 = sext16(w); break;
-        default: break;   // memory / interp / export: operands not decoded at this stage
+        case Rdna2Format::EXP: {
+            const uint32_t d1 = i.words[1];
+            i.exp_en = w & 0xFu; i.exp_target = (w >> 4) & 0x3Fu;
+            for (int k = 0; k < 4; k++) i.src[k] = vgpr((d1 >> (8 * k)) & 0xFFu);
+            i.n_src = 4; break;
+        }
+        default: break;   // memory / interp: operands not decoded at this stage
     }
 }
 }  // namespace

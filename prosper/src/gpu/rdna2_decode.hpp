@@ -56,9 +56,14 @@ struct Rdna2Inst {
     // signed 16-bit immediate for SOPK/SOPP. Memory/interp/export formats leave these unset (fmt only).
     uint32_t opcode = 0;
     Operand  dst;
-    Operand  src[3];
+    Operand  src[4];        // up to 4 (EXP has 4 VGPR sources; VOP3 uses 3)
     uint8_t  n_src = 0;
     int32_t  simm16 = 0;
+
+    // EXP-only: export target (MRT0=0..7, MRTZ=8, NULL=9, POS0=12..15, PARAM0=32..) and the 4-bit
+    // per-component enable mask. The 4 exported VGPRs are in src[0..3].
+    uint32_t exp_target = 0;
+    uint32_t exp_en = 0;
 };
 
 // Decode the single instruction at code[0..]; `max_dwords` bounds the read. On a truncated/unknown

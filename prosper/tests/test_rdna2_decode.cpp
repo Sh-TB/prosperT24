@@ -61,9 +61,23 @@ int main() {
     CHECK(ins[1].literal == 0x12345678u && ins[4].literal == 0x12345678u, "inline literals captured");
     CHECK(ins[9].is_end, "S_ENDPGM flagged as end");
 
-    // --- operand decode (stage 2) ---
     auto isS = [](const Operand& o, int n){ return o.kind == OperandKind::SGPR && o.value == n; };
     auto isV = [](const Operand& o, int n){ return o.kind == OperandKind::VGPR && o.value == n; };
+
+    // --- EXP decode (export target + enable + 4 VGPR sources) ---
+    // Assembled: exp mrt0 v0,v1,v2,v3 | exp pos0 v4,v5,v6,v7 | exp param0 v8,v9,v10,v11
+    const uint32_t mrt0[]  = {0xF800000Fu, 0x03020100u};
+    const uint32_t pos0[]  = {0xF80000CFu, 0x07060504u};
+    const uint32_t par0[]  = {0xF800020Fu, 0x0B0A0908u};
+    Rdna2Inst e0 = rdna2_decode_one(mrt0, 2), e1 = rdna2_decode_one(pos0, 2), e2 = rdna2_decode_one(par0, 2);
+    CHECK(e0.fmt == Rdna2Format::EXP && e0.exp_target == 0 && e0.exp_en == 0xF &&
+          isV(e0.src[0],0) && isV(e0.src[1],1) && isV(e0.src[2],2) && isV(e0.src[3],3), "EXP mrt0 v0..v3");
+    CHECK(e1.fmt == Rdna2Format::EXP && e1.exp_target == 12 &&
+          isV(e1.src[0],4) && isV(e1.src[3],7), "EXP pos0 (target 12) v4..v7");
+    CHECK(e2.fmt == Rdna2Format::EXP && e2.exp_target == 32 &&
+          isV(e2.src[0],8) && isV(e2.src[3],11), "EXP param0 (target 32) v8..v11");
+
+    // --- operand decode (stage 2) ---
     // inst0: s_mov_b32 s0, s1  -> dst SGPR0, src0 SGPR1
     CHECK(isS(ins[0].dst, 0) && ins[0].n_src == 1 && isS(ins[0].src[0], 1), "s_mov_b32 s0,s1 operands");
     // inst2: s_add_u32 s0, s1, s2 -> dst SGPR0, src0 SGPR1, src1 SGPR2
