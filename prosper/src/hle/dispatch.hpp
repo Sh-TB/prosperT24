@@ -43,6 +43,9 @@ void set_app0_root(const std::string& root);
 void register_service_hle();
 // Headless graphics bring-up (libSceAgc/libSceVideoOut placeholders); see hle_graphics.cpp.
 void register_graphics_hle();
+// libSceAgc "Gen5" Draw Command Buffer HLE (real PM4-building Dcb functions); see hle_agc.cpp.
+// Call AFTER register_graphics_hle so these override the observe-only glog stubs.
+void register_agc_hle();
 // libkernel virtual/direct memory (Linux backing); called by register_kernel_hle().
 void register_kernel_mem_hle();
 // libkernel time/clock + C11 threads + assorted stubs; called by register_kernel_hle().
