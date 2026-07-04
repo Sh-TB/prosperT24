@@ -1,5 +1,59 @@
 # libSceAgc call trace — API reconstruction reference (M4 groundwork)
 
+## ⭐ NAMES RESOLVED via shadPS4 (2026-07-04) — no longer guessing
+
+shadPS4's `src/core/aerolib/aerolib.inl` has a full `STUB("<NID>", sceAgc...)` map (same NID format).
+Matching our 28 traced NIDs against it gives real names — the game is **building GPU command buffers
+(DCBs) and creating shaders**, exactly the AGC command-submission model (which mirrors shadPS4's GNM
+PM4 model). Verified map (× = call count from one boot):
+
+| our NID | real name | × | role |
+|---|---|---|---|
+| `f3dg2CSgRKY` | **sceAgcCreateShader** | 36 | create a shader object from a blob (hottest) |
+| `ZvwO9euwYzc` | **sceAgcDcbSetCxRegistersIndirect** | 25 | DCB: set context registers (indirect) |
+| `d-6uF9sZDIU` | **sceAgcSetCxRegIndirectPatchAddRegisters** | 25 | patch the indirect Cx-register list (paired) |
+| `wr23dPKyWc0` | **sceAgcCbReleaseMem** | 6 | fence / release-memory (EOP write) |
+| `+kSrjIVxKFE` | **sceAgcDcbPushMarker** | 5 | DCB: push debug marker (this is "obj"'s call — obj is a **DCB**) |
+| `TRO721eVt4g` | **sceAgcDcbResetQueue** | 5 | DCB: reset/init a command-buffer queue |
+| `aJf+j5yntiU` | **sceAgcDcbEventWrite** | 5 | DCB: write a GPU event |
+| `-KRzWekV120` | **sceAgcCb*/finalize** (not in map) | 3 | (unnamed; near Cb funcs) |
+| `H7uZqCoNuWk` | **sceAgcDcbPopMarker** | 3 | DCB: pop debug marker |
+| `VmW0Tdpy420` | **sceAgcDcbWaitRegMem** | 3 | DCB: wait on register/memory |
+| `MWiElSNE8j8` | **sceAgcDcbWaitUntilSafeForRendering** | 2 | DCB: barrier |
+| `hvUfkUIQcOE` | **sceAgcDcbSetUcRegistersIndirect** | 2 | DCB: set user-config registers (indirect) |
+| `6lNcCp+fxi4` | **sceAgcSetUcRegIndirectPatchSetAddress** | 1 | patch Uc-register indirect base |
+| `vRoArM9zaIk` | **sceAgcSetUcRegIndirectPatchAddRegisters** | 2 | patch Uc-register indirect list |
+| `vcmNN+AAXnY` | **sceAgcSetCxRegIndirectPatchSetAddress** | 1 | patch Cx-register indirect base |
+| `0fWWK5uG9rQ` | **sceAgcQueueEndOfPipeActionPatchAddress** | 2 | EOP action patch |
+| `3KDcnM3lrcU` | **sceAgcWaitRegMemPatchAddress** | 2 | wait-reg-mem patch |
+| `57labkp+rSQ` | **sceAgcDcbAcquireMem** | 4 | fence / acquire-memory |
+| `LtTouSCZjHM` | **sceAgcCbNop** | 2 | command-buffer NOP |
+| `i1jyy49AjXU` | **sceAgcDcbWriteData** | 2 | DCB: write data words |
+| `MM4IZSEYytQ` | **sceAgcDriverSetHsOffchipParam** | 1 | tess hull-shader offchip config |
+| `XlNp7jzGiPo` | **sceAgcDriverSetTFRing** | 1 | tessellation-factor ring setup |
+| `Zw7uUVPulbw` | **sceAgcDriverGetEqContextId** | 2 | event-queue context id |
+| `w2rJhmD+dsE` | **sceAgcDriverAddEqEvent** | 2 | add event-queue event |
+| `h9z6+0hEydk` | **sceAgcSuspendPoint** | many | TRC R5089 suspend point (the spin-loop msg) |
+| `23LRUSvYu1M`, `BfBDZGbti7A`, `V++UgBtQhn0`, `fPSCdQxgpSw` | (not in shadPS4 map) | | device/misc |
+
+**Implications:**
+- The faulting "obj" is a **DCB (Draw Command Buffer)** — `sceAgcDcbPushMarker(obj, …)` appends to it.
+  The earlier "std::ctype facet"/"generic object" readings were wrong; the ctype-shaped instructions
+  are the game's PM4-building code operating on DCB state.
+- To progress: implement the **AGC DCB model** — a command buffer the game's `sceAgcDcb*` calls append
+  PM4 to (init via `sceAgcDcbResetQueue`, append via SetRegisters/Marker/EventWrite/WriteData, sync via
+  AcquireMem/ReleaseMem/WaitRegMem) — plus **sceAgcCreateShader** (parse the RDNA2 shader blob into an
+  object). This is directly analogous to shadPS4's `gnmdriver.cpp` (PM4 emitters) + `liverpool.cpp`
+  (PM4 decode). Then `submit` → decode DCB PM4 → Vulkan (the big M5 piece; shadPS4's `video_core` is
+  the reference, GPL-2.0 — OK, we open-source).
+- **shadPS4 reusability (from survey):** near-drop-in = generic Vulkan engine + IR→SPIR-V backend +
+  unified-memory/cache model; rewrite for RDNA2 = shader ISA decoder, register/PM4 tables, V#/T#/S#
+  bit layouts, tiling. The AGC HLE surface = shadPS4's 325 `sceAgc*` stub NIDs (a ready backlog).
+
+---
+
+## (original reconstruction from arg patterns — superseded by the names above)
+
 Generated from `PROSPER_GFXLOG=1 ./build-linux/boot_trace <dump>` (see `hle_graphics.cpp`'s per-NID
 `glog_thunk`s). The game calls **28 distinct libSceAgc/AgcDriver NIDs**, ~148 times total, before the
 first null-object fault. libSceAgc is a **PS5 system library not in our dump**, so we cannot
