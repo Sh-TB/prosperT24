@@ -10,6 +10,7 @@
 #include <setjmp.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -36,7 +37,54 @@ namespace {
     void*    g_fault_addr = nullptr;
     uint64_t g_fault_rip = 0;
     uint64_t g_rbp = 0, g_rsp = 0, g_rax = 0, g_rdi = 0, g_rsi = 0, g_rdx = 0;
+    uint64_t g_rbx = 0, g_rcx = 0, g_r8 = 0, g_r9 = 0, g_r10 = 0, g_r11 = 0,
+             g_r12 = 0, g_r13 = 0, g_r14 = 0, g_r15 = 0;
     NidDb*   g_nid_db = nullptr;
+
+    // Deterministic fault-time memory dump (opt-in via PROSPER_FAULTMEM). Live gdb breakpoints are
+    // unreliable in this multithreaded, signal-scheduled guest (register readouts race); at fault
+    // time the faulting thread is stopped, so dumping guest memory around each register here is the
+    // trustworthy way to inspect deep crashes (e.g. the null std::ctype facet at eboot+0x3b5ea6).
+    bool g_faultmem = false;
+    int  g_devnull_fd = -1;
+
+    // Async-signal-safe readability probe: write() to /dev/null returns EFAULT (not a fault) for
+    // an unmapped source, so we can test guest addresses without risking a nested SIGSEGV.
+    bool probe_readable(uint64_t a) {
+        if (a < 0x1000 || g_devnull_fd < 0) return false;
+        return write(g_devnull_fd, (const void*)a, 8) == 8;
+    }
+    void dump_fault_mem() {
+        if (!g_faultmem) return;
+        const struct { const char* n; uint64_t v; } regs[] = {
+            {"rdi", g_rdi}, {"rsi", g_rsi}, {"rdx", g_rdx}, {"rcx", g_rcx},
+            {"rax", g_rax}, {"rbx", g_rbx}, {"rbp", g_rbp}, {"rsp", g_rsp},
+            {"r8 ", g_r8},  {"r9 ", g_r9},  {"r12", g_r12}, {"r13", g_r13},
+            {"r14", g_r14}, {"r15", g_r15},
+        };
+        char b[256];
+        int n = snprintf(b, sizeof b, "[prosper] FAULTMEM dump (regs -> guest memory):\n");
+        write(2, b, n);
+        for (auto& r : regs) {
+            if (!probe_readable(r.v)) {
+                n = snprintf(b, sizeof b, "  %s=0x%llx  (unmapped/immediate)\n",
+                             r.n, (unsigned long long)r.v);
+                write(2, b, n);
+                continue;
+            }
+            uint64_t q[4] = {0, 0, 0, 0};
+            char part[4][24];
+            for (int i = 0; i < 4; i++) {
+                uint64_t addr = r.v + (uint64_t)i * 8;
+                if (probe_readable(addr)) { q[i] = *(const uint64_t*)addr;
+                    snprintf(part[i], sizeof part[i], "0x%llx", (unsigned long long)q[i]); }
+                else snprintf(part[i], sizeof part[i], "??");
+            }
+            n = snprintf(b, sizeof b, "  %s=0x%llx -> [0]=%s [8]=%s [10]=%s [18]=%s\n",
+                         r.n, (unsigned long long)r.v, part[0], part[1], part[2], part[3]);
+            write(2, b, n);
+        }
+    }
 
     // GPU virtual-address window that we back lazily. The PS5 has unified CPU/GPU memory, so GPU
     // VAs are real RAM; the guest builds GPU structures at these high addresses. We map a real
@@ -67,8 +115,14 @@ namespace {
         g_rbp = (uint64_t)g[REG_RBP]; g_rsp = (uint64_t)g[REG_RSP];
         g_rax = (uint64_t)g[REG_RAX]; g_rdi = (uint64_t)g[REG_RDI];
         g_rsi = (uint64_t)g[REG_RSI]; g_rdx = (uint64_t)g[REG_RDX];
+        g_rbx = (uint64_t)g[REG_RBX]; g_rcx = (uint64_t)g[REG_RCX];
+        g_r8  = (uint64_t)g[REG_R8];  g_r9  = (uint64_t)g[REG_R9];
+        g_r10 = (uint64_t)g[REG_R10]; g_r11 = (uint64_t)g[REG_R11];
+        g_r12 = (uint64_t)g[REG_R12]; g_r13 = (uint64_t)g[REG_R13];
+        g_r14 = (uint64_t)g[REG_R14]; g_r15 = (uint64_t)g[REG_R15];
         g_trap_sig = sig;
         g_trap_kind = (sig == SIGILL) ? 3 : 2;
+        dump_fault_mem();   // no-op unless PROSPER_FAULTMEM is set
         if (g_armed) siglongjmp(g_jb, 1);
         // Fault on a thread with no recovery point (a guest worker thread). Report where
         // (async-signal-safe write) then terminate cleanly instead of a cross-thread longjmp.
@@ -142,6 +196,9 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
 }
 
 void install_trap_handler() {
+    g_faultmem = getenv("PROSPER_FAULTMEM") != nullptr;   // read once (getenv is not signal-safe)
+    if (g_faultmem && g_devnull_fd < 0)
+        g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
     struct sigaction sa{};
     sa.sa_sigaction = fault_handler;
     sa.sa_flags = SA_SIGINFO;

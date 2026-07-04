@@ -50,15 +50,22 @@ being skipped). Chain, all verified by disassembly under gdb (`break run_entry` 
   ctype table exists; this *particular* locale/facet built in `CreateWorkload` just never gets its
   `+0x8` table populated.
 
-**Open question for the next deep session:** which constructor builds this `CreateWorkload` locale
-and why its ctype facet's `[+0x8]` is left null (a facet-install path that should copy the classic
-table but doesn't — possibly a Dinkumware `_Locinfo`/`_Getcvt` path hitting another stubbed import,
-or a facet whose table is meant to come from a locale-name lookup we don't service). Fine gdb
-breakpoints here are unreliable — the guest is multithreaded under signal-based scheduling and
-register readouts race. Prefer: (a) instrument the HLE `setlocale`/`_Locinfo`/`localeconv` family to
-log every call + return during the `CreateWorkload` window, or (b) add a one-shot guest-memory probe
-in the fault handler that, on the `+0x3b5ea6` fault, walks back to the facet and logs its bytes
-deterministically (single-threaded at fault time) instead of via a live breakpoint.
+**Refined by the `PROSPER_FAULTMEM` probe (2026-07-04, deterministic):** at the fault, `r14` (the
+facet, `obj+0x38`) points to a **fully-zeroed object** — `[+0]=[+8]=[+0x10]=[+0x18]=0`. So it is not
+merely the ctype table field that is null; **the locale's entire inline facet array is zero.** The
+`std::locale` (`obj` at `r14-0x38`) was allocated + zeroed but **no facets were ever installed** (the
+facet-copy from the classic locale never ran, or ran on a different object). `rbp[+8]=0x4014ddc1a`
+confirms the `CreateWorkload` caller frame; `obj` is loaded from `[rbp-0x198]` at `eboot+0x14ddc02`.
+
+**Open question for the next deep session:** why this `std::locale`'s facet array is left all-zero —
+i.e. where the facet-install/copy-from-classic step is skipped. Likely the classic-locale singleton
+(`std::locale::classic()`) itself never populated its facets (a guarded static init that bailed on a
+stubbed dependency), so every derived locale copies zeros. Next: find the classic-locale facet array
+and check whether it too is zero (if so, fix its init); trace what builds `obj` at `[rbp-0x198]` in
+`eboot+0x14ddc00`'s fn. **Tooling:** run `PROSPER_FAULTMEM=1 ./build-linux/boot_trace <dump>` — it
+dumps every GP register and 4 qwords of guest memory at each pointer-looking one, *at fault time on
+the stopped faulting thread* (reliable; live gdb breakpoints race in this multithreaded, signal-
+scheduled guest and give garbage register readouts).
 
 ## What's already in place (headless bring-up, correctness-first)
 
