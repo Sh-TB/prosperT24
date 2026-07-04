@@ -148,10 +148,33 @@ cx/sh/uc sets): the setter thunks (`eboot+0x3a7aa0/0x3a7b20/0x3a7b60`) and gette
 sub-object's `[sub+0x08]`. With all per-selector limits = 0 the classifier returns `0x7fff` for every
 register, so the register-set loops skip every write and never touch the null banks. **Result: the
 fault moved from `eboot+0x3b5ea6` to `eboot+0x3b1562`** — a getter that derefs `[sub[0]+0x00]`
-(still null) → `[null+0x28]`. So the confirmed next step is to also populate `[sub+0x00]` (the
-owner/state object) and, for real rendering, `[sub+0x10]/[sub+0x18]` (banks) + the real register
-offsets from `agc_reg_defaults.cpp`. This proves the diagnosis: `+kSrjIVxKFE` is the correct place to
-build the context.
+(still null) → `[null+0x28]`. This proves the diagnosis: `+kSrjIVxKFE` is the correct place to build
+the context.
+
+### Deeper mechanism (RE'd 2026-07-04) — the "source" object supersedes the direct-table stopgap
+
+Going past `0x3b1562` revealed the real wiring, which **supersedes** stage-1's approach of writing
+`[sub+0x08]` directly. The eboot function `SetSource(sub, src)` at **eboot+0x3af400** owns these
+fields:
+```
+[sub+0x00] = src                     ; the "source"/state object (NOT the context back-pointer)
+if (src == 0) { [sub+0x08] = 0; return }   ; <-- null source => null table => the boot fault
+[sub+0x08] = [src+0x08]              ; the classify table is COPIED FROM the source object
+[sub+0x30] = [src+0x5a]; [sub+0x34] = [ [src+0x08] + 0x28 ]; [sub+0x38/0x3c] from [src+0x28]+0x14/0x16
+```
+So `[sub+0x08]` (the table) is not ours to set — it is pulled from a **source object** `src`, and
+`src` is currently **null** because the AGC call that creates it is stubbed. A sibling flush
+(eboot+0x3af440) uses `peek(table,idx) = [[table+0x00]+idx*2]` (eboot+0x3b5e90) and treats a
+non-`0xffff` result as "sub exhausted" → resets the sub-object. Some sub-objects DO get a valid
+(host-allocated) source in other calls, so at least one create-source HLE returns non-null; the
+faulting `sub[0]` gets null.
+
+**STAGE 2 (real fix):** find the AGC function that creates the register "source" object and implement
+it to return a real object whose `[src+0x08]` is a populated register-map table (peek array at
+`+0x00`, subarray pointers at `+0x08`, u16 limits at `+0x2e`) built from `agc_reg_defaults.cpp`, plus
+`[src+0x28]`/`[src+0x5a]` register-count fields. That single object then flows through `SetSource`
+into every sub-object. The current stage-1 direct-`[sub+0x08]` write is a stopgap that `SetSource`
+later overwrites; it stands only as a documented WIP checkpoint.
 
 ## Recommended implementation order
 
