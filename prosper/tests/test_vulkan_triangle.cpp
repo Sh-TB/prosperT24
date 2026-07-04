@@ -11,10 +11,22 @@
 #include "spirv_triangle.h"
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
 using namespace prosper::gpu;
+
+static uint32_t crc32(const uint8_t* p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) { c ^= p[i];
+        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (~(c & 1) + 1)); }
+    return ~c;
+}
+// Write the framebuffer to a PPM if PROSPER_DUMP_PPM is set — for optional human/debug inspection.
+// The test never *requires* this: verification is the programmatic checks below. (No <cstdlib>
+// getenv include needed beyond what's here; guarded so it's a no-op in normal/CI runs.)
+static void maybe_dump_ppm(const uint8_t* px, uint32_t W, uint32_t H);
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -201,6 +213,16 @@ int main() {
            center[0], center[1], center[2], center[3], corner[0], corner[1], corner[2], corner[3]);
     CHECK(center[0] > 0x80 && center[1] < 0x40 && center[2] < 0x40, "center pixel is the RED triangle");
     CHECK(corner[2] > 0x80 && corner[0] < 0x40 && corner[1] < 0x40, "corner pixel is the BLUE clear");
+
+    // Golden-hash regression gate: llvmpipe (software raster) is deterministic, so the whole
+    // framebuffer hashes to a stable value. Any change to the pipeline/translation that alters a
+    // single pixel flips this hash and fails the test — automated regression detection, no eyeballing.
+    // (On a hardware GPU the raster may differ; this gate assumes the CI's software rasterizer.)
+    const uint32_t crc = crc32(px, (size_t)bytes);
+    printf("  framebuffer CRC32 = 0x%08x\n", crc);
+    constexpr uint32_t kGolden = 0x87160F1Eu;   // captured from llvmpipe; see note above
+    CHECK(crc == kGolden, "framebuffer matches golden hash (whole-image regression gate)");
+    maybe_dump_ppm(px, W, H);
     vkUnmapMemory(dev, bmem);
 
     vkDestroyFence(dev, fence, nullptr); vkDestroyCommandPool(dev, pool, nullptr);
@@ -215,4 +237,14 @@ int main() {
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;
+}
+
+static void maybe_dump_ppm(const uint8_t* px, uint32_t W, uint32_t H) {
+    if (!getenv("PROSPER_DUMP_PPM")) return;
+    if (FILE* f = fopen("triangle.ppm", "wb")) {
+        fprintf(f, "P6\n%u %u\n255\n", W, H);
+        for (uint32_t i = 0; i < W * H; i++) fwrite(px + i * 4, 1, 3, f);   // RGB, drop alpha
+        fclose(f);
+        printf("  wrote triangle.ppm\n");
+    }
 }
