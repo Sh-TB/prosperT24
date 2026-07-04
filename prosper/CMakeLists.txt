@@ -70,6 +70,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_render_state PRIVATE prosper_core)
   add_test(NAME render_state_extract COMMAND test_render_state)
 
+  # RDNA2 shader instruction-stream walker (first stage of the RDNA2->SPIR-V recompiler).
+  add_executable(test_rdna2_decode tests/test_rdna2_decode.cpp)
+  target_link_libraries(test_rdna2_decode PRIVATE prosper_core)
+  add_test(NAME rdna2_decode_walk COMMAND test_rdna2_decode)
+
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux only).
   if(UNIX AND NOT APPLE)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
