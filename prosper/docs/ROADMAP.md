@@ -228,7 +228,14 @@ Turn the file into a resident, relocated guest image in host memory.
 - **Tracing**: every HLE call logged behind a flag; per-module enable.
 - **Test harness**: golden memory-map & call-trace snapshots to catch regressions.
 
-### OPEN DECISION — load the real `sce_module/libc.prx` instead of HLE-ing libc? (top correctness lever)
+### RESOLVED (2026-07-04, merged to master) — load the real `sce_module/libc.prx` instead of HLE-ing libc
+
+**DONE.** The real-libc line was validated and merged to master: master now loads real `libc.prx`, with
+general-dynamic TLS, procparam, POSIX `_`-wrappers, rwlock/once, and `gettid`-based fault recovery.
+eboot's 145 libc imports bind to real Sony code; the boot reaches the same terminal point (the libSceAgc
+frontier) with real libc. Original analysis kept below for context.
+
+### (historical) OPEN DECISION — load the real `sce_module/libc.prx` instead of HLE-ing libc? (top correctness lever)
 
 The dump ships the **real Sony `sce_module/libc.prx`** (1.8 MB; 2921 exports, imports only 117: 113
 libkernel + 3 libSceLibcInternalExt + 1 libSceSysmodule). We currently **HLE** libc instead of loading
