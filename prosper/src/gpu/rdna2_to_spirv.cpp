@@ -8,14 +8,16 @@ namespace prosper::gpu {
 namespace {
 
 enum : uint32_t {
-    Op_MemoryModel=14, Op_EntryPoint=15, Op_ExecutionMode=16, Op_Capability=17,
-    Op_TypeVoid=19, Op_TypeInt=21, Op_TypeFloat=22, Op_TypeVector=23,
+    Op_ExtInstImport=11, Op_ExtInst=12, Op_MemoryModel=14, Op_EntryPoint=15, Op_ExecutionMode=16,
+    Op_Capability=17, Op_TypeVoid=19, Op_TypeInt=21, Op_TypeFloat=22, Op_TypeVector=23,
     Op_TypeRuntimeArray=29, Op_TypeStruct=30, Op_TypePointer=32, Op_TypeFunction=33,
     Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
     Op_CompositeExtract=81, Op_IAdd=128, Op_FAdd=129, Op_FSub=131, Op_IMul=132, Op_FMul=133,
-    Op_Label=248, Op_Return=253,
+    Op_FDiv=136, Op_Label=248, Op_Return=253,
 };
+// GLSL.std.450 extended-instruction numbers.
+enum : uint32_t { Glsl_Floor=8, Glsl_Fract=10, Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_FMax=40 };
 enum : uint32_t {
     Cap_Shader=1, Addr_Logical=0, Mem_GLSL450=1, Exec_GLCompute=5, EM_LocalSize=17,
     SC_Input=1, SC_StorageBuffer=12, FC_None=0,
@@ -28,13 +30,13 @@ uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 // A compute-shader SPIR-V builder specialized for "load N floats -> compute over SSA floats ->
 // store 1 float", with helpers the VALU translator drives.
 struct SpirvCompute {
-    std::vector<uint32_t> caps, mem, entry, exec, deco, types, code;
+    std::vector<uint32_t> caps, extimp, mem, entry, exec, deco, types, code;
     std::unordered_map<uint32_t, uint32_t> fconst_cache, uconst_cache;
     uint32_t next_id = 1;
     uint32_t stride = 1;
     // fixed ids (set in begin()):
     uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_v3u=0, t_ptr_sb_f32=0;
-    uint32_t v_gid=0, v_in=0, v_out=0, gidx=0, f_main=0;
+    uint32_t v_gid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0;
 
     uint32_t id() { return next_id++; }
     static void put(std::vector<uint32_t>& s, uint32_t op, std::initializer_list<uint32_t> o) {
@@ -58,6 +60,9 @@ struct SpirvCompute {
         uint32_t c = id(); put(types, Op_Constant, {t_u32, c, v}); uconst_cache[v] = c; return c;
     }
     uint32_t binop(uint32_t op, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, op, {t_f32, r, a, b}); return r; }
+    // GLSL.std.450 extended instructions (float result).
+    uint32_t ext1(uint32_t inst, uint32_t a) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, a}); return r; }
+    uint32_t ext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, a, b}); return r; }
 
     // buffer element pointer: base[ gid.x*stride + k ]
     uint32_t elem_ptr(uint32_t bufvar, uint32_t k) {
@@ -79,9 +84,10 @@ struct SpirvCompute {
         uint32_t t_ptr_in_v3u = id(); v_gid = id();
         uint32_t t_rta = id(), t_struct = id(), t_ptr_sb_struct = id();
         v_in = id(); v_out = id(); t_ptr_sb_f32 = id();
-        f_main = id(); uint32_t lbl = id();
+        f_main = id(); uint32_t lbl = id(); glsl = id();
 
         put(caps, Op_Capability, {Cap_Shader});
+        { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
         put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
         { std::vector<uint32_t> o{Exec_GLCompute, f_main}; pstr(o, "main"); o.push_back(v_gid); putv(entry, Op_EntryPoint, o); }
         put(exec, Op_ExecutionMode, {f_main, EM_LocalSize, 64, 1, 1});
@@ -112,7 +118,7 @@ struct SpirvCompute {
     std::vector<uint32_t> finish() {
         put(code, Op_Return, {}); put(code, Op_FunctionEnd, {});
         std::vector<uint32_t> m{0x07230203u, 0x00010300u, 0u, next_id, 0u};
-        for (auto* s : {&caps, &mem, &entry, &exec, &deco, &types, &code}) m.insert(m.end(), s->begin(), s->end());
+        for (auto* s : {&caps, &extimp, &mem, &entry, &exec, &deco, &types, &code}) m.insert(m.end(), s->begin(), s->end());
         return m;
     }
 };
@@ -142,15 +148,26 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     for (const auto& in : ins) {
         if (in.is_end) break;
         switch (in.fmt) {
-            case Rdna2Format::VOP1:
-                if (in.opcode == 0x01) vreg[in.dst.value] = val(in, in.src[0]);   // v_mov_b32
-                else return {};
+            case Rdna2Format::VOP1: {
+                uint32_t a = val(in, in.src[0]); uint32_t& d = vreg[in.dst.value];
+                switch (in.opcode) {
+                    case 0x01: d = a; break;                                   // v_mov_b32
+                    case 0x20: d = b.ext1(Glsl_Fract, a); break;               // v_fract_f32
+                    case 0x24: d = b.ext1(Glsl_Floor, a); break;               // v_floor_f32
+                    case 0x2A: d = b.binop(Op_FDiv, b.fconst(1.0f), a); break; // v_rcp_f32
+                    case 0x2E: d = b.ext1(Glsl_InverseSqrt, a); break;         // v_rsq_f32
+                    case 0x33: d = b.ext1(Glsl_Sqrt, a); break;                // v_sqrt_f32
+                    default: return {};
+                }
                 break;
+            }
             case Rdna2Format::VOP2: {
                 uint32_t a = val(in, in.src[0]), c = val(in, in.src[1]);
                 if      (in.opcode == 0x03) vreg[in.dst.value] = b.binop(Op_FAdd, a, c);   // v_add_f32
                 else if (in.opcode == 0x04) vreg[in.dst.value] = b.binop(Op_FSub, a, c);   // v_sub_f32
                 else if (in.opcode == 0x08) vreg[in.dst.value] = b.binop(Op_FMul, a, c);   // v_mul_f32
+                else if (in.opcode == 0x0F) vreg[in.dst.value] = b.ext2(Glsl_FMin, a, c);  // v_min_f32
+                else if (in.opcode == 0x10) vreg[in.dst.value] = b.ext2(Glsl_FMax, a, c);  // v_max_f32
                 else return {};
                 break;
             }
