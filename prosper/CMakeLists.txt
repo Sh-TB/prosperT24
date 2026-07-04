@@ -126,6 +126,11 @@ if(TARGET prosper_core)
       add_executable(test_compute_exec tests/test_compute_exec.cpp)
       target_link_libraries(test_compute_exec PRIVATE Vulkan::Vulkan)
       add_test(NAME compute_exec_differential COMMAND test_compute_exec)
+
+      # Prove our own SPIR-V emitter produces valid, correct, runnable SPIR-V (execution-differential).
+      add_executable(test_spirv_builder tests/test_spirv_builder.cpp)
+      target_link_libraries(test_spirv_builder PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME spirv_builder_exec COMMAND test_spirv_builder)
       message(STATUS "Vulkan found (${Vulkan_LIBRARY}) — offscreen graphics harness enabled")
     else()
       message(STATUS "Vulkan not found — skipping offscreen graphics harness")
