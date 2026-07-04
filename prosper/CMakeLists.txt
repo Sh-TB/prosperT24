@@ -120,6 +120,12 @@ if(TARGET prosper_core)
       add_executable(test_vulkan_triangle tests/test_vulkan_triangle.cpp)
       target_link_libraries(test_vulkan_triangle PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME vulkan_triangle_render COMMAND test_vulkan_triangle)
+
+      # Execution-differential harness (verification layer 4): run a compute shader with known
+      # inputs, assert numeric outputs. The RDNA2->SPIR-V recompiler's output will plug in here.
+      add_executable(test_compute_exec tests/test_compute_exec.cpp)
+      target_link_libraries(test_compute_exec PRIVATE Vulkan::Vulkan)
+      add_test(NAME compute_exec_differential COMMAND test_compute_exec)
       message(STATUS "Vulkan found (${Vulkan_LIBRARY}) — offscreen graphics harness enabled")
     else()
       message(STATUS "Vulkan not found — skipping offscreen graphics harness")
