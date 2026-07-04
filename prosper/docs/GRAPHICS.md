@@ -131,6 +131,28 @@ classifier is hit exactly once, not thousands of times — and NOT the `GetRegis
 wiring real RegisterDefaults did not move the fault, confirming the context table is installed by
 `+kSrjIVxKFE`, not read from `GetRegisterDefaults2` here.)
 
+### Context object model (as reverse-engineered)
+
+`+kSrjIVxKFE(context)` is the constructor for the register context embedded at **device+0x48**. The
+context holds an array of **0x70-byte register-set sub-objects at context+0x38** (index 0..2 = the
+cx/sh/uc sets): the setter thunks (`eboot+0x3a7aa0/0x3a7b20/0x3a7b60`) and getters all compute
+`sub[sel] = (context+0x38) + sel*0x70` (`eboot+0x3b0210`: `rax = rdi + sel*0x70`). Each sub-object:
+- `[sub+0x00]` → an owner/state object (chain: `[[sub+0]+0x28]+0x10/0x18`) — **must be non-null**
+- `[sub+0x08]` → the register classify table (see above)
+- `[sub+0x10]`/`[sub+0x18]` → the two register-bank output buffers
+- `[sub+0x32]` (u16), `[sub+0x68]` (flags byte)
+
+### STAGE 1 done (2026-07): empty classify tables unblock the register-set loops
+
+`+kSrjIVxKFE` is now implemented (hle_graphics.cpp) to install a zeroed classify table into each
+sub-object's `[sub+0x08]`. With all per-selector limits = 0 the classifier returns `0x7fff` for every
+register, so the register-set loops skip every write and never touch the null banks. **Result: the
+fault moved from `eboot+0x3b5ea6` to `eboot+0x3b1562`** — a getter that derefs `[sub[0]+0x00]`
+(still null) → `[null+0x28]`. So the confirmed next step is to also populate `[sub+0x00]` (the
+owner/state object) and, for real rendering, `[sub+0x10]/[sub+0x18]` (banks) + the real register
+offsets from `agc_reg_defaults.cpp`. This proves the diagnosis: `+kSrjIVxKFE` is the correct place to
+build the context.
+
 ## Recommended implementation order
 
 1. **Real unified memory.** Make GPU allocations CPU/GPU-VA *aliased*: when the guest maps direct

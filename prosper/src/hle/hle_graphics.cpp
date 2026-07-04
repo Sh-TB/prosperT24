@@ -48,6 +48,42 @@ extern "C" void* prosper_agc_reg_defaults_internal(unsigned int ver);  // -> g_r
 HLE(g_agc_regdefs)     { gfx_tick(); return (uint64_t)(uintptr_t)prosper_agc_reg_defaults((unsigned)a0); }
 HLE(g_agc_regdefs_int) { gfx_tick(); return (uint64_t)(uintptr_t)prosper_agc_reg_defaults_internal((unsigned)a0); }
 
+// +kSrjIVxKFE (kAgcNids[14]): the AGC register-context constructor. The game calls this on its
+// register context (embedded at device+0x48) as the first operation, expecting it to install a
+// "register classify table" at [context+0x08]. That table is consumed by the eboot-internal
+// classifier at eboot+0x3b5ea0: classify(table, sel, key) = (key < table.limit16[sel]) ?
+// table.subarray[sel][key] : 0x7fff, where limit16[] is a u16[4] at table+0x2e and subarray*[] is a
+// void*[4] at table+0x08. With no real impl the context stayed zeroed and the register-set loop
+// null-derefed the table (boot blocker, see docs/GRAPHICS.md).
+//
+// The register banks are an array of 0x70-byte sub-objects at context+0x38 (index 0..2 = the cx/sh/uc
+// register sets): the setter thunks (eboot+0x3a7aa0/0x3a7b20/0x3a7b60) do `add $0x38,%rdi` then
+// `sub = (context+0x38) + sel*0x70` before running the register-set loop. Each sub-object holds its
+// own classify table at [sub+0x08] and register banks at [sub+0x10]/[sub+0x18]. So the constructor
+// must install a table into every sub-object, not into the context base.
+//
+// STAGE 1 (this commit): install a zeroed table in each sub-object -> every per-selector limit is 0
+// -> classify (eboot+0x3b5ea0) returns 0x7fff for all keys -> the register-set loops skip every
+// register (their `cmp $0x7fff; je skip`) without ever touching the (still-null) register banks. This
+// is a structurally-valid empty init: it unblocks the boot so the NEXT blocker is observable. STAGE 2
+// will populate the tables from the real register offsets (agc_reg_defaults.cpp) and allocate the
+// register banks so registers are actually stored.
+namespace {
+alignas(64) uint8_t g_agc_ctx_regmap[0x40] = {0};   // all four per-selector limits (u16 @ +0x2e) = 0
+constexpr int   kAgcCtxSubCount  = 3;               // cx / sh / uc register-set sub-objects
+constexpr size_t kAgcCtxSubBase  = 0x38;            // first sub-object offset inside the context
+constexpr size_t kAgcCtxSubStride = 0x70;           // per sub-object (matches eboot+0x3b0210: *0x70)
+}
+HLE(g_agc_ctx_init) {   // a0 = context pointer (device+0x48)
+    gfx_tick();
+    if (a0) {
+        uint8_t* ctx = (uint8_t*)(uintptr_t)a0;
+        for (int i = 0; i < kAgcCtxSubCount; i++)
+            *(void**)(ctx + kAgcCtxSubBase + i * kAgcCtxSubStride + 0x08) = g_agc_ctx_regmap;
+    }
+    return 0;
+}
+
 // --- libSceVideoOut (display / frame presentation). Headless: accept opens/flips and simulate
 // flip completion so the game's render loop advances (submit -> wait completion -> submit next).
 namespace {
@@ -145,6 +181,9 @@ void register_graphics_hle() {
     RN("wRbq6ZjNop4", g_agc_regdefs_int);   // GraphicsGetRegisterDefaults2Internal -> g_reg_defaults2
     // All traced libSceAgc/AgcDriver NIDs → per-NID logging thunks (still return 0; observable only).
     register_agc_tracers(std::make_index_sequence<kAgcNidCount>{});
+    // Override the +kSrjIVxKFE tracer with the real register-context constructor (must come AFTER the
+    // tracer registration above so it wins; registry is last-write-wins per NID).
+    RN("+kSrjIVxKFE", g_agc_ctx_init);      // AGC register-context init (installs classify table)
     // libSceVideoOut display / flip
     R("sceVideoOutOpen", g_vo_open);            R("sceVideoOutClose", g_vo_close);
     R("sceVideoOutSubmitFlip", g_vo_submitflip);R("sceVideoOutIsFlipPending", g_vo_flippending);
