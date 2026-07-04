@@ -66,6 +66,16 @@ Two ways to get them, fastest first:
    target first (WSL has no display).
 4. **RDNA2 shader recompiler.** Reuse shadPS4's IR + SPIR-V backend + structurizer; write a new
    gfx10.3/wave32 decoder frontend (cross-ref LLVM AMDGPU / Mesa RADV). The largest single piece.
+   **CONFIRMED (2026-07-04):** `sceAgcCreateShader(out=a0, header=a1, code=a2, ?, size=a4≈0x100, a5)`.
+   - `a1` header begins with ASCII magic **`"1234"`** + size fields (`0x18`, `0x108`, `0xa8`).
+   - `a2` is raw **RDNA2 gfx1030 ISA** — verified by disassembling a captured blob (`build-linux/
+     shader0.bin`, via `PROSPER_AGCSHADER=1`) with **`llvm-mc-18 --disassemble -triple=amdgcn
+     -mcpu=gfx1030`**, which decodes it cleanly to a valid fullscreen vertex/primitive shader:
+     `s_sendmsg MSG_GS_ALLOC_REQ; exp prim …; v_cvt_f32_i32 …; exp pos0 … done; s_endpgm`.
+   - **Implication:** LLVM's AMDGPU backend already fully understands our shader ISA — it's a working
+     disassembler/reference and a candidate for the decode frontend (vs. hand-writing a gfx1030
+     decoder). Path: RDNA2 gfx1030 → (LLVM MC decode or shadPS4-style decoder) → IR → SPIR-V (reuse
+     shadPS4's backend). `llvm-mc-18` + `libvulkan-dev` are now installed in the WSL env.
 5. **Present.** `sceVideoOut` swapchain (already stubbed) → present the rendered target; framebuffer
    CRC golden checks (agentic-first).
 

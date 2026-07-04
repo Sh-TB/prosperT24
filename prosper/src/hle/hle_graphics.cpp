@@ -100,6 +100,31 @@ uint64_t glog_impl(const char* nid, void* ra,
                 nid, (unsigned long long)((uint64_t)ra - 0x400000000ull),
                 (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2,
                 (unsigned long long)a3, (unsigned long long)a4, (unsigned long long)a5);
+    // Shader-recompiler prep: dump the blob args of sceAgcCreateShader (f3dg2CSgRKY) to identify the
+    // RDNA2 shader container format. Args are game-heap pointers (already mapped), so the reads are
+    // safe; we only touch plausible pointers. Gated on PROSPER_AGCSHADER.
+    if (getenv("PROSPER_AGCSHADER") && !strcmp(nid, "f3dg2CSgRKY")) {
+        const uint64_t args[4] = {a0, a1, a2, a3};
+        for (int ai = 0; ai < 4; ai++) {
+            if (args[ai] < 0x100000ull) { fprintf(stderr, "  a%d=0x%llx (immediate)\n", ai, (unsigned long long)args[ai]); continue; }
+            const uint8_t* p = (const uint8_t*)(uintptr_t)args[ai];
+            fprintf(stderr, "  a%d=0x%llx: ", ai, (unsigned long long)args[ai]);
+            for (int b = 0; b < 32; b++) fprintf(stderr, "%02x ", p[b]);
+            fprintf(stderr, " | ");
+            for (int b = 0; b < 32; b++) { char c = (char)p[b]; fprintf(stderr, "%c", (c >= 32 && c < 127) ? c : '.'); }
+            fprintf(stderr, "\n");
+        }
+        // Dump the first shader's code blob (a2) to a file so it can be disassembled as RDNA2.
+        static bool dumped = false;
+        if (!dumped && a2 > 0x100000ull) {
+            dumped = true;
+            uint64_t sz = (a4 && a4 <= 0x10000) ? a4 : 0x200;   // a4 looks like a size; cap defensively
+            if (FILE* f = fopen("/mnt/c/Users/matti/repos/ps5ys/prosper/build-linux/shader0.bin", "wb")) {
+                fwrite((const void*)(uintptr_t)a2, 1, sz, f); fclose(f);
+                fprintf(stderr, "  [wrote shader0.bin: %llu bytes from a2]\n", (unsigned long long)sz);
+            }
+        }
+    }
     return 0;
 }
 template <size_t I>
