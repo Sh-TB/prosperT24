@@ -11,28 +11,35 @@
 using namespace prosper;
 
 // Module bases (keep in sync with the inputs below).
-static const uint64_t EBOOT = 0x400000000ull, IL2CPP = 0x440000000ull, PS5UTIL = 0x4c0000000ull, STUB = 0x600000000ull;
+static const uint64_t EBOOT = 0x400000000ull, IL2CPP = 0x440000000ull, PS5UTIL = 0x4c0000000ull,
+                      LIBC = 0x500000000ull, STUB = 0x600000000ull;
 static const char* cls(uint64_t a) {
     if (a >= EBOOT   && a < IL2CPP)  return "eboot";
     if (a >= IL2CPP  && a < PS5UTIL) return "Il2cpp";
-    if (a >= PS5UTIL && a < 0x500000000ull) return "PS5Util";
+    if (a >= PS5UTIL && a < LIBC)    return "PS5Util";
+    if (a >= LIBC    && a < STUB)    return "libc.prx";
     if (a >= STUB    && a < 0x610000000ull) return "STUB";
     return "mapped/host";
 }
 static uint64_t bof(uint64_t a) {
     if (a >= EBOOT   && a < IL2CPP)  return a - EBOOT;
     if (a >= IL2CPP  && a < PS5UTIL) return a - IL2CPP;
-    if (a >= PS5UTIL && a < 0x500000000ull) return a - PS5UTIL;
+    if (a >= PS5UTIL && a < LIBC)    return a - PS5UTIL;
+    if (a >= LIBC    && a < STUB)    return a - LIBC;
     return a;
 }
 
 int main(int argc, char** argv) {
     std::string d = (argc >= 2) ? argv[1] : "../../PPSA24651-app0";
     Program p; std::string e;
+    // libc.prx loaded last => its init_array runs first (deepest dependency), before eboot's entry.
+    // Experimental (branch libc-prx-integration): route eboot's 145 libc imports to the REAL Sony
+    // libc instead of our HLE. Cross-module export beats the HLE stub slot (see linker.cpp pass 2).
     std::vector<LinkInput> in = {
         { d + "/eboot.bin", EBOOT },
         { d + "/Media/Modules/Il2cppUserAssemblies.prx", IL2CPP },
         { d + "/Media/Modules/PS5Util.prx", PS5UTIL },
+        { d + "/sce_module/libc.prx", LIBC },
     };
     if (!link_program(in, STUB, p, &e)) { printf("link failed: %s\n", e.c_str()); return 1; }
     printf("linked %zu modules; %zu imports (%zu cross-module, %zu stub slots); %zu init fns\n",
