@@ -228,6 +228,30 @@ Turn the file into a resident, relocated guest image in host memory.
 - **Tracing**: every HLE call logged behind a flag; per-module enable.
 - **Test harness**: golden memory-map & call-trace snapshots to catch regressions.
 
+### OPEN DECISION — load the real `sce_module/libc.prx` instead of HLE-ing libc? (top correctness lever)
+
+The dump ships the **real Sony `sce_module/libc.prx`** (1.8 MB; 2921 exports, imports only 117: 113
+libkernel + 3 libSceLibcInternalExt + 1 libSceSysmodule). We currently **HLE** libc instead of loading
+it — eboot imports **145 functions from libc** (+ 37 from libScePosix) that all resolve to our HLE
+approximations. Loading the real libc.prx (as we already load PS5Util.prx / Il2cppUserAssemblies.prx)
+would replace those ~145 stubs with **real Sony code** — the single biggest stub-reduction +
+correctness win available, and independent of the (blocked) libSceAgc graphics frontier. It would also
+give real ctype/locale/malloc/stdio behaviour instead of our approximations.
+
+**Why it's a decision, not a quick edit:** this shifts the HLE boundary from *above* libc to *below*
+it (HLE the libkernel/syscall layer that libc.prx imports). It is **all-or-nothing** — real libc's
+malloc arena, `errno`/TLS, locale, and stdio must all initialize and interoperate together; you can't
+mix HLE `malloc` with real `free`. Real libc init also exercises libkernel paths our partial HLE may
+not cover yet, so it risks new deadlocks/crashes that need iterative debugging against the boot. Given
+the boot currently reaches graphics init, flipping this unilaterally risks regressing a working state.
+
+**Recommendation:** do it deliberately, guarded by `test_boot_linux` (which now asserts reaching
+graphics init), on a branch: add libc.prx to the linker's module list, drop the libc HLE registrations,
+implement whatever libkernel imports libc.prx needs, and iterate until the boot test still reaches
+graphics. High value, medium risk, several sessions of work. **libSceNpCppWebApi.prx is also present**
+(same opportunity, lower priority). libSceAgc/AgcDriver are NOT in the dump (system firmware) — those
+must be HLE'd/translated regardless (see `docs/AGC_TRACE.md`).
+
 ## Reality checkpoints
 - After **M2** we know exactly the call order the game needs — re-prioritize M3+.
 - **M5 is the gate.** If the shader recompiler proves intractable for AGC, options
