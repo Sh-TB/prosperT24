@@ -146,6 +146,7 @@ struct ThreadStart { void* (*entry)(void*); void* arg; void* sbase; uint64_t ssz
 void* thread_trampoline(void* p) {
     auto* ts = (ThreadStart*)p;
     if (ts->sbase) register_thread_stack((uint64_t)pthread_self(), ts->sbase, ts->ssz);
+    install_sigaltstack();   // so a guest stack overflow on this worker is still catchable
     auto entry = ts->entry; void* arg = ts->arg; free(ts);
     return entry ? entry(arg) : nullptr;
 }

@@ -25,6 +25,10 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
 // Install the fault handler for genuine guest faults during a run.
 void install_trap_handler();
 
+// Install a per-thread alternate signal stack (so the fault handler survives a guest stack overflow).
+// The main thread gets one via install_trap_handler(); worker threads call this in their trampoline.
+void install_sigaltstack();
+
 // Address of the idx-th import's stub (for tests/bring-up).
 uint64_t stub_addr(uint64_t idx);
 

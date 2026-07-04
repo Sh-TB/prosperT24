@@ -195,13 +195,28 @@ bool install_stubs(const std::vector<ImportSlot>& slots, uint64_t stub_base,
     return true;
 }
 
+// Install a per-thread alternate signal stack so the fault handler can run even when the faulting
+// thread's own stack is exhausted (a guest stack overflow otherwise delivers SIGSEGV with no usable
+// stack -> the handler can't run -> the process cores uncatchably). Idempotent per thread. Worker
+// threads call this from their trampoline; the main thread from install_trap_handler.
+void install_sigaltstack() {
+    static thread_local uint8_t* alt = nullptr;
+    if (alt) return;
+    const size_t sz = 256 * 1024;              // generous: deep real-libc call chains
+    alt = (uint8_t*)malloc(sz);
+    if (!alt) return;
+    stack_t ss{}; ss.ss_sp = alt; ss.ss_size = sz; ss.ss_flags = 0;
+    sigaltstack(&ss, nullptr);
+}
+
 void install_trap_handler() {
     g_faultmem = getenv("PROSPER_FAULTMEM") != nullptr;   // read once (getenv is not signal-safe)
     if (g_faultmem && g_devnull_fd < 0)
         g_devnull_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    install_sigaltstack();
     struct sigaction sa{};
     sa.sa_sigaction = fault_handler;
-    sa.sa_flags = SA_SIGINFO;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;   // run the handler on the alt stack (survives stack overflow)
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS,  &sa, nullptr);
