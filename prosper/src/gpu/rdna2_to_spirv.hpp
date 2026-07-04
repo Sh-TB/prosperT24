@@ -26,4 +26,8 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
 // target write vec4(src0..3) to the location-0 color output. Returns {} if unsupported / no export.
 std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords);
 
+// Recompile a vertex shader to a vertex SPIR-V module: v0 = gl_VertexIndex, run the VALU, and on EXP
+// to a POS target write vec4(src0..3) to gl_Position. Returns {} if unsupported / no position export.
+std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords);
+
 } // namespace prosper::gpu

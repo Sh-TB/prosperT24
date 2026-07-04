@@ -141,6 +141,11 @@ if(TARGET prosper_core)
       add_executable(test_recompiled_fragment tests/test_recompiled_fragment.cpp)
       target_link_libraries(test_recompiled_fragment PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME recompiled_fragment_render COMMAND test_recompiled_fragment)
+
+      # Render a frame where BOTH vertex + pixel shaders are recompiled from RDNA2.
+      add_executable(test_recompiled_shaders tests/test_recompiled_shaders.cpp)
+      target_link_libraries(test_recompiled_shaders PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME recompiled_shaders_render COMMAND test_recompiled_shaders)
       message(STATUS "Vulkan found (${Vulkan_LIBRARY}) — offscreen graphics harness enabled")
     else()
       message(STATUS "Vulkan not found — skipping offscreen graphics harness")

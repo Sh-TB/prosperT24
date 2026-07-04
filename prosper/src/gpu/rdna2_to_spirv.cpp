@@ -26,12 +26,12 @@ enum : uint32_t { Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_E
                   Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_UMin=38, Glsl_SMin=39, Glsl_FMax=40,
                   Glsl_UMax=41, Glsl_SMax=42 };
 enum : uint32_t {
-    Cap_Shader=1, Addr_Logical=0, Mem_GLSL450=1, Exec_Fragment=4, Exec_GLCompute=5,
+    Cap_Shader=1, Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_LocalSize=17,
     SC_Input=1, SC_Output=3, SC_StorageBuffer=12, FC_None=0,
     Dec_Block=2, Dec_ArrayStride=6, Dec_BuiltIn=11, Dec_Location=30, Dec_Binding=33,
     Dec_DescriptorSet=34, Dec_Offset=35,
-    BI_GlobalInvocationId=28,
+    BI_Position=0, BI_GlobalInvocationId=28, BI_VertexIndex=42,
 };
 
 uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
@@ -187,6 +187,46 @@ struct SpirvCompute {
         put(code, Op_Store, {v_color, v});
     }
 
+    // --- Vertex-shader shell: gl_VertexIndex input + gl_Position (member 0 of a gl_PerVertex Block). ---
+    uint32_t v_vid = 0, v_pos = 0, t_ptr_out_v4f = 0;
+    void begin_vertex() {
+        t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_bool = id();
+        t_v4f = id();
+        uint32_t t_ptr_in_i32 = id(); v_vid = id();
+        uint32_t t_pv = id(), t_ptr_out_pv = id(); v_pos = id(); t_ptr_out_v4f = id();
+        f_main = id(); uint32_t lbl = id(); glsl = id();
+        put(caps, Op_Capability, {Cap_Shader});
+        { std::vector<uint32_t> o{glsl}; pstr(o, "GLSL.std.450"); putv(extimp, Op_ExtInstImport, o); }
+        put(mem, Op_MemoryModel, {Addr_Logical, Mem_GLSL450});
+        { std::vector<uint32_t> o{Exec_Vertex, f_main}; pstr(o, "main"); o.push_back(v_vid); o.push_back(v_pos); putv(entry, Op_EntryPoint, o); }
+        put(deco, Op_Decorate, {v_vid, Dec_BuiltIn, BI_VertexIndex});
+        put(deco, Op_MemberDecorate, {t_pv, 0, Dec_BuiltIn, BI_Position});   // gl_PerVertex.gl_Position
+        put(deco, Op_Decorate, {t_pv, Dec_Block});
+        put(types, Op_TypeVoid, {t_void});
+        put(types, Op_TypeFunction, {t_fn, t_void});
+        put(types, Op_TypeFloat, {t_f32, 32});
+        put(types, Op_TypeInt, {t_u32, 32, 0});
+        put(types, Op_TypeInt, {t_i32, 32, 1});
+        put(types, Op_TypeBool, {t_bool});
+        put(types, Op_TypeVector, {t_v4f, t_f32, 4});
+        put(types, Op_TypePointer, {t_ptr_in_i32, SC_Input, t_i32});
+        put(types, Op_Variable, {t_ptr_in_i32, v_vid, SC_Input});
+        put(types, Op_TypeStruct, {t_pv, t_v4f});
+        put(types, Op_TypePointer, {t_ptr_out_pv, SC_Output, t_pv});
+        put(types, Op_Variable, {t_ptr_out_pv, v_pos, SC_Output});
+        put(types, Op_TypePointer, {t_ptr_out_v4f, SC_Output, t_v4f});
+        put(code, Op_Function, {t_void, f_main, FC_None, t_fn});
+        put(code, Op_Label, {lbl});
+    }
+    // Load gl_VertexIndex as raw bits (VGPR v0 for a vertex shader).
+    uint32_t load_vertex_index() { uint32_t r = id(); put(code, Op_Load, {t_i32, r, v_vid}); return i2u(r); }
+    // Write vec4(x,y,z,w) (bit-operands) to gl_Position (EXP POS0).
+    void export_position(uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
+        uint32_t v = id(); putv(code, Op_CompositeConstruct, {t_v4f, v, bcf(x), bcf(y), bcf(z), bcf(w)});
+        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_out_v4f, p, v_pos, uconst(0)});
+        put(code, Op_Store, {p, v});
+    }
+
     std::vector<uint32_t> finish() {
         put(code, Op_Return, {}); put(code, Op_FunctionEnd, {});
         std::vector<uint32_t> m{0x07230203u, 0x00010300u, 0u, next_id, 0u};
@@ -339,6 +379,34 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords) {
                 exported = true;
             }
             continue;   // ignore NULL / additional exports for now
+        }
+        bool ok = true;
+        if (!emit_alu(b, vreg, vcc, in, ok) || !ok) return {};
+    }
+    if (!exported) return {};
+    return b.finish();
+}
+
+std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords) {
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code, dwords, ins);
+
+    SpirvCompute b;
+    b.begin_vertex();
+    std::unordered_map<int, uint32_t> vreg;
+    uint32_t vcc = b.bfalse();
+    vreg[0] = b.load_vertex_index();     // VS ABI: v0 = vertex index
+    bool exported = false;
+
+    for (const auto& in : ins) {
+        if (in.is_end) break;
+        if (in.fmt == Rdna2Format::EXP) {                    // EXP POS0..3 -> gl_Position
+            if (in.exp_target >= 12 && in.exp_target <= 15 && !exported) {
+                b.export_position(operand_bits(b, vreg, in, in.src[0]), operand_bits(b, vreg, in, in.src[1]),
+                                  operand_bits(b, vreg, in, in.src[2]), operand_bits(b, vreg, in, in.src[3]));
+                exported = true;
+            }
+            continue;   // ignore PARAM exports (varyings) for now
         }
         bool ok = true;
         if (!emit_alu(b, vreg, vcc, in, ok) || !ok) return {};
