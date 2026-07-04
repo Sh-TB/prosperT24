@@ -109,6 +109,12 @@ if(TARGET prosper_core)
       add_executable(test_vulkan_offscreen tests/test_vulkan_offscreen.cpp)
       target_link_libraries(test_vulkan_offscreen PRIVATE Vulkan::Vulkan)
       add_test(NAME vulkan_offscreen_clear COMMAND test_vulkan_offscreen)
+
+      # First real rendered output: a VkPipeline whose topology/format come from a RenderState via
+      # vk_translate, drawing a triangle (embedded placeholder SPIR-V), verified by pixel readback.
+      add_executable(test_vulkan_triangle tests/test_vulkan_triangle.cpp)
+      target_link_libraries(test_vulkan_triangle PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME vulkan_triangle_render COMMAND test_vulkan_triangle)
       message(STATUS "Vulkan found (${Vulkan_LIBRARY}) — offscreen graphics harness enabled")
     else()
       message(STATUS "Vulkan not found — skipping offscreen graphics harness")
