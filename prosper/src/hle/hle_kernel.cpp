@@ -83,6 +83,40 @@ HLE(k_cond_wait)      { if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.ent
     if (a0 && *(void**)a0 && a1 && *(void**)a1) pthread_cond_wait((pthread_cond_t*)*(void**)a0, (pthread_mutex_t*)*(void**)a1);
     if (sclog()) fprintf(stderr, "[sync2] T%ld COND.wait.exit cond=0x%llx\n", sctid(), a0 ? (unsigned long long)*(void**)a0 : 0); return 0; }
 
+// --- read/write locks (opaque handle -> host pthread_rwlock_t). Real libc.prx uses these for its
+// internal state (locale, stdio, malloc arenas); stubbing them to no-ops leaves that state UNLOCKED
+// under the 15-thread IL2CPP pool -> data races. Real locking is a genuine correctness fix. ---
+HLE(k_rwlock_init) {
+    if (!a0) return 0x16;
+    auto* rw = (pthread_rwlock_t*)calloc(1, sizeof(pthread_rwlock_t));
+    pthread_rwlock_init(rw, nullptr);
+    *(void**)a0 = rw;   // store handle through caller's slot (a1=attr, a2=name ignored)
+    return 0;
+}
+HLE(k_rwlock_destroy) { if (a0 && *(void**)a0) { pthread_rwlock_destroy((pthread_rwlock_t*)*(void**)a0); free(*(void**)a0); *(void**)a0 = nullptr; } return 0; }
+HLE(k_rwlock_rdlock)  { if (a0 && *(void**)a0) pthread_rwlock_rdlock((pthread_rwlock_t*)*(void**)a0); return 0; }
+HLE(k_rwlock_wrlock)  { if (a0 && *(void**)a0) pthread_rwlock_wrlock((pthread_rwlock_t*)*(void**)a0); return 0; }
+HLE(k_rwlock_unlock)  { if (a0 && *(void**)a0) pthread_rwlock_unlock((pthread_rwlock_t*)*(void**)a0); return 0; }
+HLE(k_rwlock_tryrdlock){ return (a0 && *(void**)a0) ? (uint64_t)pthread_rwlock_tryrdlock((pthread_rwlock_t*)*(void**)a0) : 0x16; }
+HLE(k_rwlock_trywrlock){ return (a0 && *(void**)a0) ? (uint64_t)pthread_rwlock_trywrlock((pthread_rwlock_t*)*(void**)a0) : 0x16; }
+
+// scePthreadOnce(once_control*, init_routine): run init exactly once. We run it UNDER a lock so all
+// callers see it complete before returning (pthread_once semantics). A recursive mutex avoids
+// self-deadlock if an init routine itself calls scePthreadOnce. The once-control's first int is the
+// done-flag. init is a guest fn (guest ABI == host SysV) so it's callable directly.
+HLE(k_pthread_once) {
+    auto* ctl = (volatile int*)(uintptr_t)a0;
+    auto init = (void (*)())(uintptr_t)a1;
+    if (!ctl || !init) return 0x16;
+    static pthread_mutex_t om = []{ pthread_mutex_t m; pthread_mutexattr_t a;
+        pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&m, &a); pthread_mutexattr_destroy(&a); return m; }();
+    pthread_mutex_lock(&om);
+    if (*ctl == 0) { init(); *ctl = 1; }
+    pthread_mutex_unlock(&om);
+    return 0;
+}
+
 // --- thread identity ---
 // Return the real host thread handle as the Sony ScePthread — unique and stable per
 // thread, used as an opaque id (stored/compared, not dereferenced). A constant here
@@ -424,6 +458,15 @@ void register_kernel_hle() {
     R("scePthreadCondSignal", k_cond_signal);
     R("scePthreadCondBroadcast", k_cond_broadcast);
     R("scePthreadCondWait", k_cond_wait);
+    // read/write locks + once (Sony + POSIX names) — real host primitives (thread-safety fix).
+    R("scePthreadRwlockInit", k_rwlock_init);        R("pthread_rwlock_init", k_rwlock_init);
+    R("scePthreadRwlockDestroy", k_rwlock_destroy);  R("pthread_rwlock_destroy", k_rwlock_destroy);
+    R("scePthreadRwlockRdlock", k_rwlock_rdlock);    R("pthread_rwlock_rdlock", k_rwlock_rdlock);
+    R("scePthreadRwlockWrlock", k_rwlock_wrlock);    R("pthread_rwlock_wrlock", k_rwlock_wrlock);
+    R("scePthreadRwlockUnlock", k_rwlock_unlock);    R("pthread_rwlock_unlock", k_rwlock_unlock);
+    R("scePthreadRwlockTryrdlock", k_rwlock_tryrdlock);
+    R("scePthreadRwlockTrywrlock", k_rwlock_trywrlock);
+    R("scePthreadOnce", k_pthread_once);             R("pthread_once", k_pthread_once);
     R("scePthreadSelf", k_pthread_self);
     R("scePthreadEqual", k_pthread_equal);
     R("scePthreadYield", k_pthread_yield);
