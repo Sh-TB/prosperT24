@@ -169,12 +169,33 @@ non-`0xffff` result as "sub exhausted" → resets the sub-object. Some sub-objec
 (host-allocated) source in other calls, so at least one create-source HLE returns non-null; the
 faulting `sub[0]` gets null.
 
-**STAGE 2 (real fix):** find the AGC function that creates the register "source" object and implement
-it to return a real object whose `[src+0x08]` is a populated register-map table (peek array at
-`+0x00`, subarray pointers at `+0x08`, u16 limits at `+0x2e`) built from `agc_reg_defaults.cpp`, plus
-`[src+0x28]`/`[src+0x5a]` register-count fields. That single object then flows through `SetSource`
-into every sub-object. The current stage-1 direct-`[sub+0x08]` write is a stopgap that `SetSource`
-later overwrites; it stands only as a documented WIP checkpoint.
+**Root of the chain (RE'd 2026-07-04):** the `src` passed to `SetSource` is a single **global**,
+`[eboot+0x2048c60]`, read (never written) at eboot+0x149a54a and eboot+0x14ddb22 and handed to the
+sub-object setup (`eboot+0x3a72c0`). That global is **null**, and it is:
+- NOT set by any relocation — the eboot's highest reloc offset is `0x1f4e160`, below `0x2048c60`
+  (verified with a Module-parser probe over all 51,475 relocs); it lives in zero-init `.bss`.
+- NOT written by any eboot code (objdump over the whole image: only the two reads reference it).
+- NOT an exported symbol, and its address is never taken (`lea`) — so nothing external is handed a
+  pointer to it either.
+
+Conclusion: `[0x2048c60]` is **libSceAgc.prx's private global**, which the real libSceAgc populates
+with its register-source object during its own init. Because prosper HLE-stubs libSceAgc instead of
+loading a real `.prx`, that init never runs and the global stays null. This is the true root of the
+`0x3b5ea6` boot blocker.
+
+**STAGE 2 (real fix), two options:**
+1. *Preferred, needs data we don't have yet:* the AGC SDK headers / a real libSceAgc.prx, to know the
+   exact register-source object layout and the init entrypoint. Then implement that init in our
+   libSceAgc HLE to build+install the object.
+2. *Reconstruct it ourselves:* build a source object whose `[src+0x08]` is a populated register-map
+   table (peek array @ `+0x00`, subarray ptrs @ `+0x08`, u16 limits @ `+0x2e`) from
+   `agc_reg_defaults.cpp`, plus the `[src+0x28]`/`[src+0x5a]` register-count fields, and install its
+   pointer into the guest global `0x2048c60` from an early AGC-init HLE. Feasible (we know the guest
+   base, so the VA is writable) but the object layout must be fully RE'd first, and the hardcoded
+   global VA is title-specific — acceptable as a stepping stone but flagged as such.
+
+The current stage-1 direct-`[sub+0x08]` write is a stopgap that `SetSource` later overwrites; it
+stands only as a documented WIP checkpoint.
 
 ## Recommended implementation order
 
