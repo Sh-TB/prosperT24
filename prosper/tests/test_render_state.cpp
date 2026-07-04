@@ -44,7 +44,8 @@ int main() {
         // DB_DEPTH_CONTROL: Z_ENABLE(bit1)|Z_WRITE_ENABLE(bit2)|ZFUNC=4(bits[6:4]) = 0x46
         { P::DB_DEPTH_CONTROL,   0x00000046u },
         { P::CB_COLOR_CONTROL,   0x00CC0010u },
-        { P::CB_BLEND0_CONTROL,  0xABCDEF01u },
+        // CB_BLEND0_CONTROL: ENABLE(bit30) | SRCBLEND=4/SrcAlpha | DESTBLEND=5/OneMinusSrcAlpha | COMB_FCN=0/Add
+        { P::CB_BLEND0_CONTROL,  (1u << 30) | (4u << 0) | (5u << 8) | (0u << 5) },
         { P::CB_TARGET_MASK,     0x0000000Fu },
     };
     // Shader-stage program addresses.
@@ -86,9 +87,18 @@ int main() {
     CHECK(rs.zfunc == 4u, "zfunc = 4 (bits [6:4])");
     CHECK(vk_compare_op(rs.zfunc) == 4u, "zfunc 4 -> VkCompareOp GREATER (1:1)");
 
+    // Decoded blend state + RDNA2->Vulkan factor/op mapping.
+    CHECK(rs.blend_enable, "blend_enable = true (bit 30)");
+    CHECK(rs.color_src_blend == 4u && vk_blend_factor(rs.color_src_blend) == 6u,
+          "src blend 4/SrcAlpha -> VK SRC_ALPHA(6)");
+    CHECK(rs.color_dst_blend == 5u && vk_blend_factor(rs.color_dst_blend) == 7u,
+          "dst blend 5/OneMinusSrcAlpha -> VK ONE_MINUS_SRC_ALPHA(7)");
+    CHECK(rs.color_comb_fcn == 0u && vk_blend_op(rs.color_comb_fcn) == 0u, "comb_fcn 0/Add -> VK ADD(0)");
+    CHECK(vk_blend_factor(0x08u) == 4u, "RDNA2 DstColor(8) -> VK DST_COLOR(4) (non-identity)");
+    CHECK(vk_blend_op(2u) == 3u, "RDNA2 comb Min(2) -> VK MIN(3) (non-identity)");
+
     CHECK(rs.db_depth_control  == 0x00000046u, "db_depth_control raw preserved");
     CHECK(rs.cb_color_control  == 0x00CC0010u, "cb_color_control raw preserved");
-    CHECK(rs.cb_blend0_control == 0xABCDEF01u, "cb_blend0_control raw preserved");
     CHECK(rs.cb_target_mask    == 0x0000000Fu, "cb_target_mask raw preserved");
 
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }

@@ -41,4 +41,12 @@ VkFormat vk_color_format(uint32_t format, uint32_t number_type, uint32_t comp_sw
 // (0=NEVER,1=LESS,2=EQUAL,3=LEQUAL,4=GREATER,5=NOTEQUAL,6=GEQUAL,7=ALWAYS), so the value maps 1:1.
 inline uint32_t vk_compare_op(uint32_t zfunc) { return zfunc & 0x7u; }
 
+// Map an RDNA2 CB_BLEND_CONTROL blend factor to a VkBlendFactor value (NOT identity — e.g. RDNA2
+// DstColor=8 -> VK DST_COLOR=4). Per Kyty GraphicsRender.cpp. Unknown -> ZERO.
+uint32_t vk_blend_factor(uint32_t rdna2_factor);
+
+// Map an RDNA2 COLOR_COMB_FCN to a VkBlendOp value (0=ADD,1=SUB,2=MIN,3=MAX,4=REV_SUB ->
+// VK ADD=0,SUB=1,MIN=3,MAX=4,REV_SUB=2). Unknown -> ADD.
+uint32_t vk_blend_op(uint32_t comb_fcn);
+
 } // namespace prosper::gpu

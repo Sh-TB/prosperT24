@@ -46,10 +46,17 @@ RenderState extract_render_state(const GpuState& st) {
     rs.z_write_enable = PM4_FIELD(dc, DB_DEPTH_CONTROL, Z_WRITE_ENABLE) != 0;
     rs.zfunc          = PM4_FIELD(dc, DB_DEPTH_CONTROL, ZFUNC);
 
+    // Color blend state (decoded fields of CB_BLEND0_CONTROL).
+    const uint32_t bc = rd(st.cx, P::CB_BLEND0_CONTROL);
+    rs.blend_enable    = PM4_FIELD(bc, CB_BLEND0_CONTROL, ENABLE) != 0;
+    rs.color_src_blend = PM4_FIELD(bc, CB_BLEND0_CONTROL, COLOR_SRCBLEND);
+    rs.color_dst_blend = PM4_FIELD(bc, CB_BLEND0_CONTROL, COLOR_DESTBLEND);
+    rs.color_comb_fcn  = PM4_FIELD(bc, CB_BLEND0_CONTROL, COLOR_COMB_FCN);
+
     // Faithful raw state registers.
     rs.db_depth_control  = dc;
     rs.cb_color_control  = rd(st.cx, P::CB_COLOR_CONTROL);
-    rs.cb_blend0_control = rd(st.cx, P::CB_BLEND0_CONTROL);
+    rs.cb_blend0_control = bc;
     rs.cb_target_mask    = rd(st.cx, P::CB_TARGET_MASK);
 
     return rs;

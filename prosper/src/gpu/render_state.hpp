@@ -36,6 +36,13 @@ struct RenderState {
     bool     stencil_enable = false;
     uint32_t zfunc          = 0;      // compare op, 0..7 (RDNA2 order == VkCompareOp order)
 
+    // Color blend state for MRT 0, decoded from CB_BLEND0_CONTROL (RDNA2 factor/op enum values;
+    // map to Vulkan with vk_blend_factor / vk_blend_op).
+    bool     blend_enable    = false;
+    uint32_t color_src_blend = 0;     // COLOR_SRCBLEND
+    uint32_t color_dst_blend = 0;     // COLOR_DESTBLEND
+    uint32_t color_comb_fcn  = 0;     // COLOR_COMB_FCN (blend op)
+
     // Raw state registers — remaining bit layouts decoded by the Vulkan backend later (kept faithful).
     uint32_t db_depth_control  = 0;   // DB_DEPTH_CONTROL
     uint32_t cb_color_control  = 0;   // CB_COLOR_CONTROL
