@@ -245,12 +245,26 @@ mix HLE `malloc` with real `free`. Real libc init also exercises libkernel paths
 not cover yet, so it risks new deadlocks/crashes that need iterative debugging against the boot. Given
 the boot currently reaches graphics init, flipping this unilaterally risks regressing a working state.
 
-**Recommendation:** do it deliberately, guarded by `test_boot_linux` (which now asserts reaching
-graphics init), on a branch: add libc.prx to the linker's module list, drop the libc HLE registrations,
-implement whatever libkernel imports libc.prx needs, and iterate until the boot test still reaches
-graphics. High value, medium risk, several sessions of work. **libSceNpCppWebApi.prx is also present**
-(same opportunity, lower priority). libSceAgc/AgcDriver are NOT in the dump (system firmware) — those
-must be HLE'd/translated regardless (see `docs/AGC_TRACE.md`).
+**FEASIBILITY CONFIRMED (branch `libc-prx-integration`, 2026-07-04).** Adding libc.prx to boot_trace's
+module list works: it **loads, links, and inits** — cross-module resolutions jump 11 → **329** (318
+more imports bind to real Sony libc instead of HLE). So the mechanism is sound. The boot then regresses
+(crashes at `eboot+0x8065ee` via `libc.prx+0x7f42b`) because real libc needs libkernel machinery we stub
+to 0. Work-list surfaced by the run:
+- **`__tls_get_addr` + ELF TLS — the crux and the hard part.** Real libc is TLS-heavy (errno, locale,
+  stdio state). This needs: loader parsing each module's `PT_TLS`, handling `R_X86_64_DTPMOD64/
+  DTPOFF64/TPOFF64` relocs, and per-thread TLS blocks. **The deep problem: initial-exec TLS uses `%fs`
+  directly (the TCB), which collides with the host glibc's `%fs`.** Resolving that (swap `%fs` at the
+  guest/host boundary, or an emulated-TLS scheme) is a Wine-class problem — almost certainly *why*
+  HLE-libc was the original choice. This is the real cost of the decision.
+- `scePthreadOnce`, `scePthreadRwlock{Init,Destroy,Rd/Wr/Unlock}` — trivial pthread wrappers.
+- `_sceKernelSetThreadDtors` / `_sceKernelSetThreadAtexitCount/Report` — thread atexit bookkeeping.
+
+**Recommendation:** the branch is the proven starting point. The gating question is whether to solve
+guest `%fs`/TLS (needed for real libc, and eventually for any real system module). If yes, that TLS/`%fs`
+work is the prerequisite; the rest (thread wrappers, dropping libc HLE regs) is mechanical, guarded by
+`test_boot_linux`. High value, **medium-high risk (the `%fs` problem)**, several sessions.
+**libSceNpCppWebApi.prx is also present** (same opportunity, lower priority). libSceAgc/AgcDriver are
+NOT in the dump (system firmware) — those must be HLE'd/translated regardless (see `docs/AGC_TRACE.md`).
 
 ## Reality checkpoints
 - After **M2** we know exactly the call order the game needs — re-prioritize M3+.
