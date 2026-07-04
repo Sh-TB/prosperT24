@@ -16,6 +16,73 @@ bool sop_has_literal(uint32_t w, int nsrc) {
 bool vop_has_literal(uint32_t w) { return (w & 0x1FFu) == LITERAL; }   // src0 is 9 bits
 }  // namespace
 
+float inline_float_value(uint32_t code) {
+    switch (code) {
+        case 240: return 0.5f;  case 241: return -0.5f;
+        case 242: return 1.0f;  case 243: return -1.0f;
+        case 244: return 2.0f;  case 245: return -2.0f;
+        case 246: return 4.0f;  case 247: return -4.0f;
+        case 248: return 0.15915494f;   // 1/(2*pi)
+        default:  return 0.0f;
+    }
+}
+
+Operand decode_src_field(uint32_t f) {
+    if (f >= 256) return {OperandKind::VGPR, (int32_t)(f - 256)};            // 256..511 = VGPR 0..255
+    if (f <= 105) return {OperandKind::SGPR, (int32_t)f};                    // 0..105 = SGPR
+    if (f == 128) return {OperandKind::InlineInt, 0};
+    if (f >= 129 && f <= 192) return {OperandKind::InlineInt, (int32_t)f - 128};   // +1..+64
+    if (f >= 193 && f <= 208) return {OperandKind::InlineInt, 192 - (int32_t)f};   // -1..-16
+    if (f >= 240 && f <= 248) return {OperandKind::InlineFloat, (int32_t)f};       // inline floats
+    if (f == 255) return {OperandKind::Literal, 0};
+    return {OperandKind::Special, (int32_t)f};   // VCC_LO/HI, EXEC, M0, null, ttmp, ...
+}
+
+namespace {
+Operand vgpr(uint32_t n) { return {OperandKind::VGPR, (int32_t)(n & 0xFFu)}; }
+Operand sgpr(uint32_t n) { return {OperandKind::SGPR, (int32_t)(n & 0x7Fu)}; }
+int32_t sext16(uint32_t w) { return (int32_t)(int16_t)(w & 0xFFFFu); }
+
+// Fill opcode + operands for the ALU formats. `d1` is the second dword (for VOP3).
+void decode_operands(Rdna2Inst& i) {
+    const uint32_t w = i.words[0];
+    switch (i.fmt) {
+        case Rdna2Format::VOP1:
+            i.opcode = (w >> 9) & 0xFFu;  i.dst = vgpr(w >> 17);
+            i.src[0] = decode_src_field(w & 0x1FFu); i.n_src = 1; break;
+        case Rdna2Format::VOP2:
+            i.opcode = (w >> 25) & 0x3Fu; i.dst = vgpr(w >> 17);
+            i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; break;
+        case Rdna2Format::VOPC:
+            i.opcode = (w >> 17) & 0xFFu; i.dst = {OperandKind::Special, 106 /*VCC_LO*/};
+            i.src[0] = decode_src_field(w & 0x1FFu); i.src[1] = vgpr(w >> 9); i.n_src = 2; break;
+        case Rdna2Format::VOP3: {
+            const uint32_t d1 = i.words[1];
+            i.opcode = (w >> 16) & 0x3FFu; i.dst = vgpr(w);   // VOP3A: vdst in [7:0] of dword0
+            i.src[0] = decode_src_field(d1 & 0x1FFu);
+            i.src[1] = decode_src_field((d1 >> 9) & 0x1FFu);
+            i.src[2] = decode_src_field((d1 >> 18) & 0x1FFu); i.n_src = 3; break;
+        }
+        case Rdna2Format::SOP1:
+            i.opcode = (w >> 8) & 0xFFu;  i.dst = sgpr(w >> 16);
+            i.src[0] = decode_src_field(w & 0xFFu); i.n_src = 1; break;
+        case Rdna2Format::SOP2:
+            i.opcode = (w >> 23) & 0x7Fu; i.dst = sgpr(w >> 16);
+            i.src[0] = decode_src_field(w & 0xFFu); i.src[1] = decode_src_field((w >> 8) & 0xFFu);
+            i.n_src = 2; break;
+        case Rdna2Format::SOPK:
+            i.opcode = (w >> 23) & 0x1Fu; i.dst = sgpr(w >> 16); i.simm16 = sext16(w); break;
+        case Rdna2Format::SOPC:
+            i.opcode = (w >> 16) & 0x7Fu;
+            i.src[0] = decode_src_field(w & 0xFFu); i.src[1] = decode_src_field((w >> 8) & 0xFFu);
+            i.n_src = 2; break;
+        case Rdna2Format::SOPP:
+            i.opcode = (w >> 16) & 0x7Fu; i.simm16 = sext16(w); break;
+        default: break;   // memory / interp / export: operands not decoded at this stage
+    }
+}
+}  // namespace
+
 Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
     Rdna2Inst i;
     if (max_dwords == 0) { i.fmt = Rdna2Format::Unknown; i.len_dwords = 0; return i; }
@@ -61,6 +128,7 @@ Rdna2Inst rdna2_decode_one(const uint32_t* code, size_t max_dwords) {
         }
     }
     if (i.len_dwords > max_dwords) i.len_dwords = (uint32_t)max_dwords;   // clamp at buffer end
+    decode_operands(i);
     return i;
 }
 

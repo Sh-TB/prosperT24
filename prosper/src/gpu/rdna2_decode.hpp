@@ -26,6 +26,22 @@ enum class Rdna2Format : uint8_t {
     Unknown,
 };
 
+// An operand's kind + payload. For SGPR/VGPR, `value` is the register number; for InlineInt, the
+// signed integer constant (-16..64); for InlineFloat, the AMD encoding code (240..248, see
+// inline_float_value); for Literal, the constant is in Rdna2Inst::literal; for Special, the field
+// code (VCC/EXEC/M0/...). See the AMD gfx10 ISA "SSRC/SRC operand" table.
+enum class OperandKind : uint8_t { None, SGPR, VGPR, InlineInt, InlineFloat, Literal, Special };
+struct Operand {
+    OperandKind kind = OperandKind::None;
+    int32_t     value = 0;
+};
+
+// Decode an AMD gfx10 source-operand field (8-bit scalar SSRC, or 9-bit vector SRC where 256..511 =
+// VGPR). Pure; exposed for reuse/testing.
+Operand decode_src_field(uint32_t field);
+// The float value an InlineFloat operand encodes (0.5, 1.0, ... , 1/(2*pi)); 0 for non-float codes.
+float inline_float_value(uint32_t code);
+
 struct Rdna2Inst {
     Rdna2Format fmt = Rdna2Format::Unknown;
     uint32_t    pc = 0;            // dword offset from the start of the stream
@@ -34,6 +50,15 @@ struct Rdna2Inst {
     bool        has_literal = false;
     uint32_t    literal = 0;       // the inline 32-bit constant, if has_literal
     bool        is_end = false;    // S_ENDPGM
+
+    // Decoded operands (filled for the ALU formats: SOP1/2/K, VOP1/2/C, VOP3). `opcode` is the
+    // format-local opcode; `dst` the destination; `src[0..n_src-1]` the sources. simm16 holds the
+    // signed 16-bit immediate for SOPK/SOPP. Memory/interp/export formats leave these unset (fmt only).
+    uint32_t opcode = 0;
+    Operand  dst;
+    Operand  src[3];
+    uint8_t  n_src = 0;
+    int32_t  simm16 = 0;
 };
 
 // Decode the single instruction at code[0..]; `max_dwords` bounds the read. On a truncated/unknown
