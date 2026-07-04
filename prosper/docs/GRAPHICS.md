@@ -21,51 +21,45 @@ threads eventually read a null sub-object pointer out of them and dereference it
 `eboot+0x3b5ea6` `[null+0x30]`, `eboot+0x149c99c` `[null+0x18]`). Zeroed placeholders no longer
 suffice — the game needs **real object graphs**, i.e. the actual graphics/audio subsystems.
 
-### The current deterministic terminal fault (verified 2026-07-03, corrects an earlier mis-diagnosis)
+### The terminal fault is unimplemented libSceAgc, NOT a C++ locale bug (verified 2026-07-04)
 
-`boot_trace` ends every run at the same place. The last log line is Unity's own:
+**This corrects two earlier mis-diagnoses in this file's history** (first "rune facet never set during
+static init", then "std::ctype locale facet array left zero"). Both were wrong: the table-lookup
+*instruction shape* at `eboot+0x3b5ea0` (`movzwl 0x2e(%rdi,%rcx,2)`) merely *resembles* `std::ctype`
+classification. The object it reads actually comes from an **unimplemented libSceAgc initializer**.
 
-```
-todo: void GfxDevicePS5SharedData::CreateWorkload()
-=== RUN ENDED: SIGSEGV at addr=0x30 rip=eboot+0x3b5ea6  rdi=0x0 ===
-```
+The last log line before the crash is Unity's own `todo: void GfxDevicePS5SharedData::CreateWorkload()`
+— i.e. we are inside Unity's PS5 GPU-device setup. The crash **site varies across runs** (multithreaded
+graphics workers): `eboot+0x3b5ea6` (`addr=0x30`), `eboot+0x149c99c` (`addr=0x18`), … — all null-field
+derefs of zeroed graphics objects, not one deterministic path.
 
-So this is a **graphics-path fault inside `GfxDevicePS5SharedData::CreateWorkload()`**, *not* a
-boot-time C++/locale-construction mystery (an earlier working note wrongly framed it as a "rune
-facet never set during static init" — there is **no** eboot `init_array` at all: `init_array_va=0`,
-and the game initializes its C++ via IL2CPP + guarded function-local statics, so no static-init is
-being skipped). Chain, all verified by disassembly under gdb (`break run_entry` first):
+Verified chain for the `CreateWorkload` object (gdb, `break run_entry` first; `pltm` + the unimpl log):
 
-- `eboot+0x3b5ea0` is a `std::ctype`-style classify routine: `movzwl 0x2e(%rdi,%rcx,2),%esi` /
-  `mov (%rdi),%rax; movzwl (%rax,%rcx,2)` — `rdi` is the classification **table** pointer, indexed
-  by char code. It faults because `rdi == 0`.
-- Its caller `eboot+0x3afb90` loads that table as **`[facet+0x8]`** (`mov 0x8(%r14),%rdi` at
-  `+0x3afbc8`, where `r14` = the facet). So the offending facet's `+0x8` table field is **null**.
-- The facet pointer is `obj+0x38 + facet_index*0x70` (extractor `eboot+0x3b0210` returns
-  `rdi + esi*0x70`; caller `eboot+0x3a7b60` does `rdi += 0x38` first). I.e. `obj+0x38` is an inline
-  array of 0x70-byte facets; this is a `std::locale` built in the GfxDevice path.
-- **`_Getpctype` is NOT the culprit — it already works.** It is implemented (`h_getpctype` →
-  `build_ctype`, returns a real 257-entry table) and *does* bind and get called (confirmed: a
-  breakpoint on `prosper::h_getpctype` fires, called from `eboot+0x82e898`). So the classic-locale
-  ctype table exists; this *particular* locale/facet built in `CreateWorkload` just never gets its
-  `+0x8` table populated.
+- In `eboot+0x14dd*`'s fn: `obj = r14+0x48` (`lea 0x48(%r14),%r12` @`+0x14dda75`), then immediately
+  `call 0x4003ae7d0(obj)` — the object's initializer.
+- `0x4003ae7d0` is a **PLT stub**: `jmp *[0x401d95858]`. At runtime that GOT slot holds `0x600004180`,
+  which is one of **our unimplemented-import stubs** (`mov $idx,%edi; movabs $prosper_on_unimpl; jmp`).
+- `pltm eboot.bin known_names.txt 1d95858` → NID **`+kSrjIVxKFE`**, and the boot log shows
+  `unimplemented: libSceAgc::+kSrjIVxKFE -> returning 0`. So `obj`'s initializer is an **unimplemented
+  libSceAgc function** that does nothing.
+- The caller then passes that *same* `obj` (`r12`, stored at `[rbp-0x198]`) to `0x4003a7b60`, which
+  walks `obj+0x38` and reads `[obj+0x40]` as a pointer → it's null (never set by the stubbed init) →
+  SIGSEGV. `PROSPER_FAULTMEM` confirms the whole `obj` region is zero at the fault.
+- `_Getpctype` works and is called, but only for an unrelated inline `isspace`-style loop
+  (`eboot+0x82e893`, `test $0x144`) — it is NOT part of this path.
 
-**Refined by the `PROSPER_FAULTMEM` probe (2026-07-04, deterministic):** at the fault, `r14` (the
-facet, `obj+0x38`) points to a **fully-zeroed object** — `[+0]=[+8]=[+0x10]=[+0x18]=0`. So it is not
-merely the ctype table field that is null; **the locale's entire inline facet array is zero.** The
-`std::locale` (`obj` at `r14-0x38`) was allocated + zeroed but **no facets were ever installed** (the
-facet-copy from the classic locale never ran, or ran on a different object). `rbp[+8]=0x4014ddc1a`
-confirms the `CreateWorkload` caller frame; `obj` is loaded from `[rbp-0x198]` at `eboot+0x14ddc02`.
+**Conclusion:** the blocker is the **libSceAgc GPU object graph**. `CreateWorkload` (and sibling
+graphics init) call ~24 libSceAgc functions — `23LRUSvYu1M`, `BfBDZGbti7A`, `+kSrjIVxKFE`,
+`H7uZqCoNuWk`, `vRoArM9zaIk`, … (full list via `boot_trace`) — **all unimplemented, all returning 0**,
+so the GPU objects they should build stay null and the graphics workers deref null. This is squarely
+the M4/M5 libSceAgc→Vulkan work below; there is no locale/libc gap to fix. Faking these objects with
+plausible-looking fields would be "limping to graphics" (violates correctness-first) — they need the
+real AGC object model, reverse-engineered from the call args (`PROSPER_GFXLOG`) + AGC semantics.
 
-**Open question for the next deep session:** why this `std::locale`'s facet array is left all-zero —
-i.e. where the facet-install/copy-from-classic step is skipped. Likely the classic-locale singleton
-(`std::locale::classic()`) itself never populated its facets (a guarded static init that bailed on a
-stubbed dependency), so every derived locale copies zeros. Next: find the classic-locale facet array
-and check whether it too is zero (if so, fix its init); trace what builds `obj` at `[rbp-0x198]` in
-`eboot+0x14ddc00`'s fn. **Tooling:** run `PROSPER_FAULTMEM=1 ./build-linux/boot_trace <dump>` — it
-dumps every GP register and 4 qwords of guest memory at each pointer-looking one, *at fault time on
-the stopped faulting thread* (reliable; live gdb breakpoints race in this multithreaded, signal-
-scheduled guest and give garbage register readouts).
+**Tooling:** `PROSPER_FAULTMEM=1 ./build-linux/boot_trace <dump>` dumps every GP register + 4 qwords of
+guest memory at each pointer-looking one, at fault time on the stopped thread (reliable; live gdb
+breakpoints race in this multithreaded, signal-scheduled guest). `pltm eboot.bin known_names.txt
+<got_off>` maps a GOT slot to its import NID/name.
 
 ## What's already in place (headless bring-up, correctness-first)
 
