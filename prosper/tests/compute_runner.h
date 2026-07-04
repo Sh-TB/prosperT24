@@ -9,9 +9,14 @@
 
 namespace prosper::test {
 
-// Returns the output buffer (same length as `input`), or an empty vector on any Vulkan failure.
-inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const std::vector<float>& input) {
-    const uint32_t N = (uint32_t)input.size();
+// Run `spirv` over storage buffer 0 = `input`, storage buffer 1 = output. `invocations` compute
+// threads are dispatched (default = input.size()); the output buffer holds `out_count` floats
+// (default = input.size()). Returns the output, or {} on any Vulkan failure (incl. rejected SPIR-V).
+inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const std::vector<float>& input,
+                                      uint32_t invocations = 0, uint32_t out_count = 0) {
+    const uint32_t IN_N = (uint32_t)input.size();
+    if (invocations == 0) invocations = IN_N;
+    if (out_count == 0)   out_count = IN_N;
     std::vector<float> out;
 
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_1;
@@ -47,20 +52,21 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
                 (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) return i;
         return UINT32_MAX;
     };
-    const VkDeviceSize bytes = (VkDeviceSize)N * sizeof(float);
+    const VkDeviceSize inBytes = (VkDeviceSize)IN_N * sizeof(float);
+    const VkDeviceSize outBytes = (VkDeviceSize)out_count * sizeof(float);
     VkBuffer inBuf, outBuf; VkDeviceMemory inMem, outMem;
-    auto makeBuf = [&](VkBuffer& b, VkDeviceMemory& m) {
+    auto makeBuf = [&](VkBuffer& b, VkDeviceMemory& m, VkDeviceSize sz) {
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bci.size = bytes; bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bci.size = sz; bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         vkCreateBuffer(dev, &bci, nullptr, &b);
         VkMemoryRequirements r; vkGetBufferMemoryRequirements(dev, b, &r);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         ai.allocationSize = r.size; ai.memoryTypeIndex = hostMem(r.memoryTypeBits);
         vkAllocateMemory(dev, &ai, nullptr, &m); vkBindBufferMemory(dev, b, m, 0);
     };
-    makeBuf(inBuf, inMem); makeBuf(outBuf, outMem);
-    void* p = nullptr; vkMapMemory(dev, inMem, 0, bytes, 0, &p);
-    for (uint32_t i = 0; i < N; i++) ((float*)p)[i] = input[i];
+    makeBuf(inBuf, inMem, inBytes); makeBuf(outBuf, outMem, outBytes);
+    void* p = nullptr; vkMapMemory(dev, inMem, 0, inBytes, 0, &p);
+    for (uint32_t i = 0; i < IN_N; i++) ((float*)p)[i] = input[i];
     vkUnmapMemory(dev, inMem);
 
     VkDescriptorSetLayoutBinding binds[2]{};
@@ -108,16 +114,16 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     vkBeginCommandBuffer(cmd, &cbbi);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &dset, 0, nullptr);
-    vkCmdDispatch(cmd, (N + 63) / 64, 1, 1);
+    vkCmdDispatch(cmd, (invocations + 63) / 64, 1, 1);
     vkEndCommandBuffer(cmd);
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence fence; vkCreateFence(dev, &fci, nullptr, &fence);
     vkQueueSubmit(queue, 1, &si, fence);
     vkWaitForFences(dev, 1, &fence, VK_TRUE, 5ull * 1000 * 1000 * 1000);
 
-    out.resize(N);
-    void* op = nullptr; vkMapMemory(dev, outMem, 0, bytes, 0, &op);
-    for (uint32_t i = 0; i < N; i++) out[i] = ((float*)op)[i];
+    out.resize(out_count);
+    void* op = nullptr; vkMapMemory(dev, outMem, 0, outBytes, 0, &op);
+    for (uint32_t i = 0; i < out_count; i++) out[i] = ((float*)op)[i];
     vkUnmapMemory(dev, outMem);
 
     vkDestroyFence(dev, fence, nullptr); vkDestroyCommandPool(dev, pool, nullptr);

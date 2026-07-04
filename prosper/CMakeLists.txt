@@ -131,6 +131,11 @@ if(TARGET prosper_core)
       add_executable(test_spirv_builder tests/test_spirv_builder.cpp)
       target_link_libraries(test_spirv_builder PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME spirv_builder_exec COMMAND test_spirv_builder)
+
+      # End-to-end: recompile real RDNA2 (llvm-mc) -> SPIR-V -> run -> assert numeric result.
+      add_executable(test_rdna2_to_spirv tests/test_rdna2_to_spirv.cpp)
+      target_link_libraries(test_rdna2_to_spirv PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME rdna2_to_spirv_exec COMMAND test_rdna2_to_spirv)
       message(STATUS "Vulkan found (${Vulkan_LIBRARY}) — offscreen graphics harness enabled")
     else()
       message(STATUS "Vulkan not found — skipping offscreen graphics harness")
