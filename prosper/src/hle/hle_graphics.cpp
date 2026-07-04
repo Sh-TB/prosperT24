@@ -25,16 +25,6 @@ namespace prosper {
                                        uint64_t a3, uint64_t a4, uint64_t a5)
 
 namespace {
-// A getter that returns a pointer the guest dereferences: hand back a per-callsite singleton
-// zeroed buffer (big enough that field reads/writes at any small offset stay in-bounds). Singleton
-// so repeated "get the device/context" calls see a stable object, as the guest expects.
-uint64_t agc_singleton(int slot) {
-    static void* objs[16] = {nullptr};
-    if (slot < 0 || slot >= 16) slot = 0;
-    if (!objs[slot]) objs[slot] = calloc(1, 64 * 1024);
-    return (uint64_t)(uintptr_t)objs[slot];
-}
-
 // Optional fork-safe counter bumped when the guest calls into the graphics libs (libSceAgc /
 // libSceVideoOut). Tests use it to assert the boot advanced all the way into GPU/display init — a
 // regression guard for the entire runtime bring-up (loader → IL2CPP → C# startup → services →
@@ -46,8 +36,22 @@ inline void gfx_tick() { if (g_gfx_counter) *g_gfx_counter = *g_gfx_counter + 1;
 
 void set_gfx_call_counter(volatile int* counter) { g_gfx_counter = counter; }
 
-HLE(g_agc_dev)  { gfx_tick(); return agc_singleton(0); }   // libSceAgc 2JtWUUiYBXs — obj deref'd at +0x38
-HLE(g_agc_ctx)  { gfx_tick(); return agc_singleton(1); }   // libSceAgc wRbq6ZjNop4 — obj deref'd at +0x38
+// sceAgcGraphicsGetRegisterDefaults2 / ...Internal (NIDs 2JtWUUiYBXs / wRbq6ZjNop4). Per Kyty
+// (Graphics.cpp:766, 1307), these return a RegisterDefaults table the game reads to seed GPU register
+// state. Layout: tbl0/1/2/3 (ShaderRegister** arrays), unknown[2], index table, count@0x38. Returning
+// a zeroed buffer (old behavior) gave null table pointers -> the game's register-default walk faulted.
+// We return a real, structurally-valid RegisterDefaults; count=0 => the game applies no defaults yet
+// (correct-enough to get past the null-deref; real default tables can be ported from Kyty later).
+namespace {
+struct AgcRegisterDefaults {
+    const void* tbl0; const void* tbl1; const void* tbl2; const void* tbl3;
+    uint64_t unknown[2]; const void* index_tbl; uint32_t count; uint32_t pad;
+};
+uint32_t g_agc_empty_tbl[64] = {0};                          // non-null, mapped, zeroed
+AgcRegisterDefaults g_agc_regdefaults = {
+    g_agc_empty_tbl, g_agc_empty_tbl, g_agc_empty_tbl, nullptr, {0, 0}, g_agc_empty_tbl, 0, 0 };
+}
+HLE(g_agc_regdefs) { gfx_tick(); return (uint64_t)(uintptr_t)&g_agc_regdefaults; }  // GetRegisterDefaults2[Internal]
 
 // --- libSceVideoOut (display / frame presentation). Headless: accept opens/flips and simulate
 // flip completion so the game's render loop advances (submit -> wait completion -> submit next).
@@ -142,8 +146,8 @@ void register_graphics_hle() {
     #define RN(nid, fn) Hle::register_fn(nid, (HleFn)(fn), nid)   // raw NID (graphics libs undocumented)
     #define R(str, fn)  Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     // libSceAgc getters whose results the guest dereferences → return stable zeroed objects.
-    RN("2JtWUUiYBXs", g_agc_dev);
-    RN("wRbq6ZjNop4", g_agc_ctx);
+    RN("2JtWUUiYBXs", g_agc_regdefs);   // GraphicsGetRegisterDefaults2
+    RN("wRbq6ZjNop4", g_agc_regdefs);   // GraphicsGetRegisterDefaults2Internal
     // All traced libSceAgc/AgcDriver NIDs → per-NID logging thunks (still return 0; observable only).
     register_agc_tracers(std::make_index_sequence<kAgcNidCount>{});
     // libSceVideoOut display / flip
