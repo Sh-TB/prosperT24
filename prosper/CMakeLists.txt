@@ -82,6 +82,10 @@ if(TARGET prosper_core)
     target_link_libraries(test_rwlock_once PRIVATE prosper_core)
     add_test(NAME rwlock_once_semantics COMMAND test_rwlock_once)
 
+    add_executable(test_agc_dcb tests/test_agc_dcb.cpp)
+    target_link_libraries(test_agc_dcb PRIVATE prosper_core)
+    add_test(NAME agc_dcb_pm4 COMMAND test_agc_dcb)
+
     # Graphics-phase foundation + agentic-first verification harness: headless offscreen Vulkan
     # (render/clear -> readback -> pixel/CRC assert). Only built if Vulkan dev files are present.
     find_package(Vulkan QUIET)
