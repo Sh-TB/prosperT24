@@ -9,9 +9,11 @@ namespace {
 
 enum : uint32_t {
     Op_ExtInstImport=11, Op_ExtInst=12, Op_MemoryModel=14, Op_EntryPoint=15, Op_ExecutionMode=16,
-    Op_Capability=17, Op_TypeVoid=19, Op_TypeInt=21, Op_TypeFloat=22, Op_TypeVector=23,
+    Op_Capability=17, Op_TypeVoid=19, Op_TypeBool=20, Op_TypeInt=21, Op_TypeFloat=22, Op_TypeVector=23,
     Op_TypeRuntimeArray=29, Op_TypeStruct=30, Op_TypePointer=32, Op_TypeFunction=33,
-    Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
+    Op_ConstantFalse=42, Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
+    Op_Select=169, Op_FOrdEqual=180, Op_FOrdNotEqual=182, Op_FOrdLessThan=184, Op_FOrdGreaterThan=186,
+    Op_FOrdLessThanEqual=188, Op_FOrdGreaterThanEqual=190,
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
     Op_ConvertFToU=109, Op_ConvertUToF=112, Op_Bitcast=124,
     Op_CompositeExtract=81, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_FSub=131, Op_IMul=132, Op_FMul=133,
@@ -38,8 +40,8 @@ struct SpirvCompute {
     uint32_t next_id = 1;
     uint32_t stride = 1;
     // fixed ids (set in begin()):
-    uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_v3u=0, t_ptr_sb_f32=0;
-    uint32_t v_gid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0;
+    uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
+    uint32_t v_gid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
 
     uint32_t id() { return next_id++; }
     static void put(std::vector<uint32_t>& s, uint32_t op, std::initializer_list<uint32_t> o) {
@@ -83,6 +85,10 @@ struct SpirvCompute {
     uint32_t frcp(uint32_t a) { uint32_t rf = id(); put(code, Op_FDiv, {t_f32, rf, fconstf(1.0f), bcf(a)}); return bcu(rf); }
     uint32_t cvt_u2f(uint32_t u) { uint32_t rf = id(); put(code, Op_ConvertUToF, {t_f32, rf, u}); return bcu(rf); }   // uint -> float bits
     uint32_t cvt_f2u(uint32_t bits) { uint32_t r = id(); put(code, Op_ConvertFToU, {t_u32, r, bcf(bits)}); return r; }
+    // Float ordered compare on bit-operands -> bool (for VCC). select() picks bits by a bool condition.
+    uint32_t fcmp(uint32_t cmpop, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, cmpop, {t_bool, r, bcf(a), bcf(b)}); return r; }
+    uint32_t bfalse() { if (!bconst_false) { bconst_false = id(); put(types, Op_ConstantFalse, {t_bool, bconst_false}); } return bconst_false; }
+    uint32_t sel(uint32_t cond, uint32_t tval, uint32_t fval) { uint32_t r = id(); put(code, Op_Select, {t_u32, r, cond, tval, fval}); return r; }
 
     // buffer element pointer: base[ gid.x*stride + k ]
     uint32_t elem_ptr(uint32_t bufvar, uint32_t k) {
@@ -101,7 +107,7 @@ struct SpirvCompute {
 
     void begin(uint32_t input_stride) {
         stride = input_stride;
-        t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_v3u = id();
+        t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_v3u = id(); t_bool = id();
         uint32_t t_ptr_in_v3u = id(); v_gid = id();
         uint32_t t_rta = id(), t_struct = id(), t_ptr_sb_struct = id();
         v_in = id(); v_out = id(); t_ptr_sb_f32 = id();
@@ -123,6 +129,7 @@ struct SpirvCompute {
         put(types, Op_TypeFloat, {t_f32, 32});
         put(types, Op_TypeInt, {t_u32, 32, 0});
         put(types, Op_TypeVector, {t_v3u, t_u32, 3});
+        put(types, Op_TypeBool, {t_bool});
         put(types, Op_TypePointer, {t_ptr_in_v3u, SC_Input, t_v3u});
         put(types, Op_Variable, {t_ptr_in_v3u, v_gid, SC_Input});
         put(types, Op_TypeRuntimeArray, {t_rta, t_f32});
@@ -153,7 +160,8 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
 
     SpirvCompute b;
     b.begin(num_inputs ? num_inputs : 1);
-    std::unordered_map<int, uint32_t> vreg;                 // VGPR -> current SSA float id
+    std::unordered_map<int, uint32_t> vreg;                 // VGPR -> current SSA bits id
+    uint32_t vcc = b.bfalse();                              // VCC: current bool condition (from v_cmp_*)
     for (uint32_t k = 0; k < num_inputs; k++) vreg[(int)k] = b.load_input(k);
 
     // Resolve an operand to its raw 32-bit VGPR value (bits). Float ops bitcast these to float.
@@ -193,6 +201,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
             case Rdna2Format::VOP2: {
                 uint32_t a = val(in, in.src[0]), c = val(in, in.src[1]); uint32_t& d = vreg[in.dst.value];
                 switch (in.opcode) {
+                    case 0x01: d = b.sel(vcc, c, a); break;               // v_cndmask_b32: dst = vcc ? src1 : src0
                     case 0x03: d = b.fbin(Op_FAdd, a, c); break;          // v_add_f32
                     case 0x04: d = b.fbin(Op_FSub, a, c); break;          // v_sub_f32
                     case 0x08: d = b.fbin(Op_FMul, a, c); break;          // v_mul_f32
@@ -209,6 +218,19 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                     case 0x1D: d = b.ibin(Op_BitwiseXor, a, c); break;    // v_xor_b32
                     case 0x25: d = b.ibin(Op_IAdd, a, c); break;          // v_add_nc_u32
                     case 0x26: d = b.ibin(Op_ISub, a, c); break;          // v_sub_nc_u32
+                    default: return {};
+                }
+                break;
+            }
+            case Rdna2Format::VOPC: {                                     // v_cmp_*_f32 -> VCC (bool)
+                uint32_t a = val(in, in.src[0]), c = val(in, in.src[1]);
+                switch (in.opcode) {
+                    case 0x01: vcc = b.fcmp(Op_FOrdLessThan, a, c); break;         // v_cmp_lt_f32
+                    case 0x02: vcc = b.fcmp(Op_FOrdEqual, a, c); break;            // v_cmp_eq_f32
+                    case 0x03: vcc = b.fcmp(Op_FOrdLessThanEqual, a, c); break;    // v_cmp_le_f32
+                    case 0x04: vcc = b.fcmp(Op_FOrdGreaterThan, a, c); break;      // v_cmp_gt_f32
+                    case 0x05: vcc = b.fcmp(Op_FOrdNotEqual, a, c); break;         // v_cmp_lg_f32
+                    case 0x06: vcc = b.fcmp(Op_FOrdGreaterThanEqual, a, c); break; // v_cmp_ge_f32
                     default: return {};
                 }
                 break;
