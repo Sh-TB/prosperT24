@@ -81,5 +81,17 @@ if(TARGET prosper_core)
     add_executable(test_rwlock_once tests/test_rwlock_once.cpp)
     target_link_libraries(test_rwlock_once PRIVATE prosper_core)
     add_test(NAME rwlock_once_semantics COMMAND test_rwlock_once)
+
+    # Graphics-phase foundation + agentic-first verification harness: headless offscreen Vulkan
+    # (render/clear -> readback -> pixel/CRC assert). Only built if Vulkan dev files are present.
+    find_package(Vulkan QUIET)
+    if(Vulkan_FOUND)
+      add_executable(test_vulkan_offscreen tests/test_vulkan_offscreen.cpp)
+      target_link_libraries(test_vulkan_offscreen PRIVATE Vulkan::Vulkan)
+      add_test(NAME vulkan_offscreen_clear COMMAND test_vulkan_offscreen)
+      message(STATUS "Vulkan found (${Vulkan_LIBRARY}) — offscreen graphics harness enabled")
+    else()
+      message(STATUS "Vulkan not found — skipping offscreen graphics harness")
+    endif()
   endif()
 endif()
