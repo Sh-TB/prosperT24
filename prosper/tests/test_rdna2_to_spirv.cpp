@@ -136,6 +136,41 @@ int main() {
     printf("  kernel6 mismatches=%u (out[10]=%g expect=%g)\n", bad6, got6.size()==N?got6[10]:-1, exp6[10]);
     CHECK(got6.size()==N && bad6==0, "recompiled kernel 6 computes max via compare+select correctly");
 
+    // Kernel 7: signed min/max/ashr. i=(int)a; range=max(i0,i1)-min(i0,i1); out=(float)(range >> (i2&31)).
+    const uint32_t code7[] = {
+        0x7E001100u, 0x7E021101u, 0x7E041102u, 0x22060300u, 0x24080300u, 0x4C060704u, 0x30060702u, 0x7E000B03u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv7 = recompile_valu(code7, sizeof(code7)/sizeof(code7[0]), 3, 0);
+    CHECK(!spv7.empty(), "recompiled kernel 7 (signed min/max/ashr) -> SPIR-V");
+    std::vector<float> in7(N * 3), exp7(N);
+    for (uint32_t i = 0; i < N; i++) {
+        int i0 = (int)i - 70, i1 = (int)((i * 13) % 140) - 70, i2 = (int)(i % 8);
+        in7[i*3+0]=(float)i0; in7[i*3+1]=(float)i1; in7[i*3+2]=(float)i2;
+        int mn = i0 < i1 ? i0 : i1, mx = i0 > i1 ? i0 : i1; int range = mx - mn;
+        exp7[i] = (float)(range >> (i2 & 31));
+    }
+    std::vector<float> got7 = prosper::test::run_compute(spv7, in7, N, N);
+    uint32_t bad7 = 0; for (uint32_t i=0;i<N&&got7.size()==N;i++) if (std::fabs(got7[i]-exp7[i])>1e-3f) bad7++;
+    printf("  kernel7 mismatches=%u (out[90]=%g expect=%g)\n", bad7, got7.size()==N?got7[90]:-1, exp7[90]);
+    CHECK(got7.size()==N && bad7==0, "recompiled kernel 7 (signed min/max/ashr) correct");
+
+    // Kernel 8: signed compare + select. out = (i0 > i1) ? i0 : i2  (signed comparison).
+    const uint32_t code8[] = {
+        0x7E001100u, 0x7E021101u, 0x7E041102u, 0x7D080300u, 0x02000102u, 0x7E000B00u, 0xBF810000u,
+    };
+    std::vector<uint32_t> spv8 = recompile_valu(code8, sizeof(code8)/sizeof(code8[0]), 3, 0);
+    CHECK(!spv8.empty(), "recompiled kernel 8 (v_cmp_gt_i32 + select) -> SPIR-V");
+    std::vector<float> in8(N * 3), exp8(N);
+    for (uint32_t i = 0; i < N; i++) {
+        int i0 = (int)(i % 50) - 25, i1 = 0, i2 = (int)i - 40;
+        in8[i*3+0]=(float)i0; in8[i*3+1]=(float)i1; in8[i*3+2]=(float)i2;
+        exp8[i] = (float)(i0 > i1 ? i0 : i2);
+    }
+    std::vector<float> got8 = prosper::test::run_compute(spv8, in8, N, N);
+    uint32_t bad8 = 0; for (uint32_t i=0;i<N&&got8.size()==N;i++) if (std::fabs(got8[i]-exp8[i])>1e-3f) bad8++;
+    printf("  kernel8 mismatches=%u (out[10]=%g expect=%g)\n", bad8, got8.size()==N?got8[10]:-1, exp8[10]);
+    CHECK(got8.size()==N && bad8==0, "recompiled kernel 8 (signed compare/select) correct");
+
     if (fails) { printf("== FAIL: %d ==\n", fails); return 1; }
     printf("== PASS ==\n");
     return 0;

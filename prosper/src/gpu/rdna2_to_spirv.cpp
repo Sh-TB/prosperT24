@@ -15,14 +15,16 @@ enum : uint32_t {
     Op_Select=169, Op_FOrdEqual=180, Op_FOrdNotEqual=182, Op_FOrdLessThan=184, Op_FOrdGreaterThan=186,
     Op_FOrdLessThanEqual=188, Op_FOrdGreaterThanEqual=190,
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
-    Op_ConvertFToU=109, Op_ConvertUToF=112, Op_Bitcast=124,
+    Op_ConvertFToU=109, Op_ConvertFToS=110, Op_ConvertSToF=111, Op_ConvertUToF=112, Op_Bitcast=124,
     Op_CompositeExtract=81, Op_IAdd=128, Op_FAdd=129, Op_ISub=130, Op_FSub=131, Op_IMul=132, Op_FMul=133,
-    Op_FDiv=136, Op_ShiftRightLogical=194, Op_ShiftLeftLogical=196, Op_BitwiseOr=197, Op_BitwiseXor=198,
-    Op_BitwiseAnd=199, Op_Not=200, Op_Label=248, Op_Return=253,
+    Op_FDiv=136, Op_IEqual=170, Op_UGreaterThan=172, Op_SGreaterThan=173, Op_ULessThan=176, Op_SLessThan=177,
+    Op_ShiftRightLogical=194, Op_ShiftRightArithmetic=195, Op_ShiftLeftLogical=196, Op_BitwiseOr=197,
+    Op_BitwiseXor=198, Op_BitwiseAnd=199, Op_Not=200, Op_Label=248, Op_Return=253,
 };
 // GLSL.std.450 extended-instruction numbers.
 enum : uint32_t { Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Exp2=29, Glsl_Log2=30,
-                  Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_UMin=38, Glsl_FMin=37, Glsl_FMax=40, Glsl_UMax=41 };
+                  Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_UMin=38, Glsl_SMin=39, Glsl_FMax=40,
+                  Glsl_UMax=41, Glsl_SMax=42 };
 enum : uint32_t {
     Cap_Shader=1, Addr_Logical=0, Mem_GLSL450=1, Exec_GLCompute=5, EM_LocalSize=17,
     SC_Input=1, SC_StorageBuffer=12, FC_None=0,
@@ -40,7 +42,7 @@ struct SpirvCompute {
     uint32_t next_id = 1;
     uint32_t stride = 1;
     // fixed ids (set in begin()):
-    uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
+    uint32_t t_void=0, t_fn=0, t_f32=0, t_u32=0, t_i32=0, t_v3u=0, t_bool=0, t_ptr_sb_f32=0;
     uint32_t v_gid=0, v_in=0, v_out=0, gidx=0, f_main=0, glsl=0, bconst_false=0;
 
     uint32_t id() { return next_id++; }
@@ -89,6 +91,16 @@ struct SpirvCompute {
     uint32_t fcmp(uint32_t cmpop, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, cmpop, {t_bool, r, bcf(a), bcf(b)}); return r; }
     uint32_t bfalse() { if (!bconst_false) { bconst_false = id(); put(types, Op_ConstantFalse, {t_bool, bconst_false}); } return bconst_false; }
     uint32_t sel(uint32_t cond, uint32_t tval, uint32_t fval) { uint32_t r = id(); put(code, Op_Select, {t_u32, r, cond, tval, fval}); return r; }
+    // Signed-int helpers: bits are bitcast to i32, the op runs, and the i32 result is bitcast to bits.
+    uint32_t bcs(uint32_t u) { uint32_t r = id(); put(code, Op_Bitcast, {t_i32, r, u}); return r; }   // bits -> i32
+    uint32_t i2u(uint32_t i) { uint32_t r = id(); put(code, Op_Bitcast, {t_u32, r, i}); return r; }   // i32 -> bits
+    uint32_t sbin(uint32_t op, uint32_t a, uint32_t b) { uint32_t ri = id(); put(code, op, {t_i32, ri, bcs(a), bcs(b)}); return i2u(ri); }
+    uint32_t sext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t ri = id(); putv(code, Op_ExtInst, {t_i32, ri, glsl, inst, bcs(a), bcs(b)}); return i2u(ri); }
+    uint32_t cvt_f2i(uint32_t bits) { uint32_t ri = id(); put(code, Op_ConvertFToS, {t_i32, ri, bcf(bits)}); return i2u(ri); }
+    uint32_t cvt_i2f(uint32_t bits) { uint32_t rf = id(); put(code, Op_ConvertSToF, {t_f32, rf, bcs(bits)}); return bcu(rf); }
+    // Integer compares -> bool. scmp treats operands as signed, ucmp as unsigned.
+    uint32_t scmp(uint32_t op, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, op, {t_bool, r, bcs(a), bcs(b)}); return r; }
+    uint32_t ucmp(uint32_t op, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, op, {t_bool, r, a, b}); return r; }
 
     // buffer element pointer: base[ gid.x*stride + k ]
     uint32_t elem_ptr(uint32_t bufvar, uint32_t k) {
@@ -128,6 +140,7 @@ struct SpirvCompute {
         put(types, Op_TypeFunction, {t_fn, t_void});
         put(types, Op_TypeFloat, {t_f32, 32});
         put(types, Op_TypeInt, {t_u32, 32, 0});
+        put(types, Op_TypeInt, {t_i32, 32, 1});
         put(types, Op_TypeVector, {t_v3u, t_u32, 3});
         put(types, Op_TypeBool, {t_bool});
         put(types, Op_TypePointer, {t_ptr_in_v3u, SC_Input, t_v3u});
@@ -182,8 +195,10 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                 uint32_t a = val(in, in.src[0]); uint32_t& d = vreg[in.dst.value];
                 switch (in.opcode) {
                     case 0x01: d = a; break;                              // v_mov_b32
+                    case 0x05: d = b.cvt_i2f(a); break;                   // v_cvt_f32_i32
                     case 0x06: d = b.cvt_u2f(a); break;                   // v_cvt_f32_u32
                     case 0x07: d = b.cvt_f2u(a); break;                   // v_cvt_u32_f32
+                    case 0x08: d = b.cvt_f2i(a); break;                   // v_cvt_i32_f32
                     case 0x20: d = b.fext1(Glsl_Fract, a); break;         // v_fract_f32
                     case 0x21: d = b.fext1(Glsl_Trunc, a); break;         // v_trunc_f32
                     case 0x22: d = b.fext1(Glsl_Ceil, a); break;          // v_ceil_f32
@@ -207,10 +222,14 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                     case 0x08: d = b.fbin(Op_FMul, a, c); break;          // v_mul_f32
                     case 0x0F: d = b.fext2(Glsl_FMin, a, c); break;       // v_min_f32
                     case 0x10: d = b.fext2(Glsl_FMax, a, c); break;       // v_max_f32
+                    case 0x11: d = b.sext2(Glsl_SMin, a, c); break;       // v_min_i32
+                    case 0x12: d = b.sext2(Glsl_SMax, a, c); break;       // v_max_i32
                     case 0x13: d = b.uext2(Glsl_UMin, a, c); break;       // v_min_u32
                     case 0x14: d = b.uext2(Glsl_UMax, a, c); break;       // v_max_u32
                     case 0x16: { uint32_t sh = b.ibin(Op_BitwiseAnd, a, b.uconst(31));   // v_lshrrev_b32
                                  d = b.ibin(Op_ShiftRightLogical, c, sh); break; }       // dst = src1 >> (src0 & 31)
+                    case 0x18: { uint32_t sh = b.ibin(Op_BitwiseAnd, a, b.uconst(31));   // v_ashrrev_i32
+                                 d = b.sbin(Op_ShiftRightArithmetic, c, sh); break; }    // dst = src1 >>a (src0 & 31)
                     case 0x1A: { uint32_t sh = b.ibin(Op_BitwiseAnd, a, b.uconst(31));   // v_lshlrev_b32
                                  d = b.ibin(Op_ShiftLeftLogical, c, sh); break; }        // dst = src1 << (src0 & 31)
                     case 0x1B: d = b.ibin(Op_BitwiseAnd, a, c); break;    // v_and_b32
@@ -231,6 +250,11 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                     case 0x04: vcc = b.fcmp(Op_FOrdGreaterThan, a, c); break;      // v_cmp_gt_f32
                     case 0x05: vcc = b.fcmp(Op_FOrdNotEqual, a, c); break;         // v_cmp_lg_f32
                     case 0x06: vcc = b.fcmp(Op_FOrdGreaterThanEqual, a, c); break; // v_cmp_ge_f32
+                    case 0x81: vcc = b.scmp(Op_SLessThan, a, c); break;            // v_cmp_lt_i32
+                    case 0x82: vcc = b.ucmp(Op_IEqual, a, c); break;               // v_cmp_eq_i32
+                    case 0x84: vcc = b.scmp(Op_SGreaterThan, a, c); break;         // v_cmp_gt_i32
+                    case 0xC1: vcc = b.ucmp(Op_ULessThan, a, c); break;            // v_cmp_lt_u32
+                    case 0xC4: vcc = b.ucmp(Op_UGreaterThan, a, c); break;         // v_cmp_gt_u32
                     default: return {};
                 }
                 break;
