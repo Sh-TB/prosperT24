@@ -13,8 +13,10 @@ enum : uint32_t {
     Op_TypeRuntimeArray=29, Op_TypeStruct=30, Op_TypePointer=32, Op_TypeFunction=33,
     Op_Constant=43, Op_Function=54, Op_FunctionEnd=56, Op_Variable=59,
     Op_Load=61, Op_Store=62, Op_AccessChain=65, Op_Decorate=71, Op_MemberDecorate=72,
+    Op_ConvertFToU=109, Op_ConvertUToF=112, Op_Bitcast=124,
     Op_CompositeExtract=81, Op_IAdd=128, Op_FAdd=129, Op_FSub=131, Op_IMul=132, Op_FMul=133,
-    Op_FDiv=136, Op_Label=248, Op_Return=253,
+    Op_FDiv=136, Op_ShiftLeftLogical=196, Op_BitwiseOr=197, Op_BitwiseXor=198, Op_BitwiseAnd=199,
+    Op_Label=248, Op_Return=253,
 };
 // GLSL.std.450 extended-instruction numbers.
 enum : uint32_t { Glsl_Floor=8, Glsl_Fract=10, Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_FMax=40 };
@@ -59,10 +61,23 @@ struct SpirvCompute {
         auto it = uconst_cache.find(v); if (it != uconst_cache.end()) return it->second;
         uint32_t c = id(); put(types, Op_Constant, {t_u32, c, v}); uconst_cache[v] = c; return c;
     }
-    uint32_t binop(uint32_t op, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, op, {t_f32, r, a, b}); return r; }
-    // GLSL.std.450 extended instructions (float result).
-    uint32_t ext1(uint32_t inst, uint32_t a) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, a}); return r; }
-    uint32_t ext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, a, b}); return r; }
+    // VGPRs are modeled as raw 32-bit VALUES (uint). Float ops bitcast their operands uint->float and
+    // bitcast the result back to uint; integer ops operate on the bits directly. This matches the
+    // hardware's untyped VGPRs and lets float and integer instructions share the same register file.
+    uint32_t bcf(uint32_t u) { uint32_t r = id(); put(code, Op_Bitcast, {t_f32, r, u}); return r; }   // bits -> float
+    uint32_t bcu(uint32_t f) { uint32_t r = id(); put(code, Op_Bitcast, {t_u32, r, f}); return r; }   // float -> bits
+    uint32_t fconstf(float f) { uint32_t b = fbits(f); auto it = fconst_cache.find(b); if (it != fconst_cache.end()) return it->second;
+        uint32_t c = id(); put(types, Op_Constant, {t_f32, c, b}); fconst_cache[b] = c; return c; }
+    // Float binary op on bit-operands -> bit-result.
+    uint32_t fbin(uint32_t op, uint32_t a, uint32_t b) { uint32_t rf = id(); put(code, op, {t_f32, rf, bcf(a), bcf(b)}); return bcu(rf); }
+    // Integer binary op on bit-operands -> bit-result.
+    uint32_t ibin(uint32_t op, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, op, {t_u32, r, a, b}); return r; }
+    // GLSL.std.450 float ext-instructions on bit-operands -> bit-result.
+    uint32_t fext1(uint32_t inst, uint32_t a) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, bcf(a)}); return bcu(r); }
+    uint32_t fext2(uint32_t inst, uint32_t a, uint32_t b) { uint32_t r = id(); putv(code, Op_ExtInst, {t_f32, r, glsl, inst, bcf(a), bcf(b)}); return bcu(r); }
+    uint32_t frcp(uint32_t a) { uint32_t rf = id(); put(code, Op_FDiv, {t_f32, rf, fconstf(1.0f), bcf(a)}); return bcu(rf); }
+    uint32_t cvt_u2f(uint32_t u) { uint32_t rf = id(); put(code, Op_ConvertUToF, {t_f32, rf, u}); return bcu(rf); }   // uint -> float bits
+    uint32_t cvt_f2u(uint32_t bits) { uint32_t r = id(); put(code, Op_ConvertFToU, {t_u32, r, bcf(bits)}); return r; }
 
     // buffer element pointer: base[ gid.x*stride + k ]
     uint32_t elem_ptr(uint32_t bufvar, uint32_t k) {
@@ -71,11 +86,12 @@ struct SpirvCompute {
         if (k != 0) { uint32_t a = id(); put(code, Op_IAdd, {t_u32, a, idx, uconst(k)}); idx = a; }
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_f32, p, bufvar, uconst(0), idx}); return p;
     }
-    uint32_t load_input(uint32_t k)  { uint32_t p = elem_ptr(v_in, k); uint32_t r = id(); put(code, Op_Load, {t_f32, r, p}); return r; }
-    // Output is one float per invocation: b[gid.x] (stride 1), independent of the input stride.
-    void     store_output(uint32_t val) {
+    // Load one float from the input buffer and return it as raw bits (VGPR value).
+    uint32_t load_input(uint32_t k) { uint32_t p = elem_ptr(v_in, k); uint32_t r = id(); put(code, Op_Load, {t_f32, r, p}); return bcu(r); }
+    // Store a VGPR (bits) as one float per invocation: b[gid.x] (stride 1), independent of input stride.
+    void     store_output(uint32_t bits) {
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_f32, p, v_out, uconst(0), gidx});
-        put(code, Op_Store, {p, val});
+        put(code, Op_Store, {p, bcf(bits)});
     }
 
     void begin(uint32_t input_stride) {
@@ -135,13 +151,14 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     std::unordered_map<int, uint32_t> vreg;                 // VGPR -> current SSA float id
     for (uint32_t k = 0; k < num_inputs; k++) vreg[(int)k] = b.load_input(k);
 
+    // Resolve an operand to its raw 32-bit VGPR value (bits). Float ops bitcast these to float.
     auto val = [&](const Rdna2Inst& in, const Operand& o) -> uint32_t {
         switch (o.kind) {
-            case OperandKind::VGPR: { auto it = vreg.find(o.value); return it == vreg.end() ? b.fconst(0.f) : it->second; }
-            case OperandKind::InlineInt:   return b.fconst((float)o.value);
-            case OperandKind::InlineFloat: return b.fconst(inline_float_value((uint32_t)o.value));
-            case OperandKind::Literal: { uint32_t bits = in.literal; float f; std::memcpy(&f, &bits, 4); return b.fconst(f); }
-            default: return b.fconst(0.f);
+            case OperandKind::VGPR: { auto it = vreg.find(o.value); return it == vreg.end() ? b.uconst(0) : it->second; }
+            case OperandKind::InlineInt:   return b.uconst((uint32_t)o.value);
+            case OperandKind::InlineFloat: return b.uconst(fbits(inline_float_value((uint32_t)o.value)));
+            case OperandKind::Literal:     return b.uconst(in.literal);
+            default: return b.uconst(0);
         }
     };
 
@@ -151,30 +168,42 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
             case Rdna2Format::VOP1: {
                 uint32_t a = val(in, in.src[0]); uint32_t& d = vreg[in.dst.value];
                 switch (in.opcode) {
-                    case 0x01: d = a; break;                                   // v_mov_b32
-                    case 0x20: d = b.ext1(Glsl_Fract, a); break;               // v_fract_f32
-                    case 0x24: d = b.ext1(Glsl_Floor, a); break;               // v_floor_f32
-                    case 0x2A: d = b.binop(Op_FDiv, b.fconst(1.0f), a); break; // v_rcp_f32
-                    case 0x2E: d = b.ext1(Glsl_InverseSqrt, a); break;         // v_rsq_f32
-                    case 0x33: d = b.ext1(Glsl_Sqrt, a); break;                // v_sqrt_f32
+                    case 0x01: d = a; break;                              // v_mov_b32
+                    case 0x06: d = b.cvt_u2f(a); break;                   // v_cvt_f32_u32
+                    case 0x07: d = b.cvt_f2u(a); break;                   // v_cvt_u32_f32
+                    case 0x20: d = b.fext1(Glsl_Fract, a); break;         // v_fract_f32
+                    case 0x24: d = b.fext1(Glsl_Floor, a); break;         // v_floor_f32
+                    case 0x2A: d = b.frcp(a); break;                      // v_rcp_f32
+                    case 0x2E: d = b.fext1(Glsl_InverseSqrt, a); break;   // v_rsq_f32
+                    case 0x33: d = b.fext1(Glsl_Sqrt, a); break;          // v_sqrt_f32
                     default: return {};
                 }
                 break;
             }
             case Rdna2Format::VOP2: {
-                uint32_t a = val(in, in.src[0]), c = val(in, in.src[1]);
-                if      (in.opcode == 0x03) vreg[in.dst.value] = b.binop(Op_FAdd, a, c);   // v_add_f32
-                else if (in.opcode == 0x04) vreg[in.dst.value] = b.binop(Op_FSub, a, c);   // v_sub_f32
-                else if (in.opcode == 0x08) vreg[in.dst.value] = b.binop(Op_FMul, a, c);   // v_mul_f32
-                else if (in.opcode == 0x0F) vreg[in.dst.value] = b.ext2(Glsl_FMin, a, c);  // v_min_f32
-                else if (in.opcode == 0x10) vreg[in.dst.value] = b.ext2(Glsl_FMax, a, c);  // v_max_f32
-                else return {};
+                uint32_t a = val(in, in.src[0]), c = val(in, in.src[1]); uint32_t& d = vreg[in.dst.value];
+                switch (in.opcode) {
+                    case 0x03: d = b.fbin(Op_FAdd, a, c); break;          // v_add_f32
+                    case 0x04: d = b.fbin(Op_FSub, a, c); break;          // v_sub_f32
+                    case 0x08: d = b.fbin(Op_FMul, a, c); break;          // v_mul_f32
+                    case 0x0F: d = b.fext2(Glsl_FMin, a, c); break;       // v_min_f32
+                    case 0x10: d = b.fext2(Glsl_FMax, a, c); break;       // v_max_f32
+                    case 0x1A: { uint32_t sh = b.ibin(Op_BitwiseAnd, a, b.uconst(31));   // v_lshlrev_b32
+                                 d = b.ibin(Op_ShiftLeftLogical, c, sh); break; }        // dst = src1 << (src0 & 31)
+                    case 0x1B: d = b.ibin(Op_BitwiseAnd, a, c); break;    // v_and_b32
+                    case 0x1C: d = b.ibin(Op_BitwiseOr,  a, c); break;    // v_or_b32
+                    case 0x1D: d = b.ibin(Op_BitwiseXor, a, c); break;    // v_xor_b32
+                    case 0x25: d = b.ibin(Op_IAdd, a, c); break;          // v_add_nc_u32
+                    default: return {};
+                }
                 break;
             }
             case Rdna2Format::VOP3:
-                if (in.opcode == 0x14B) {  // v_fma_f32 (gfx10 VOP3 op 0x14B) = src0*src1 + src2
-                    uint32_t m = b.binop(Op_FMul, val(in, in.src[0]), val(in, in.src[1]));
-                    vreg[in.dst.value] = b.binop(Op_FAdd, m, val(in, in.src[2]));
+                if (in.opcode == 0x14B) {                                 // v_fma_f32 = src0*src1 + src2
+                    uint32_t m = b.fbin(Op_FMul, val(in, in.src[0]), val(in, in.src[1]));
+                    vreg[in.dst.value] = b.fbin(Op_FAdd, m, val(in, in.src[2]));
+                } else if (in.opcode == 0x169) {                          // v_mul_lo_u32
+                    vreg[in.dst.value] = b.ibin(Op_IMul, val(in, in.src[0]), val(in, in.src[1]));
                 } else return {};
                 break;
             default: return {};   // scalar / memory / unsupported: not handled at this stage
@@ -182,7 +211,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     }
 
     auto it = vreg.find((int)out_vgpr);
-    b.store_output(it == vreg.end() ? b.fconst(0.f) : it->second);
+    b.store_output(it == vreg.end() ? b.uconst(0) : it->second);
     return b.finish();
 }
 
