@@ -237,10 +237,19 @@ struct SpirvCompute {
 
 }  // namespace
 
-// Resolve an operand to its raw 32-bit VGPR value (bits). Float ops bitcast these to float.
-uint32_t operand_bits(SpirvCompute& b, std::unordered_map<int, uint32_t>& vreg, const Rdna2Inst& in, const Operand& o) {
+// Machine state during recompilation: the VGPR and SGPR files (VGPR/SGPR number -> current SSA bits
+// id) and VCC (current bool condition). VGPRs and SGPRs are separate register files; VALU/EXP source
+// operands may reference either (SGPR is a valid ALU operand), so both are resolved by operand_bits.
+struct RegState {
+    std::unordered_map<int, uint32_t> vreg, sreg;
+    uint32_t vcc = 0;
+};
+
+// Resolve an operand to its raw 32-bit value (bits). Float ops bitcast these to float.
+uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const Operand& o) {
     switch (o.kind) {
-        case OperandKind::VGPR: { auto it = vreg.find(o.value); return it == vreg.end() ? b.uconst(0) : it->second; }
+        case OperandKind::VGPR: { auto it = rs.vreg.find(o.value); return it == rs.vreg.end() ? b.uconst(0) : it->second; }
+        case OperandKind::SGPR: { auto it = rs.sreg.find(o.value); return it == rs.sreg.end() ? b.uconst(0) : it->second; }
         case OperandKind::InlineInt:   return b.uconst((uint32_t)o.value);
         case OperandKind::InlineFloat: return b.uconst(fbits(inline_float_value((uint32_t)o.value)));
         case OperandKind::Literal:     return b.uconst(in.literal);
@@ -248,12 +257,37 @@ uint32_t operand_bits(SpirvCompute& b, std::unordered_map<int, uint32_t>& vreg, 
     }
 }
 
-// Emit one VALU (VOP1/2/C/3) instruction into `b`, updating `vreg`/`vcc`. Returns true if `in` is a
-// VALU format handled here; sets ok=false if it is a VALU op this stage doesn't support yet. Non-VALU
-// formats (EXP/SOP/memory/...) return false so the stage-specific caller can handle them.
-bool emit_alu(SpirvCompute& b, std::unordered_map<int, uint32_t>& vreg, uint32_t& vcc, const Rdna2Inst& in, bool& ok) {
-    auto val = [&](const Operand& o) { return operand_bits(b, vreg, in, o); };
+// Emit one ALU instruction (VOP1/2/C/3 or SOP1/2) into `b`, updating `rs`. Returns true if `in` is an
+// ALU format handled here; sets ok=false if it is an ALU op this stage doesn't support yet. Non-ALU
+// formats (EXP/memory/...) return false so the stage-specific caller can handle them.
+bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok) {
+    auto& vreg = rs.vreg; uint32_t& vcc = rs.vcc;
+    auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o); };
     switch (in.fmt) {
+        case Rdna2Format::SOP1: {
+            uint32_t a = val(in.src[0]); uint32_t& d = rs.sreg[in.dst.value];
+            switch (in.opcode) {
+                case 0x03: d = a; break;                    // s_mov_b32
+                case 0x07: d = b.iun(Op_Not, a); break;     // s_not_b32
+                default: ok = false;
+            }
+            return true;
+        }
+        case Rdna2Format::SOP2: {
+            uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t& d = rs.sreg[in.dst.value];
+            switch (in.opcode) {
+                case 0x00: d = b.ibin(Op_IAdd, a, c); break;         // s_add_u32
+                case 0x01: d = b.ibin(Op_ISub, a, c); break;         // s_sub_u32
+                case 0x0E: d = b.ibin(Op_BitwiseAnd, a, c); break;   // s_and_b32
+                case 0x10: d = b.ibin(Op_BitwiseOr,  a, c); break;   // s_or_b32
+                case 0x12: d = b.ibin(Op_BitwiseXor, a, c); break;   // s_xor_b32
+                case 0x1E: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_lshl_b32
+                             d = b.ibin(Op_ShiftLeftLogical, a, sh); break; }        // dst = src0 << (src1 & 31)
+                case 0x26: d = b.ibin(Op_IMul, a, c); break;         // s_mul_i32 (low 32 bits)
+                default: ok = false;
+            }
+            return true;
+        }
         case Rdna2Format::VOP1: {
             uint32_t a = val(in.src[0]); uint32_t& d = vreg[in.dst.value];
             switch (in.opcode) {
@@ -345,18 +379,17 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
 
     SpirvCompute b;
     b.begin(num_inputs ? num_inputs : 1);
-    std::unordered_map<int, uint32_t> vreg;                 // VGPR -> current SSA bits id
-    uint32_t vcc = b.bfalse();                              // VCC: current bool condition
-    for (uint32_t k = 0; k < num_inputs; k++) vreg[(int)k] = b.load_input(k);
+    RegState rs; rs.vcc = b.bfalse();
+    for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
 
     for (const auto& in : ins) {
         if (in.is_end) break;
         bool ok = true;
-        if (!emit_alu(b, vreg, vcc, in, ok) || !ok) return {};   // compute kernels are pure VALU
+        if (!emit_alu(b, rs, in, ok) || !ok) return {};   // compute kernels are pure ALU
     }
 
-    auto it = vreg.find((int)out_vgpr);
-    b.store_output(it == vreg.end() ? b.uconst(0) : it->second);
+    auto it = rs.vreg.find((int)out_vgpr);
+    b.store_output(it == rs.vreg.end() ? b.uconst(0) : it->second);
     return b.finish();
 }
 
@@ -366,22 +399,21 @@ std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords) {
 
     SpirvCompute b;
     b.begin_fragment();
-    std::unordered_map<int, uint32_t> vreg;
-    uint32_t vcc = b.bfalse();
+    RegState rs; rs.vcc = b.bfalse();
     bool exported = false;
 
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt == Rdna2Format::EXP) {                    // EXP MRT0..7 -> the color output
             if (in.exp_target <= 7 && !exported) {
-                b.export_color(operand_bits(b, vreg, in, in.src[0]), operand_bits(b, vreg, in, in.src[1]),
-                               operand_bits(b, vreg, in, in.src[2]), operand_bits(b, vreg, in, in.src[3]));
+                b.export_color(operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
+                               operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
                 exported = true;
             }
             continue;   // ignore NULL / additional exports for now
         }
         bool ok = true;
-        if (!emit_alu(b, vreg, vcc, in, ok) || !ok) return {};
+        if (!emit_alu(b, rs, in, ok) || !ok) return {};
     }
     if (!exported) return {};
     return b.finish();
@@ -393,23 +425,22 @@ std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords) {
 
     SpirvCompute b;
     b.begin_vertex();
-    std::unordered_map<int, uint32_t> vreg;
-    uint32_t vcc = b.bfalse();
-    vreg[0] = b.load_vertex_index();     // VS ABI: v0 = vertex index
+    RegState rs; rs.vcc = b.bfalse();
+    rs.vreg[0] = b.load_vertex_index();     // VS ABI: v0 = vertex index
     bool exported = false;
 
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt == Rdna2Format::EXP) {                    // EXP POS0..3 -> gl_Position
             if (in.exp_target >= 12 && in.exp_target <= 15 && !exported) {
-                b.export_position(operand_bits(b, vreg, in, in.src[0]), operand_bits(b, vreg, in, in.src[1]),
-                                  operand_bits(b, vreg, in, in.src[2]), operand_bits(b, vreg, in, in.src[3]));
+                b.export_position(operand_bits(b, rs, in, in.src[0]), operand_bits(b, rs, in, in.src[1]),
+                                  operand_bits(b, rs, in, in.src[2]), operand_bits(b, rs, in, in.src[3]));
                 exported = true;
             }
             continue;   // ignore PARAM exports (varyings) for now
         }
         bool ok = true;
-        if (!emit_alu(b, vreg, vcc, in, ok) || !ok) return {};
+        if (!emit_alu(b, rs, in, ok) || !ok) return {};
     }
     if (!exported) return {};
     return b.finish();
