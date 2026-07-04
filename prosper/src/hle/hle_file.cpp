@@ -122,6 +122,12 @@ void register_file_hle() {
     R("sceKernelOpen", f_open);   R("sceKernelClose", f_close);  R("sceKernelRead", f_read);
     R("sceKernelWrite", f_write); R("sceKernelLseek", f_lseek);  R("sceKernelStat", f_stat);
     R("sceKernelFstat", f_fstat);
+    // Low-level POSIX wrappers with the internal leading-underscore names. Real libc.prx implements
+    // its stdio/file layer (fopen/fwrite/...) on top of these, so they MUST be real (were stubbed to
+    // 0). Same handlers/host-fd space as the unprefixed ones, so libc's fds stay consistent.
+    R("_open", f_open);    R("_close", f_close);  R("_read", f_read);    R("_write", f_write);
+    R("_lseek", f_lseek);  R("_stat", f_stat);    R("_fstat", f_fstat);  R("_access", f_access);
+    R("_pread", f_pread);  R("_pwrite", f_pwrite);
     // directory / unlink (real host ops, /app0-translated)
     R("pread", f_pread);          R("sceKernelPread", f_pread);
     R("pwrite", f_pwrite);        R("sceKernelPwrite", f_pwrite);
