@@ -81,6 +81,10 @@ std::optional<Module> Module::load(const std::string& path, std::string* err) {
         if (p.p_filesz > 0 && (p.p_type == PT_LOAD || p.p_type == PT_DYNAMIC ||
                                p.p_type == PT_SCE_PROCPARAM || p.p_type == PT_TLS))
             m.loads.push_back(s);
+        if (p.p_type == PT_TLS) {   // TLS init template: tdata (filesz) + tbss (memsz-filesz)
+            m.tls_vaddr = p.p_vaddr; m.tls_filesz = p.p_filesz;
+            m.tls_memsz = p.p_memsz; m.tls_align = p.p_align;
+        }
     }
     // Find DYNAMIC
     const Segment* dynseg = nullptr;
@@ -216,7 +220,20 @@ size_t apply_relocations(const Module& m, LoadedImage& img) {
             case R_X86_64_64:        if (write64(va, sym_addr(r.sym) + (uint64_t)r.addend)) applied++; break;
             case R_X86_64_GLOB_DAT:
             case R_X86_64_JUMP_SLOT:  if (write64(va, sym_addr(r.sym))) applied++; break;
-            // TLS relocs handled at M3 when TLS blocks exist; skip for now.
+            // TLS (general-dynamic model, used by .prx shared libs like libc.prx). A GOT
+            // tls_index{module_id, offset} pair is patched by DTPMOD64 + DTPOFF64; the guest then
+            // calls __tls_get_addr(tls_index*) which our HLE resolves to a per-thread block. We
+            // resolve the module id to THIS module's assigned id (correct for module-local TLS,
+            // which is the common case for libc's own errno/locale state); a cross-module TLS ref
+            // (import symbol) would need the defining module's id — logged as unhandled if it ever
+            // appears. DTPOFF64 = the TLS symbol's offset within its module's TLS block.
+            case R_X86_64_DTPMOD64:  if (write64(va, img.tls_modid)) applied++; break;
+            case R_X86_64_DTPOFF64: {
+                uint64_t off = (r.sym && r.sym < m.symbols.size()) ? m.symbols[r.sym].value
+                                                                   : (uint64_t)r.addend;
+                if (write64(va, off)) applied++;
+                break;
+            }
             default: break;
         }
     }

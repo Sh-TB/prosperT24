@@ -62,6 +62,8 @@ struct Module {
     uint64_t e_entry = 0;
     // Module initialization (C++ global ctors etc.): DT_INIT + DT_INIT_ARRAY.
     uint64_t init_va = 0, init_array_va = 0, init_array_sz = 0;
+    // Thread-local storage template (PT_TLS): init image + sizes for per-thread block allocation.
+    uint64_t tls_vaddr = 0, tls_filesz = 0, tls_memsz = 0, tls_align = 0;
 
     std::vector<Segment> segments;  // all program headers (file-backed ones have file_off)
     std::vector<Segment> loads;     // just the ones that occupy VA space
@@ -98,6 +100,7 @@ struct LoadedImage {
     struct Prot { uint64_t vaddr, size; bool r, w, x; };
     std::vector<Prot> prot;            // per-segment protections (for the real backend)
     uint64_t entry = 0;                // guest entry address (base + e_entry)
+    uint32_t tls_modid = 0;            // TLS module id (assigned by the linker; 0 = none)
 
     // stub binding: import sym_index -> assigned guest address (trap stub)
     std::map<uint32_t, uint64_t> import_addr;

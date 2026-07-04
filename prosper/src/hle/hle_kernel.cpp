@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
+#include <unordered_map>
 #ifdef __linux__
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -358,8 +360,40 @@ HLE(k_dlsym) {   // sceKernelDlsym(SceKernelModule handle, const char* name, voi
     return 0x80020003;   // SCE_KERNEL_ERROR_ESRCH
 }
 
+// --- General-dynamic TLS (__tls_get_addr) for loaded modules (e.g. the real libc.prx). ----------
+// PS5 .prx shared libs access thread-locals via __tls_get_addr(tls_index*), where the tls_index
+// {module_id, offset} was patched by our DTPMOD64/DTPOFF64 relocs. We keep a per-thread block per
+// module id, lazily allocated from the module's PT_TLS template (memsz block, filesz copied from
+// the init image, tbss zeroed). This is the general-dynamic model — no %fs needed (that's only for
+// the main exe's initial-exec TLS, which the current boot already tolerates).
+namespace { std::vector<TlsModuleDesc> g_tls_mods; }
+void set_tls_modules(const TlsModuleDesc* descs, size_t count) {
+    g_tls_mods.assign(descs, descs + count);
+}
+HLE(k_tls_get_addr) {   // __tls_get_addr(tls_index* ti): ti[0]=module id, ti[1]=offset-in-block
+    const uint64_t* ti = (const uint64_t*)(uintptr_t)a0;
+    if (!ti) return 0;
+    uint64_t modid = ti[0], off = ti[1];
+    thread_local std::unordered_map<uint64_t, void*> t_dtv;   // per-thread: module id -> block
+    auto it = t_dtv.find(modid);
+    if (it != t_dtv.end()) return (uint64_t)(uintptr_t)it->second + off;
+    size_t memsz = 64, filesz = 0; uint64_t init_va = 0;
+    if (modid < g_tls_mods.size()) {
+        memsz  = g_tls_mods[modid].memsz ? g_tls_mods[modid].memsz : 64;
+        filesz = g_tls_mods[modid].filesz;
+        init_va = g_tls_mods[modid].init_va;
+    }
+    void* blk = calloc(1, memsz);
+    if (init_va && filesz) memcpy(blk, (const void*)(uintptr_t)init_va, filesz);
+    t_dtv[modid] = blk;
+    return (uint64_t)(uintptr_t)blk + off;
+}
+
 void register_kernel_hle() {
     #define R(str, fn) Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
+    // ELF TLS accessor used by loaded .prx modules (raw NID + name).
+    Hle::register_fn("vNe1w4diLCs", (HleFn)k_tls_get_addr, "__tls_get_addr");
+    R("__tls_get_addr", k_tls_get_addr);
     R("sceKernelInstallExceptionHandler", k_install_exc_handler);
     R("sceKernelRaiseException", k_raise_exception);
     R("sceKernelDlsym", k_dlsym);
