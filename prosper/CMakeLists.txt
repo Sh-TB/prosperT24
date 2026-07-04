@@ -136,6 +136,11 @@ if(TARGET prosper_core)
       add_executable(test_rdna2_to_spirv tests/test_rdna2_to_spirv.cpp)
       target_link_libraries(test_rdna2_to_spirv PRIVATE prosper_core Vulkan::Vulkan)
       add_test(NAME rdna2_to_spirv_exec COMMAND test_rdna2_to_spirv)
+
+      # Render a triangle whose PIXEL shader is recompiled from RDNA2 (EXP MRT0 -> color output).
+      add_executable(test_recompiled_fragment tests/test_recompiled_fragment.cpp)
+      target_link_libraries(test_recompiled_fragment PRIVATE prosper_core Vulkan::Vulkan)
+      add_test(NAME recompiled_fragment_render COMMAND test_recompiled_fragment)
       message(STATUS "Vulkan found (${Vulkan_LIBRARY}) — offscreen graphics harness enabled")
     else()
       message(STATUS "Vulkan not found — skipping offscreen graphics harness")

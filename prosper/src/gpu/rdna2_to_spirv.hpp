@@ -22,4 +22,8 @@ namespace prosper::gpu {
 std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      uint32_t num_inputs, uint32_t out_vgpr);
 
+// Recompile a pixel/fragment shader to a fragment SPIR-V module: run the VALU, and on EXP to an MRT
+// target write vec4(src0..3) to the location-0 color output. Returns {} if unsupported / no export.
+std::vector<uint32_t> recompile_fragment(const uint32_t* code, size_t dwords);
+
 } // namespace prosper::gpu
