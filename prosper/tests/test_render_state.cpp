@@ -5,6 +5,7 @@
 #include "../src/hle/dispatch.hpp"
 #include "../src/gpu/command_processor.hpp"
 #include "../src/gpu/render_state.hpp"
+#include "../src/gpu/vk_translate.hpp"
 #include "../src/gpu/pm4_registers.hpp"
 #include <cstdio>
 #include <cstdint>
@@ -37,9 +38,10 @@ int main() {
     ShaderReg cx_regs[] = {
         { P::CB_COLOR0_BASE,     0x00100000u },
         { P::CB_COLOR0_BASE_EXT, 0x00000012u },
-        { P::CB_COLOR0_INFO,     0x0000000Au },   // FORMAT (bits[4:0]) = 0x0A
+        { P::CB_COLOR0_INFO,     0x0000000Au << 2 },   // FORMAT at bits[6:2] -> value 0x0A
         { P::VGT_PRIMITIVE_TYPE, 0x00000004u },   // PRIM_TYPE = 4
-        { P::DB_DEPTH_CONTROL,   0x12345678u },
+        // DB_DEPTH_CONTROL: Z_ENABLE(bit1)|Z_WRITE_ENABLE(bit2)|ZFUNC=4(bits[6:4]) = 0x46
+        { P::DB_DEPTH_CONTROL,   0x00000046u },
         { P::CB_COLOR_CONTROL,   0x00CC0010u },
         { P::CB_BLEND0_CONTROL,  0xABCDEF01u },
         { P::CB_TARGET_MASK,     0x0000000Fu },
@@ -67,8 +69,17 @@ int main() {
     CHECK(rs.color0_base == rdna2_addr(0x00100000u, 0x12u), "color0_base = (BASE<<8)|(EXT<<40)");
     CHECK(rs.color0_format == 0x0Au, "color0_format = 0x0A (FORMAT field)");
     CHECK(rs.prim_type == 0x04u, "prim_type = 4");
+    CHECK(vk_topology(rs.prim_type) == VkTopology::TriangleList, "prim_type 4 -> VK TriangleList");
+    CHECK(vk_topology(6) == VkTopology::TriangleStrip && vk_topology(1) == VkTopology::PointList,
+          "topology map: 6 -> TriangleStrip, 1 -> PointList");
 
-    CHECK(rs.db_depth_control  == 0x12345678u, "db_depth_control raw preserved");
+    // Decoded DB_DEPTH_CONTROL fields (value 0x46).
+    CHECK(rs.z_enable, "z_enable = true (bit 1)");
+    CHECK(rs.z_write_enable, "z_write_enable = true (bit 2)");
+    CHECK(!rs.stencil_enable, "stencil_enable = false (bit 0)");
+    CHECK(rs.zfunc == 4u, "zfunc = 4 (bits [6:4])");
+
+    CHECK(rs.db_depth_control  == 0x00000046u, "db_depth_control raw preserved");
     CHECK(rs.cb_color_control  == 0x00CC0010u, "cb_color_control raw preserved");
     CHECK(rs.cb_blend0_control == 0xABCDEF01u, "cb_blend0_control raw preserved");
     CHECK(rs.cb_target_mask    == 0x0000000Fu, "cb_target_mask raw preserved");

@@ -24,10 +24,17 @@ struct RenderState {
     uint64_t color0_base   = 0;   // byte address (CB_COLOR0_BASE + BASE_EXT)
     uint32_t color0_format = 0;   // CB_COLOR0_INFO.FORMAT  (bits [4:0])
 
-    // Primitive topology (VGT_PRIMITIVE_TYPE.PRIM_TYPE, bits [5:0]).
+    // Primitive topology (VGT_PRIMITIVE_TYPE.PRIM_TYPE).
     uint32_t prim_type = 0;
 
-    // Raw state registers — bit layouts decoded by the Vulkan backend later (kept faithful here).
+    // Depth/stencil test state, decoded from DB_DEPTH_CONTROL (field shifts/masks from pm4_registers.hpp,
+    // matching Kyty hw_ctx_set_depth_control).
+    bool     z_enable       = false;
+    bool     z_write_enable = false;
+    bool     stencil_enable = false;
+    uint32_t zfunc          = 0;      // compare op, 0..7 (RDNA2 order == VkCompareOp order)
+
+    // Raw state registers — remaining bit layouts decoded by the Vulkan backend later (kept faithful).
     uint32_t db_depth_control  = 0;   // DB_DEPTH_CONTROL
     uint32_t cb_color_control  = 0;   // CB_COLOR_CONTROL
     uint32_t cb_blend0_control = 0;   // CB_BLEND0_CONTROL

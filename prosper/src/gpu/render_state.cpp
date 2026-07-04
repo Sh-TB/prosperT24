@@ -31,13 +31,20 @@ RenderState extract_render_state(const GpuState& st) {
 
     // Color MRT 0 (context register file).
     rs.color0_base   = addr_of(rd(st.cx, P::CB_COLOR0_BASE), rd(st.cx, P::CB_COLOR0_BASE_EXT));
-    rs.color0_format = rd(st.cx, P::CB_COLOR0_INFO) & P::CB_COLOR0_INFO_FORMAT_MASK;   // FORMAT @ bit 0
+    rs.color0_format = PM4_FIELD(rd(st.cx, P::CB_COLOR0_INFO), CB_COLOR0_INFO, FORMAT);
 
-    // Primitive topology (PRIM_TYPE is bits [5:0] of VGT_PRIMITIVE_TYPE).
-    rs.prim_type = rd(st.cx, P::VGT_PRIMITIVE_TYPE) & 0x3fu;
+    // Primitive topology.
+    rs.prim_type = PM4_FIELD(rd(st.cx, P::VGT_PRIMITIVE_TYPE), VGT_PRIMITIVE_TYPE, PRIM_TYPE);
+
+    // Depth/stencil test state (decoded fields of DB_DEPTH_CONTROL).
+    const uint32_t dc = rd(st.cx, P::DB_DEPTH_CONTROL);
+    rs.stencil_enable = PM4_FIELD(dc, DB_DEPTH_CONTROL, STENCIL_ENABLE) != 0;
+    rs.z_enable       = PM4_FIELD(dc, DB_DEPTH_CONTROL, Z_ENABLE) != 0;
+    rs.z_write_enable = PM4_FIELD(dc, DB_DEPTH_CONTROL, Z_WRITE_ENABLE) != 0;
+    rs.zfunc          = PM4_FIELD(dc, DB_DEPTH_CONTROL, ZFUNC);
 
     // Faithful raw state registers.
-    rs.db_depth_control  = rd(st.cx, P::DB_DEPTH_CONTROL);
+    rs.db_depth_control  = dc;
     rs.cb_color_control  = rd(st.cx, P::CB_COLOR_CONTROL);
     rs.cb_blend0_control = rd(st.cx, P::CB_BLEND0_CONTROL);
     rs.cb_target_mask    = rd(st.cx, P::CB_TARGET_MASK);
