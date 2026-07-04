@@ -54,6 +54,12 @@ if(TARGET prosper_core)
   target_link_libraries(test_stat PRIVATE prosper_core)
   add_test(NAME sce_stat_layout COMMAND test_stat)
 
+  # PM4 command-stream decoder (front of the CommandProcessor): decode a Dcb built by the AGC
+  # Dcb functions and assert the ops. Pure/cross-platform, no game dump needed.
+  add_executable(test_pm4_decode tests/test_pm4_decode.cpp)
+  target_link_libraries(test_pm4_decode PRIVATE prosper_core)
+  add_test(NAME pm4_decode_stream COMMAND test_pm4_decode)
+
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux only).
   if(UNIX AND NOT APPLE)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
