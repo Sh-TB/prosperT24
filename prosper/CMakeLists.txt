@@ -60,6 +60,11 @@ if(TARGET prosper_core)
   target_link_libraries(test_pm4_decode PRIVATE prosper_core)
   add_test(NAME pm4_decode_stream COMMAND test_pm4_decode)
 
+  # CommandProcessor apply stage: replay a decoded stream into a GpuState (register files + draws).
+  add_executable(test_command_processor tests/test_command_processor.cpp)
+  target_link_libraries(test_command_processor PRIVATE prosper_core)
+  add_test(NAME command_processor_apply COMMAND test_command_processor)
+
   # M2+: real memory mapping, trap, boot, and the boot-trace debug tool (Linux only).
   if(UNIX AND NOT APPLE)
     add_executable(boot_trace tools/boot_trace/boot_trace.cpp)
