@@ -100,6 +100,37 @@ initializers to construct valid GPU objects (correctness-first — no plausible-
 - Graphics libs are sparsely documented; most NIDs don't resolve to names — reverse-engineer from
   call args (`PROSPER_GFXLOG`) and `build-linux/tools/pltm` (maps a module GOT offset → NID).
 
+## THE BOOT BLOCKER (precisely located, 2026-07): `+kSrjIVxKFE` = AGC context init
+
+The boot faults at `eboot+0x3b5ea6` inside a GPU register-setting routine. Full chain, traced under gdb:
+
+- During `GfxDevicePS5` graphics init (a `CreateWorkload`-style fn at `eboot+0x14dd900`), the game
+  computes its **register context = device+0x48** (embedded object) and calls `+kSrjIVxKFE(context)`
+  as the very first operation on it (`eboot+0x14dda7c` → thunk `eboot+0x3ae7d0` → PLT `eboot+0x19b4730`
+  → GOT `+0x1d95858`).
+- That GOT slot resolves to **our stub** (`0x600003140`) which tail-jumps to `glog_thunk<14>` —
+  i.e. `+kSrjIVxKFE` is `kAgcNids[14]`, currently an **observe-only logger that returns 0**.
+- So the context is never initialized: it stays fully zeroed. `[context+0x08]` (the register-index→
+  hardware-slot *classify table*), `[context+0x10]`/`[context+0x18]` (the two register-bank output
+  buffers) are all null.
+- The following register-set loop (`eboot+0x3afb90`, reached via thunk `eboot+0x3a7b60`) calls the
+  classifier `eboot+0x3b5ea0`: `classify(table=[context+8], sel, key) = (key < table.limit16[sel]) ?
+  table.subarray[sel][key] : 0x7fff`, where the table has 16-bit `limit[sel]` at `+0x2e` and
+  `subarray*[sel]` at `+0x08`. With `table==NULL` it reads `[0x30]` → SIGSEGV at addr `0x30`.
+
+**Fix = implement `+kSrjIVxKFE` as the real AGC register-context constructor**: allocate the two
+register banks, install `[context+0x10]`/`[context+0x18]`, and install a valid classify table at
+`[context+0x08]` mapping (register-set selector, SDK register index) → hardware slot. The register
+offsets for that mapping are exactly the data now vendored in `agc_reg_defaults.cpp` (the ported
+Kyty `RegisterDefaults`). Note: this AGC code is **statically linked into eboot** — only the leaf
+SDK entrypoints like `+kSrjIVxKFE` are imports (PLT/GOT), which is why implementing that one import
+unblocks the whole internal register path.
+
+(Superseded theories, for the record: this is NOT a `std::ctype`/`std::locale` facet issue — the
+classifier is hit exactly once, not thousands of times — and NOT the `GetRegisterDefaults2` result;
+wiring real RegisterDefaults did not move the fault, confirming the context table is installed by
+`+kSrjIVxKFE`, not read from `GetRegisterDefaults2` here.)
+
 ## Recommended implementation order
 
 1. **Real unified memory.** Make GPU allocations CPU/GPU-VA *aliased*: when the guest maps direct

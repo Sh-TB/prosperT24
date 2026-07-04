@@ -39,19 +39,14 @@ void set_gfx_call_counter(volatile int* counter) { g_gfx_counter = counter; }
 // sceAgcGraphicsGetRegisterDefaults2 / ...Internal (NIDs 2JtWUUiYBXs / wRbq6ZjNop4). Per Kyty
 // (Graphics.cpp:766, 1307), these return a RegisterDefaults table the game reads to seed GPU register
 // state. Layout: tbl0/1/2/3 (ShaderRegister** arrays), unknown[2], index table, count@0x38. Returning
-// a zeroed buffer (old behavior) gave null table pointers -> the game's register-default walk faulted.
-// We return a real, structurally-valid RegisterDefaults; count=0 => the game applies no defaults yet
-// (correct-enough to get past the null-deref; real default tables can be ported from Kyty later).
-namespace {
-struct AgcRegisterDefaults {
-    const void* tbl0; const void* tbl1; const void* tbl2; const void* tbl3;
-    uint64_t unknown[2]; const void* index_tbl; uint32_t count; uint32_t pad;
-};
-uint32_t g_agc_empty_tbl[64] = {0};                          // non-null, mapped, zeroed
-AgcRegisterDefaults g_agc_regdefaults = {
-    g_agc_empty_tbl, g_agc_empty_tbl, g_agc_empty_tbl, nullptr, {0, 0}, g_agc_empty_tbl, 0, 0 };
-}
-HLE(g_agc_regdefs) { gfx_tick(); return (uint64_t)(uintptr_t)&g_agc_regdefaults; }  // GetRegisterDefaults2[Internal]
+// an empty (count=0) table gave the game nothing to build its internal register-offset table from, so
+// Unity's Gen5 init left that table null and a later register lookup null-derefed (eboot+0x3b5ea6).
+// We now return the REAL default tables (127 cx+sh+uc registers), vendored from Kyty in
+// agc_reg_defaults.cpp, so the game can build a populated register-offset table.
+extern "C" void* prosper_agc_reg_defaults(unsigned int ver);           // -> g_reg_defaults1 (127 regs)
+extern "C" void* prosper_agc_reg_defaults_internal(unsigned int ver);  // -> g_reg_defaults2 (21 regs)
+HLE(g_agc_regdefs)     { gfx_tick(); return (uint64_t)(uintptr_t)prosper_agc_reg_defaults((unsigned)a0); }
+HLE(g_agc_regdefs_int) { gfx_tick(); return (uint64_t)(uintptr_t)prosper_agc_reg_defaults_internal((unsigned)a0); }
 
 // --- libSceVideoOut (display / frame presentation). Headless: accept opens/flips and simulate
 // flip completion so the game's render loop advances (submit -> wait completion -> submit next).
@@ -146,8 +141,8 @@ void register_graphics_hle() {
     #define RN(nid, fn) Hle::register_fn(nid, (HleFn)(fn), nid)   // raw NID (graphics libs undocumented)
     #define R(str, fn)  Hle::register_fn(nid_hash(str), (HleFn)(fn), str)
     // libSceAgc getters whose results the guest dereferences → return stable zeroed objects.
-    RN("2JtWUUiYBXs", g_agc_regdefs);   // GraphicsGetRegisterDefaults2
-    RN("wRbq6ZjNop4", g_agc_regdefs);   // GraphicsGetRegisterDefaults2Internal
+    RN("2JtWUUiYBXs", g_agc_regdefs);       // GraphicsGetRegisterDefaults2       -> g_reg_defaults1
+    RN("wRbq6ZjNop4", g_agc_regdefs_int);   // GraphicsGetRegisterDefaults2Internal -> g_reg_defaults2
     // All traced libSceAgc/AgcDriver NIDs → per-NID logging thunks (still return 0; observable only).
     register_agc_tracers(std::make_index_sequence<kAgcNidCount>{});
     // libSceVideoOut display / flip
