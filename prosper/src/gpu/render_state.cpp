@@ -30,8 +30,11 @@ RenderState extract_render_state(const GpuState& st) {
     rs.hs_addr = addr_of(rd(st.sh, P::SPI_SHADER_PGM_LO_HS), rd(st.sh, P::SPI_SHADER_PGM_HI_HS));
 
     // Color MRT 0 (context register file).
-    rs.color0_base   = addr_of(rd(st.cx, P::CB_COLOR0_BASE), rd(st.cx, P::CB_COLOR0_BASE_EXT));
-    rs.color0_format = PM4_FIELD(rd(st.cx, P::CB_COLOR0_INFO), CB_COLOR0_INFO, FORMAT);
+    rs.color0_base            = addr_of(rd(st.cx, P::CB_COLOR0_BASE), rd(st.cx, P::CB_COLOR0_BASE_EXT));
+    const uint32_t cinfo       = rd(st.cx, P::CB_COLOR0_INFO);
+    rs.color0_format           = PM4_FIELD(cinfo, CB_COLOR0_INFO, FORMAT);
+    rs.color0_number_type      = PM4_FIELD(cinfo, CB_COLOR0_INFO, NUMBER_TYPE);
+    rs.color0_comp_swap        = PM4_FIELD(cinfo, CB_COLOR0_INFO, COMP_SWAP);
 
     // Primitive topology.
     rs.prim_type = PM4_FIELD(rd(st.cx, P::VGT_PRIMITIVE_TYPE), VGT_PRIMITIVE_TYPE, PRIM_TYPE);

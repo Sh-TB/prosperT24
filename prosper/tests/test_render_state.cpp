@@ -38,7 +38,8 @@ int main() {
     ShaderReg cx_regs[] = {
         { P::CB_COLOR0_BASE,     0x00100000u },
         { P::CB_COLOR0_BASE_EXT, 0x00000012u },
-        { P::CB_COLOR0_INFO,     0x0000000Au << 2 },   // FORMAT at bits[6:2] -> value 0x0A
+        // CB_COLOR0_INFO: FORMAT=0xA (bits[6:2]) | NUMBER_TYPE=6/SRGB (bits[10:8]) | COMP_SWAP=1/BGRA (bits[12:11])
+        { P::CB_COLOR0_INFO,     (0x0Au << 2) | (6u << 8) | (1u << 11) },
         { P::VGT_PRIMITIVE_TYPE, 0x00000004u },   // PRIM_TYPE = 4
         // DB_DEPTH_CONTROL: Z_ENABLE(bit1)|Z_WRITE_ENABLE(bit2)|ZFUNC=4(bits[6:4]) = 0x46
         { P::DB_DEPTH_CONTROL,   0x00000046u },
@@ -68,6 +69,11 @@ int main() {
 
     CHECK(rs.color0_base == rdna2_addr(0x00100000u, 0x12u), "color0_base = (BASE<<8)|(EXT<<40)");
     CHECK(rs.color0_format == 0x0Au, "color0_format = 0x0A (FORMAT field)");
+    CHECK(rs.color0_number_type == 6u, "color0_number_type = 6 (SRGB)");
+    CHECK(rs.color0_comp_swap == 1u, "color0_comp_swap = 1 (BGRA)");
+    CHECK(vk_color_format(rs.color0_format, rs.color0_number_type, rs.color0_comp_swap)
+              == VkFormat::B8G8R8A8_SRGB, "color format -> VK B8G8R8A8_SRGB");
+    CHECK(vk_color_format(0x0Au, 0u, 0u) == VkFormat::R8G8B8A8_UNORM, "0xA/UNORM/RGBA -> R8G8B8A8_UNORM");
     CHECK(rs.prim_type == 0x04u, "prim_type = 4");
     CHECK(vk_topology(rs.prim_type) == VkTopology::TriangleList, "prim_type 4 -> VK TriangleList");
     CHECK(vk_topology(6) == VkTopology::TriangleStrip && vk_topology(1) == VkTopology::PointList,
@@ -78,6 +84,7 @@ int main() {
     CHECK(rs.z_write_enable, "z_write_enable = true (bit 2)");
     CHECK(!rs.stencil_enable, "stencil_enable = false (bit 0)");
     CHECK(rs.zfunc == 4u, "zfunc = 4 (bits [6:4])");
+    CHECK(vk_compare_op(rs.zfunc) == 4u, "zfunc 4 -> VkCompareOp GREATER (1:1)");
 
     CHECK(rs.db_depth_control  == 0x00000046u, "db_depth_control raw preserved");
     CHECK(rs.cb_color_control  == 0x00CC0010u, "cb_color_control raw preserved");

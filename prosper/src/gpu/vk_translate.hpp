@@ -23,4 +23,22 @@ enum class VkTopology : uint32_t {
 // to PointList (a safe, visible default) rather than asserting, so an unexpected stream still runs.
 VkTopology vk_topology(uint32_t prim_type);
 
+// Selected values == VkFormat enumerators (VK_FORMAT_UNDEFINED == 0).
+enum class VkFormat : uint32_t {
+    Undefined     = 0,
+    R8G8B8A8_UNORM = 37,
+    R8G8B8A8_SRGB  = 43,
+    B8G8R8A8_UNORM = 44,
+    B8G8R8A8_SRGB  = 50,
+};
+
+// Map a CB_COLOR surface (FORMAT, NUMBER_TYPE, COMP_SWAP) triple to a VkFormat. Follows Kyty's
+// GraphicsRender.cpp RenderTextureFormat decode; currently covers the 8_8_8_8 (format 0xA) surfaces
+// the target uses (RGBA/BGRA × UNORM/SRGB). Returns Undefined for not-yet-mapped surfaces.
+VkFormat vk_color_format(uint32_t format, uint32_t number_type, uint32_t comp_swap);
+
+// RDNA2 DB_DEPTH_CONTROL.ZFUNC enumerates compare ops in the SAME order as VkCompareOp
+// (0=NEVER,1=LESS,2=EQUAL,3=LEQUAL,4=GREATER,5=NOTEQUAL,6=GEQUAL,7=ALWAYS), so the value maps 1:1.
+inline uint32_t vk_compare_op(uint32_t zfunc) { return zfunc & 0x7u; }
+
 } // namespace prosper::gpu

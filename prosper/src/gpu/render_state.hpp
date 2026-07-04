@@ -20,9 +20,11 @@ struct RenderState {
     uint64_t es_addr = 0;   // export/vertex (…_ES)
     uint64_t hs_addr = 0;   // hull/tess (…_HS)
 
-    // Color MRT 0.
-    uint64_t color0_base   = 0;   // byte address (CB_COLOR0_BASE + BASE_EXT)
-    uint32_t color0_format = 0;   // CB_COLOR0_INFO.FORMAT  (bits [4:0])
+    // Color MRT 0. format/number_type/comp_swap together select the VkFormat (see vk_translate).
+    uint64_t color0_base        = 0;   // byte address (CB_COLOR0_BASE + BASE_EXT)
+    uint32_t color0_format      = 0;   // CB_COLOR0_INFO.FORMAT       (surface format)
+    uint32_t color0_number_type = 0;   // CB_COLOR0_INFO.NUMBER_TYPE  (UNORM/SRGB/…)
+    uint32_t color0_comp_swap   = 0;   // CB_COLOR0_INFO.COMP_SWAP    (channel order: RGBA/BGRA/…)
 
     // Primitive topology (VGT_PRIMITIVE_TYPE.PRIM_TYPE).
     uint32_t prim_type = 0;
