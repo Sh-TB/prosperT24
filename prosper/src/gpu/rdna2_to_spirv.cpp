@@ -10712,21 +10712,24 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
                 b.lds_store(b.ibin(Op_IAdd, idx0, b.uconst(1)), vread(in.src[1].value + 1),
                             rs.exec_narrowed, rs.exec);
-                b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec);
-                b.lds_store(b.ibin(Op_IAdd, idx1, b.uconst(1)), vread(in.src[2].value + 1),
-                            rs.exec_narrowed, rs.exec);
+                // OFFSET0 == OFFSET1 selects ONE address: the hardware performs a single write and
+                // uses DATA0 only (RDNA2 ISA 70648 §10.4.3). Writing DATA1 as well leaves the later
+                // store winning, so a subsequent LDS read observes DATA1 where hardware preserves
+                // DATA0 -- silent wrong data rather than a fault. The ds_write2_b32 case above
+                // already guards this; the 64-bit variant did not (#1473).
+                if ((in.literal & 0xFFu) != ((in.literal >> 8) & 0xFFu)) {
+                    b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec);
+                    b.lds_store(b.ibin(Op_IAdd, idx1, b.uconst(1)), vread(in.src[2].value + 1),
+                                rs.exec_narrowed, rs.exec);
+                }
                 return true;
             }
-            if (in.opcode == 0x0e) {                    // ds_write2_b32: two dwords at offset0/offset1
-                // AMD RDNA2 ISA 12.13: DATA0/1 go to ADDR + OFFSET0/1 * 4. The packed
-                // 8-bit offsets have the same layout as DS_READ2_B32 below.
-                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
-                const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst(in.literal & 0xFFu));
-                const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst((in.literal >> 8) & 0xFFu));
-                b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
-                b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec);
-                return true;
-            }
+            // NOTE: a SECOND ds_write2_b32 (0x0e) block used to sit here, unreachable because the
+            // handler above claims 0x0e first and returns. It was a duplicate carrying the
+            // PRE-FIX behaviour -- both stores, no equal-offset guard -- so the hazard was never
+            // that it ran. It was that adding any condition to the reachable block (a wave-size
+            // check, an encoding refinement) would have silently handed 0x0e to a copy with the
+            // #1473 defect still in it, and the tests would have kept passing. Deleted (#1473).
             if (in.opcode == 0x77) {                    // ds_read2_b64: two pairs at scaled offsets
                 const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
                 const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst((in.literal & 0xFFu) * 2u));
