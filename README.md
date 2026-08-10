@@ -19,15 +19,44 @@ ProsperT24 is our development fork based on the original Prosper project by matt
 
 **PPSA02929 (Dreaming Sarah)** was successfully booted through our CLI (`boot_trace`) and produced a **real rendered first frame** captured via `--capture-first-frame`.
 
+The initial first-frame capture has now been extended with a **real frame sequence** showing the boot/splash state followed by later rendered game-loading content. The CLI demonstrates continued observation of real rendered output beyond a single isolated frame.
+
 This is not a synthetic test pattern — it is actual rendered game output from the PS5 present path.
 
 ---
 
-## 📸 Captured Frame
+## 📸 First Captured Frame
 
 ![Dreaming Sarah — Real Captured Frame](assets/PPSA02929_first_frame.png)
 
 **Visual content:** Splash screen showing pixel-art teal dog character + "AIKA GAMES" logo + "RATTAL" branding text — consistent with Dreaming Sarah's actual boot screen.
+
+---
+
+## 🎬 Real Frame Sequence
+
+The CLI has now been validated beyond a single first-frame capture. For PPSA02929 / Dreaming Sarah:
+
+- **Frames 1–220** show the initial boot/splash state (RATALAIKA GAMES logo)
+- **Frames 260–600** show later loading/game-rendered content (title screen, loading progression)
+
+These are **captured runtime frames**, not synthetic test patterns.
+
+Representative captured frames:
+
+![Frame 200 — Boot/Splash](assets/frames/PPSA02929_frame_0200.png)
+
+*Frame 200: Boot/splash screen with RATALAIKA GAMES logo*
+
+![Frame 260 — Title Screen](assets/frames/PPSA02929_frame_0260.png)
+
+*Frame 260: "Dreaming Sarah" title appearing*
+
+![Frame 420 — Game Loading](assets/frames/PPSA02929_frame_0420.png)
+
+*Frame 420: Title screen with loading indicator*
+
+This demonstrates that the CLI can observe a **continuing sequence of real rendered output** from boot through game initialization.
 
 ---
 
@@ -39,6 +68,7 @@ Our fork extends Prosper's `boot_trace` tool with **frame capture diagnostics**:
 - Runtime/boot diagnostics output
 - VideoOut/present observation (3840×2160 buffers)
 - First-frame capture (`--capture-first-frame`)
+- Continued frame sequence observation
 - Real rendered-frame validation
 - Frame metadata/integrity reporting
 - **Observer-only capture** — does not modify game runtime behavior
@@ -65,12 +95,13 @@ export PROSPER_RENDER=1
 | Source | **Real rendered output** (not synthetic) |
 | Target resolution | 3840 × 2160 |
 | Format | RGBA8 (32-bit) |
-| Frame sequence | 1 |
-| Present count | 2 |
+| Frame sequence | 1 → 220+ (extended) |
+| Present count | 2+ |
 | Capture mode | Observer-only (no runtime modification) |
 | Vulkan renderer | llvmpipe (LLVM 19.1.7) |
+| Observed range | Frames 1–600+ |
 
-**All phases passed:** BUILD → BOOT → RUNTIME → REAL PRESENT → FRAME CAPTURE
+**All phases passed:** BUILD → BOOT → RUNTIME → REAL PRESENT → FRAME CAPTURE → SEQUENCE OBSERVATION
 
 ---
 
@@ -88,6 +119,6 @@ export PROSPER_RENDER=1
 
 **Evidence ID:** `EXP-CLI-FRAME-REAL-001`
 
-Full technical report, captured frame (PNG), runtime logs, metadata, and reproducibility notes are available in the release assets.
+Full technical report, captured frames (PNG), runtime logs, metadata, and reproducibility notes are available in the release assets.
 
 *Date: 2026-08-10*
