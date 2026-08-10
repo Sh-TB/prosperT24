@@ -322,6 +322,8 @@ struct SpirvCompute {
     // single descriptor, so an access chain for it takes no leading index. Kept beside `cbuf_var`
     // because every consumer of the variable also needs to know whether it is an array.
     std::map<uint32_t, uint32_t> cbuf_table_arity;
+    // binding -> user SGPR holding the descriptor index, when one is available.
+    std::map<uint32_t, uint32_t> cbuf_table_index_sgpr;
     // A two-byte guest V# can only back our u32 SSBO ABI when every use of that binding is the exact
     // one-record Uint16/Float16 path. Ordinary load/store/atomic helpers blacklist their bindings;
     // finish() emits the explicit typed zero-pad contract only for candidates with no competing use.
@@ -1911,9 +1913,44 @@ struct SpirvCompute {
     }
     // Load one dword (raw bits) from the constant/vertex buffer at descriptor `binding` at dword index
     // `idx` (SMEM). The 1-arg form keeps the legacy slot convention (0 -> binding 2, 1 -> binding 3).
+    // THE only place a storage-buffer element pointer is built. There were FOUR identical
+    // OpAccessChain sites -- cbuf_load_impl, cbuf_store's unpredicated and predicated branches, and
+    // cbuf_atomic_rtn -- and a table-indexed binding needs the leading selector in every one of them.
+    //
+    // #2474 claimed cbuf_load_impl was "the single place a buffer access chain is built" and used that
+    // as its correctness argument. It was false, and the review that caught it found three sites; the
+    // fourth turned up while fixing it. For a table-indexed binding the pointee is `OpTypeArray %Block N`,
+    // so an unfixed site does not merely read the wrong slot: `uconst(0)` consumes the ARRAY index and
+    // `idx` is then a member index into the Block, which has one member. So idx==0 yields a pointer to
+    // the runtime array against a declared `t_ptr_sb_u32` (result-type mismatch) and idx!=0 is
+    // out-of-range -- an invalid module either way. Loud rather than silent, but only where something
+    // validates; on this path nothing does yet, so it surfaces as a failed pipeline and a dropped draw.
+    //
+    // Hence one function: the sites cannot drift apart again, and a fifth caller inherits the selector
+    // rather than a stale comment promising there is only one.
+    uint32_t cbuf_element_ptr(uint32_t buf, uint32_t binding, uint32_t idx) {
+        auto arity = cbuf_table_arity.find(binding);
+        auto index_sgpr = cbuf_table_index_sgpr.find(binding);
+        uint32_t ptr = id();
+        if (arity != cbuf_table_arity.end() && index_sgpr != cbuf_table_index_sgpr.end()) {
+            const uint32_t sel = load_push_constant(index_sgpr->second);
+            // NonUniform on both the selector and the pointer, unconditionally. Measured: of
+            // PPSA04263's 51 compute launches, 5 are local=256x1x1 -- four waves per workgroup, so four
+            // EXECs and four distinct scalar indices, wave-uniform but NOT dynamically uniform across
+            // the invocation group. 43 of 51 are one wave per group, which is why the "obviously
+            // uniform" reading looks safe and is wrong. `load_push_constant` mints a fresh id per call
+            // and does not cache, so these decorations never duplicate onto one id.
+            put(deco, Op_Decorate, {sel, Dec_NonUniform});
+            putv(code, Op_AccessChain, {t_ptr_sb_u32, ptr, buf, sel, uconst(0), idx});
+            put(deco, Op_Decorate, {ptr, Dec_NonUniform});
+            return ptr;
+        }
+        putv(code, Op_AccessChain, {t_ptr_sb_u32, ptr, buf, uconst(0), idx});
+        return ptr;
+    }
     uint32_t cbuf_load_impl(uint32_t idx, uint32_t binding) {
         uint32_t buf = buf_for_binding(binding);
-        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
+        uint32_t p = cbuf_element_ptr(buf, binding, idx);
         uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
     }
     uint32_t cbuf_load(uint32_t idx, uint32_t binding = 2) {
@@ -1934,14 +1971,14 @@ struct SpirvCompute {
         cbuf_ordinary_accesses.insert(binding);
         uint32_t buf = buf_for_binding(binding);
         if (!predicated) {
-            uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
+            uint32_t p = cbuf_element_ptr(buf, binding, idx);
             put(code, Op_Store, {p, value}); return;
         }
         uint32_t then = id(), merge = id();
         put(code, Op_SelectionMerge, {merge, 0});
         put(code, Op_BranchConditional, {pred, then, merge});
         put(code, Op_Label, {then}); cur_block = then;
-        uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
+        uint32_t p = cbuf_element_ptr(buf, binding, idx);
         put(code, Op_Store, {p, value});
         put(code, Op_Branch, {merge});
         put(code, Op_Label, {merge}); cur_block = merge;
@@ -1954,7 +1991,7 @@ struct SpirvCompute {
         cbuf_ordinary_accesses.insert(binding);
         const uint32_t buf = buf_for_binding(binding);
         auto emit = [&]() {
-            uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_sb_u32, p, buf, uconst(0), idx});
+            uint32_t p = cbuf_element_ptr(buf, binding, idx);
             uint32_t result = id();
             put(code, op, {t_u32, result, p, uconst(Scope_Device),
                            uconst(MemSem_UniformAcqRel), value});
@@ -2325,8 +2362,66 @@ struct SpirvCompute {
         put(types, Op_TypeRuntimeArray, {t_rta_u, t_u32});
         put(types, Op_TypeStruct, {t_struct_u, t_rta_u});
         put(types, Op_TypePointer, {t_ptr_sb_struct_u, SC_StorageBuffer, t_struct_u});
-        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf,  SC_StorageBuffer});
-        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf1, SC_StorageBuffer});
+        // Bindings 2 and 3 are declared here rather than in the loop below, so a TABLE-INDEXED resource
+        // on either of them has to be handled here too (#2472). Before this, both were declared
+        // unconditionally as scalar buffers and then seeded into the loop's `seen` set, so an array at
+        // binding 2 or 3 was skipped and silently emitted as a single descriptor -- and since Vulkan
+        // permits a shader declaring one descriptor against a layout declaring N, that produced no
+        // error: the shader read element 0 for every index. Titles put their constant buffers on
+        // exactly these two bindings, so it was the common case that failed quietly.
+        // Both helpers below must select the SAME resource, so the predicate lives in one place. Two
+        // resources may share a binding (`declare_cbufs` does not prevent it), so a class filter on one
+        // helper and not the other can take the arity from one and the index SGPR from the other —
+        // wrong descriptor index, and quiet, because both values are individually plausible.
+        auto table_indexed_here = [](const ShaderResource& r, uint32_t binding) {
+            return r.binding == binding && r.table_index_count != 0 &&
+                   (r.cls == ResourceClass::ConstantBuffer || r.cls == ResourceClass::VertexBuffer);
+        };
+        auto table_arity_for = [&](uint32_t binding) -> uint32_t {
+            if (!rt) return 0;
+            for (const auto& r : rt->resources)
+                if (table_indexed_here(r, binding)) return r.table_index_count;
+            return 0;
+        };
+        auto index_sgpr_for = [&](uint32_t binding) -> uint32_t {
+            if (!rt) return 0xFFFFFFFFu;
+            for (const auto& r : rt->resources)
+                if (table_indexed_here(r, binding)) return r.table_index_sgpr;
+            return 0xFFFFFFFFu;
+        };
+        // Declare `binding`'s variable as an array of the Block type, reusing the id already decorated
+        // for it, so its set/binding decorations above stay correct.
+        auto declare_as_array = [&](uint32_t binding, uint32_t var, uint32_t arity) {
+            constexpr uint32_t kMaxPlausibleArity = 1u << 16;
+            declare_descriptor_indexing();
+            const uint32_t arr = id();
+            if (arity > kMaxPlausibleArity) put(types, Op_TypeRuntimeArray, {arr, t_struct_u});
+            else                            put(types, Op_TypeArray, {arr, t_struct_u, uconst(arity)});
+            const uint32_t arr_ptr = id();
+            put(types, Op_TypePointer, {arr_ptr, SC_StorageBuffer, arr});
+            put(types, Op_Variable, {arr_ptr, var, SC_StorageBuffer});
+            cbuf_table_arity[binding] = arity;
+            const uint32_t sgpr = index_sgpr_for(binding);
+            if (sgpr != 0xFFFFFFFFu) cbuf_table_index_sgpr[binding] = sgpr;
+        };
+        const uint32_t arity2 = table_arity_for(2), arity3 = table_arity_for(3);
+        // NOTE on the fallback: `buf_for_binding` returns `v_cbuf` for a binding it does not know. If
+        // binding 2 is an array, that fallback yields an array-typed variable, and an access chain built
+        // for a scalar pointee against it is malformed SPIR-V. It is NOT caught at emission: `put`/`putv`
+        // (:383, :386) are a word assembler — they push a length word and the raw ids and type-check
+        // nothing — so the module is emitted happily. Nor is it caught by `spirv-val`, which gates one
+        // representative module per emitter path and has none for this case, since the case has never
+        // been constructed. What actually happens is that pipeline creation rejects the module and the
+        // draw is dropped. Both branches are hard errors rather than wrong pixels -- index 0 selects a
+        // Block, so index 1 indexes into a structure, and SPIR-V requires a struct member index to be an
+        // OpConstant, which a computed index is not; in the only constant case it yields a
+        // pointer-to-runtime-array against a declared `t_ptr_sb_u32`, a type mismatch. So the direction
+        // is still fail-visible, not silently wrong -- but "loud" here means a dropped draw, not a
+        // validator, and nothing reports it as a type error at the point the mistake was made.
+        if (arity2) declare_as_array(2, v_cbuf, arity2);
+        else        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf,  SC_StorageBuffer});
+        if (arity3) declare_as_array(3, v_cbuf1, arity3);
+        else        put(types, Op_Variable, {t_ptr_sb_struct_u, v_cbuf1, SC_StorageBuffer});
         put(types, Op_TypePointer, {t_ptr_sb_u32, SC_StorageBuffer, t_u32});
         cbuf_var[2] = v_cbuf; cbuf_var[3] = v_cbuf1;
         // N-buffer model: declare an additional storage buffer for each distinct constant/vertex buffer
@@ -2366,6 +2461,8 @@ struct SpirvCompute {
                     put(types, Op_Variable, {arr_ptr, v, SC_StorageBuffer});
                     cbuf_var[r.binding] = v;
                     cbuf_table_arity[r.binding] = r.table_index_count;
+                    if (r.table_index_sgpr != 0xFFFFFFFFu)
+                        cbuf_table_index_sgpr[r.binding] = r.table_index_sgpr;
                     continue;
                 }
                 put(types, Op_Variable, {t_ptr_sb_struct_u, v, SC_StorageBuffer});
