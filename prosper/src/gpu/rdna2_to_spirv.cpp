@@ -11,7 +11,9 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -16186,6 +16188,75 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const uint64_t local_count = static_cast<uint64_t>(local_x) * local_y * local_z;
     b.native_subgroup_size = config.native_subgroup_size == wave_size &&
         local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
+    // PROSPER_DBG: report the inputs to that decision, not just its outcome (#2429).
+    //
+    // Every wave-width-dependent lowering in this file gates on `b.native_subgroup_size` -- the
+    // VCC-as-scalar-data path at :5604 most consequentially, since when it is 0 the guest's
+    // `s_add_u32 sN, sM, vcc_lo` never resolves, the descriptor never lands, and the draw is
+    // skipped. Nothing printed any of this, under any variable, so "was that path active on this
+    // device?" could only be inferred from the adapter's advertised width.
+    //
+    // `config.native_subgroup_size` is NOT the adapter's advertised width -- it is the OUTPUT of
+    // select_native_compute_subgroup_size() (gpu_executor.cpp), an adoption decision with THREE
+    // `return 0` sites comprising 22 clauses -- 25 if `adoptable`'s four ANDed device checks are
+    // counted individually, which is defensible since each is independently sufficient. It spans
+    // device features, queue support, workgroup limits and the dispatch's own dimensions, and
+    // yields 0 when it declines. Zero therefore means "no native width was adopted", NOT "the
+    // device is narrower than wave_size", and the three cases below are distinguished for that
+    // reason.
+    //
+    // Counted rather than estimated, because two lanes published two different guesses at it on the
+    // same day (#2483 "~14", #2484 "roughly eight") and neither had derived the number.
+    //
+    // This line dedupes on the exact input tuple, so it answers "which combinations exist" cheaply --
+    // a couple of lines for a whole boot. For a per-dispatch CENSUS (how many dispatches fall in
+    // each category, which this instrument's dedupe destroys by design) use PROSPER_SUBGROUP_LOG in
+    // gpu_executor.cpp instead.
+    //
+    // That inference is WRONG, and reporting only the effective value would preserve the error:
+    // the expression above is zero for THREE independent reasons -- the device width not matching
+    // `wave_size`, an implausible `local_count`, or a workgroup that is not a whole number of waves
+    // (`local_count % wave_size`). A dispatch with a partial final wave disables the path on an
+    // adapter whose width matches perfectly. #2429 attributes it entirely to the first cause, and
+    // that is checkable only if all three inputs are printed.
+    //
+    // Deduplicated on the exact tuple rather than rate-limited, because the interesting event is a
+    // DISTINCT combination appearing, not the hundredth repeat of one -- and a kernel that disables
+    // the path for a different reason than its predecessors is exactly what a rate limit would drop.
+    if (getenv("PROSPER_DBG")) {
+        static std::mutex mx;
+        // Keyed on the EXACT inputs, local_count included. An earlier revision packed
+        // `local_count % wave_size` instead, which collapsed dispatches that differ only in
+        // workgroup shape -- and the line prints `local=`, so one row then named whichever
+        // instance arrived first and stood silently for the rest. Measured on GTA V's six
+        // native=0 shapes, that key produced three rows, one of which represented 1024, 256,
+        // 256 and 256 while printing only 1024 -- and the 256-wide ones were the multi-wave
+        // case that mattered. A diagnostic may aggregate, but it must not name one member of
+        // a bucket as though it were the bucket.
+        static std::set<std::tuple<uint32_t, uint32_t, uint64_t, uint32_t>> seen;
+        std::lock_guard<std::mutex> lk(mx);
+        if (seen.insert(std::make_tuple(config.native_subgroup_size, wave_size,
+                                        local_count, b.native_subgroup_size)).second)
+            std::fprintf(stderr,
+                         "[subgroup-width] device=%u wave=%u local=%llu local%%wave=%llu -> "
+                         "native_subgroup_size=%u (%s)\n",
+                         config.native_subgroup_size, wave_size,
+                         (unsigned long long)local_count,
+                         (unsigned long long)(local_count % (wave_size ? wave_size : 1u)),
+                         b.native_subgroup_size,
+                         b.native_subgroup_size
+                             ? "width-dependent lowerings ENABLED"
+                             : (config.native_subgroup_size == 0
+                                    ? "DISABLED: no native width adopted -- "
+                                      "select_native_compute_subgroup_size() declined"
+                                    : (config.native_subgroup_size != wave_size
+                                           ? "DISABLED: adopted width != wave_size"
+                                           : (local_count > UINT32_MAX
+                                                  ? "DISABLED: local_count exceeds the plausibility "
+                                                    "guard"
+                                                  : "DISABLED: workgroup is not a whole number "
+                                                    "of waves"))));
+    }
     b.native_storage_format_support = config.native_storage_format_support;
     b.packed_r11_storage = config.packed_r11_storage;
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
