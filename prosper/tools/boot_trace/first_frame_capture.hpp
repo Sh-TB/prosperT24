@@ -22,6 +22,7 @@ struct ContentValidation {
     uint64_t unique_colors = 0;     // Number of distinct RGBA pixel values
     double mean_luminance = 0.0;    // Average brightness (0.0 = black, 1.0 = white)
     double color_variance = 0.0;     // Pixel-to-pixel variance (0.0 = uniform)
+    std::string evidence;           // Human-readable explanation of validation result
     
     // Validation thresholds (configurable for testing)
     static constexpr uint64_t MIN_UNIQUE_COLORS = 16;      // Reject < 16 unique colors

@@ -206,12 +206,35 @@ ContentValidation validate_frame_content(const uint8_t* rgba, uint32_t w, uint32
     double uniform_ratio = n_samples > 0 ? matching_first / n_samples : 1.0;
     cv.is_uniform = (uniform_ratio > ContentValidation::MAX_UNIFORM_RATIO);
     
-    // Validation decision
+    // Validation decision with evidence messages
     bool has_enough_colors = (cv.unique_colors >= ContentValidation::MIN_UNIQUE_COLORS);
     bool has_variance = (cv.color_variance >= ContentValidation::MIN_LUMINANCE_VARIANCE);
     bool not_completely_black = (cv.mean_luminance > 0.001); // Allow near-black but not pure black
     
-    cv.is_valid = has_enough_colors && has_variance && !cv.is_uniform && not_completely_black;
+    // Set evidence based on which check failed (check in priority order)
+    if (!has_enough_colors) {
+        cv.is_valid = false;
+        cv.evidence = "too few unique colors (" + std::to_string(cv.unique_colors) 
+                    + " < " + std::to_string(ContentValidation::MIN_UNIQUE_COLORS) + ")";
+    } else if (cv.is_uniform) {
+        cv.is_valid = false;
+        cv.evidence = "uniform frame (" + std::to_string(uniform_ratio).substr(0, 5) 
+                    + " ratio exceeds threshold)";
+    } else if (!has_variance) {
+        cv.is_valid = false;
+        cv.evidence = "insufficient luminance variance (" 
+                    + std::to_string(cv.color_variance).substr(0, 6) + " < " 
+                    + std::to_string(ContentValidation::MIN_LUMINANCE_VARIANCE) + ")";
+    } else if (!not_completely_black) {
+        cv.is_valid = false;
+        cv.evidence = "near-black frame (mean luminance=" 
+                    + std::to_string(cv.mean_luminance).substr(0, 6) + ")";
+    } else {
+        cv.is_valid = true;
+        cv.evidence = "validated non-uniform rendered frame (" 
+                    + std::to_string(cv.unique_colors) + " unique colors, variance="
+                    + std::to_string(cv.color_variance).substr(0, 6) + ")";
+    }
     
     return cv;
 }
