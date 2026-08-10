@@ -9,14 +9,16 @@
 // 4. Does NOT fake FramePresented events
 // 5. Does NOT hardcode addresses, dimensions, or pixel data
 //
-// If the existing renderer produces a real frame, we capture it.
-// If no frame is produced, we honestly report NO_REAL_FRAME_PRESENTED.
+// If the existing renderer produces a real frame with meaningful content, we capture it.
+// If no frame is produced, or if the frame is uniform/empty, we honestly report failure.
 #include "first_frame_capture.hpp"
 #include "gpu/videoout_present.hpp"   // present_snapshot, present_has_frame, etc.
 #include <chrono>
 #include <thread>
 #include <cstring>
 #include <algorithm>
+#include <unordered_set>
+#include <cmath>
 
 namespace prosper::first_frame {
 
@@ -129,17 +131,106 @@ bool write_bmp(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h,
     return true;
 }
 
+// Content validation: proves frame contains meaningful rendered content.
+// Rejects uniform frames (black/white/solid color) that indicate diagnostic buffers
+// rather than actual game rendering.
+ContentValidation validate_frame_content(const uint8_t* rgba, uint32_t w, uint32_t h) {
+    ContentValidation cv = {};
+    
+    if (!rgba || w == 0 || h == 0) {
+        cv.is_valid = false;
+        cv.is_uniform = true;
+        cv.evidence = "null or zero-dimension buffer";
+        return cv;
+    }
+    
+    const size_t total_pixels = (size_t)w * h;
+    const size_t max_sample_pixels = std::min(total_pixels, (size_t)10000); // Sample up to 10K pixels
+    
+    // Use a hash set for unique color counting (sampled for performance)
+    std::unordered_set<uint32_t> unique_colors;
+    unique_colors.reserve(4096); // Pre-allocate for typical game frames
+    
+    double luminance_sum = 0.0;
+    double luminance_sq_sum = 0.0;
+    uint32_t first_pixel = 0;
+    bool first_pixel_set = false;
+    uint64_t matching_first = 0;
+    
+    // Sample pixels across the entire frame (not just one area)
+    const size_t sample_stride = total_pixels > max_sample_pixels 
+                                 ? total_pixels / max_sample_pixels 
+                                 : 1;
+    
+    for (size_t i = 0; i < total_pixels && unique_colors.size() < max_sample_pixels; i += sample_stride) {
+        const size_t offset = i * 4;
+        if (offset + 3 >= total_pixels * 4) break;
+        
+        const uint8_t r = rgba[offset];
+        const uint8_t g = rgba[offset + 1];
+        const uint8_t b = rgba[offset + 2];
+        // Alpha ignored for content validation
+        
+        // Pack RGB into 32-bit key for hashing
+        uint32_t rgb_key = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        unique_colors.insert(rgb_key);
+        
+        // Calculate relative luminance (BT.709)
+        double lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+        luminance_sum += lum;
+        luminance_sq_sum += lum * lum;
+        
+        // Track uniformity against first sampled pixel
+        if (!first_pixel_set) {
+            first_pixel = rgb_key;
+            first_pixel_set = true;
+        }
+        if (rgb_key == first_pixel) {
+            matching_first++;
+        }
+    }
+    
+    // Calculate metrics
+    cv.unique_colors = unique_colors.size();
+    
+    const double n_samples = static_cast<double>(std::min(total_pixels / sample_stride, max_sample_pixels));
+    if (n_samples > 0) {
+        cv.mean_luminance = luminance_sum / n_samples;
+        
+        // Variance: E[X²] - (E[X])²
+        double mean_sq = luminance_sq_sum / n_samples;
+        cv.color_variance = mean_sq - (cv.mean_luminance * cv.mean_luminance);
+    }
+    
+    // Uniformity check: what fraction of samples match the first pixel?
+    double uniform_ratio = n_samples > 0 ? matching_first / n_samples : 1.0;
+    cv.is_uniform = (uniform_ratio > ContentValidation::MAX_UNIFORM_RATIO);
+    
+    // Validation decision
+    bool has_enough_colors = (cv.unique_colors >= ContentValidation::MIN_UNIQUE_COLORS);
+    bool has_variance = (cv.color_variance >= ContentValidation::MIN_LUMINANCE_VARIANCE);
+    bool not_completely_black = (cv.mean_luminance > 0.001); // Allow near-black but not pure black
+    
+    cv.is_valid = has_enough_colors && has_variance && !cv.is_uniform && not_completely_black;
+    
+    return cv;
+}
+
 bool capture_first_frame(const std::string& output_path, double timeout_secs,
                          CaptureResult& result) {
     result = {}; // Initialize all fields to defaults
     
     auto t0 = std::chrono::steady_clock::now();
-    bool first_has_frame = false;
-    uint64_t last_frame_seq = 0;
+    enum class StabilityState { WAITING_FIRST, WAITING_STABLE, CAPTURED };
+    StabilityState stability_state = StabilityState::WAITING_FIRST;
+    uint64_t detected_frame_seq = 0;
+    int stable_poll_count = 0;
+    static constexpr int REQUIRED_STABLE_POLLS = 2; // Must see same seq on 2 consecutive polls
     
-    fprintf(stderr, "[first-frame] waiting for first real frame from present path...\n");
+    fprintf(stderr, "[first-frame] waiting for first validated rendered frame from present path...\n");
     fprintf(stderr, "[first-frame] output path: %s\n", 
             output_path.empty() ? "(none)" : output_path.c_str());
+    fprintf(stderr, "[first-frame] stability: requiring %d consecutive polls with same frame_seq\n", REQUIRED_STABLE_POLLS);
     
     // Poll the EXISTING present path for a real frame.
     // We do NOT trigger rendering - we only observe what the renderer produces.
@@ -151,7 +242,7 @@ bool capture_first_frame(const std::string& output_path, double timeout_secs,
         if (timeout_secs > 0 && elapsed > timeout_secs) {
             result.wait_seconds = elapsed;
             result.no_real_frame_presented = true;
-            result.evidence = "TIMEOUT: no frame presented within timeout";
+            result.evidence = "TIMEOUT: no validated frame presented within timeout";
             
             // Record what state we're in even without a frame
             result.width = gpu::present_width();
@@ -172,16 +263,49 @@ bool capture_first_frame(const std::string& output_path, double timeout_secs,
         bool has_frame_now = gpu::present_has_frame();
         uint64_t current_seq = gpu::present_frame_seq();
         
-        // Detect first frame appearance
-        if (has_frame_now && !first_has_frame) {
-            first_has_frame = true;
-            last_frame_seq = current_seq;
-            fprintf(stderr, "[first-frame] RENDERER FRAME DETECTED at %.3fs (seq=%llu)\n",
-                    elapsed, (unsigned long long)current_seq);
+        switch (stability_state) {
+            case StabilityState::WAITING_FIRST:
+                // Looking for ANY frame appearance
+                if (has_frame_now && current_seq > 0) {
+                    detected_frame_seq = current_seq;
+                    stability_state = StabilityState::WAITING_STABLE;
+                    stable_poll_count = 1; // Count this first detection
+                    fprintf(stderr, "[first-frame] FRAME DETECTED at %.3fs (seq=%llu), waiting for stability...\n",
+                            elapsed, (unsigned long long)current_seq);
+                }
+                break;
+                
+            case StabilityState::WAITING_STABLE:
+                // Verify same frame persists across polls
+                if (has_frame_now && current_seq == detected_frame_seq) {
+                    stable_poll_count++;
+                    fprintf(stderr, "[first-frame] stability poll %d/%d at %.3fs\n",
+                            stable_poll_count, REQUIRED_STABLE_POLLS, elapsed);
+                    
+                    if (stable_poll_count >= REQUIRED_STABLE_POLLS) {
+                        stability_state = StabilityState::CAPTURED;
+                        fprintf(stderr, "[first-frame] STABLE after %d polls, capturing...\n", stable_poll_count);
+                    }
+                } else if (has_frame_now && current_seq != detected_frame_seq) {
+                    // Frame changed - restart stability tracking with new seq
+                    detected_frame_seq = current_seq;
+                    stable_poll_count = 1;
+                    fprintf(stderr, "[first-frame] frame changed to seq=%llu, restarting stability count\n",
+                            (unsigned long long)current_seq);
+                } else {
+                    // Frame disappeared - go back to waiting
+                    stability_state = StabilityState::WAITING_FIRST;
+                    stable_poll_count = 0;
+                    fprintf(stderr, "[first-frame] frame lost, waiting for new frame...\n");
+                }
+                break;
+                
+            case StabilityState::CAPTURED:
+                // Proceed to capture and validate
+                break;
         }
         
-        // If we have a frame and it's stable (same seq for two polls), capture it
-        if (has_frame_now && current_seq > 0 && current_seq == last_frame_seq) {
+        if (stability_state == StabilityState::CAPTURED) {
             // Small delay to ensure frame is fully published
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             
@@ -196,6 +320,7 @@ bool capture_first_frame(const std::string& output_path, double timeout_secs,
                 result.frame_seq = snap.frame_seq;
                 result.present_count = snap.present_count;
                 result.front_index = snap.front_index;
+                result.stability_polls_seen = stable_poll_count;
                 
                 // Classify source
                 switch (snap.source) {
@@ -213,21 +338,58 @@ bool capture_first_frame(const std::string& output_path, double timeout_secs,
                 if (snap.rgba.empty()) {
                     result.evidence = "ERROR: snapshot returned empty pixel data";
                     result.captured = false;
+                    result.content_validated = false;
                     fprintf(stderr, "[first-frame] ERROR: empty snapshot pixels\n");
                     return false;
                 }
                 
-                // Write BMP if path specified
+                // CONTENT VALIDATION: prove frame contains meaningful rendered content
+                result.content = validate_frame_content(snap.rgba.data(), snap.width, snap.height);
+                result.content_validated = result.content.is_valid;
+                
+                if (!result.content_validated) {
+                    // Frame exists but content is invalid (uniform/black/empty)
+                    result.captured = false;
+                    result.no_real_frame_presented = true;
+                    
+                    if (result.content.is_uniform) {
+                        result.evidence = "NO_REAL_FRAME_PRESENTED: frame is uniform ("
+                            + std::to_string(result.content.unique_colors) + " unique colors, "
+                            + "mean_lum=" + std::to_string(result.content.mean_luminance).substr(0, 5) + ")";
+                    } else {
+                        result.evidence = "NO_REAL_FRAME_PRESENTED: content validation failed ("
+                            + std::to_string(result.content.unique_colors) + " unique colors, "
+                            + "variance=" + std::to_string(result.content.color_variance).substr(0, 6) + ")";
+                    }
+                    
+                    fprintf(stderr, "[first-frame] REJECTED: %s\n", result.evidence.c_str());
+                    fprintf(stderr, "[first-frame]   unique_colors=%llu  mean_lum=%.4f  variance=%.6f  uniform=%s\n",
+                            (unsigned long long)result.content.unique_colors,
+                            result.content.mean_luminance,
+                            result.content.color_variance,
+                            result.content.is_uniform ? "yes" : "no");
+                    
+                    // Return failure but don't timeout - caller may retry
+                    return false;
+                }
+                
+                // Frame passed all validations - write BMP if path specified
                 if (!output_path.empty()) {
                     std::string bmp_error;
                     if (write_bmp(output_path.c_str(), snap.rgba.data(), 
                                   snap.width, snap.height, bmp_error)) {
                         result.output_path = output_path;
                         result.bytes_written = 54 + snap.rgba.size(); // headers + pixels
-                        result.evidence = "REAL FRAME CAPTURED from " + result.source + " source";
-                        fprintf(stderr, "[first-frame] CAPTURED: %s (%ux%u, %llu bytes)\n",
+                        result.evidence = "REAL_FRAME_CAPTURED from " + result.source 
+                            + " source (validated: " + std::to_string(result.content.unique_colors) 
+                            + " unique colors, non-uniform)";
+                        fprintf(stderr, "[first-frame] CAPTURED & VALIDATED: %s (%ux%u, %llu bytes)\n",
                                 output_path.c_str(), result.width, result.height,
                                 (unsigned long long)result.bytes_written);
+                        fprintf(stderr, "[first-frame]   content: %llu unique colors, lum=%.3f, var=%.6f\n",
+                                (unsigned long long)result.content.unique_colors,
+                                result.content.mean_luminance,
+                                result.content.color_variance);
                     } else {
                         result.evidence = std::string("BMP WRITE FAILED: ") + bmp_error;
                         result.captured = false;
@@ -237,21 +399,19 @@ bool capture_first_frame(const std::string& output_path, double timeout_secs,
                 } else {
                     // No output path - just report success
                     result.bytes_written = snap.rgba.size();
-                    result.evidence = "REAL FRAME OBSERVED from " + result.source + " source (not written)";
-                    fprintf(stderr, "[first-frame] OBSERVED: %ux%u from %s (no output path)\n",
+                    result.evidence = "REAL_FRAME_OBSERVED from " + result.source 
+                        + " source (validated: " + std::to_string(result.content.unique_colors) 
+                        + " unique colors, non-uniform)";
+                    fprintf(stderr, "[first-frame] OBSERVED & VALIDATED: %ux%u from %s (no output path)\n",
                             result.width, result.height, result.source.c_str());
                 }
                 
                 return true;
             } else {
-                result.evidence = "ERROR: present_snapshot failed after frame detected";
-                fprintf(stderr, "[first-frame] ERROR: snapshot failed despite has_frame=true\n");
+                result.evidence = "ERROR: present_snapshot failed after stable frame detected";
+                fprintf(stderr, "[first-frame] ERROR: snapshot failed despite stable frame detection\n");
                 return false;
             }
-        }
-        
-        if (has_frame_now) {
-            last_frame_seq = current_seq;
         }
         
         // Brief sleep to avoid busy-waiting
@@ -282,6 +442,7 @@ std::string generate_report(const CaptureResult& result, const std::string& game
              "    RUNTIME:        PASS\n"
              "    REAL PRESENT:   %s\n"
              "    FRAME CAPTURE:  %s\n"
+             "    CONTENT VALID:  %s\n"
              "\n"
              "--- Captured Frame Metadata ---\n"
              "    width:          %u\n"
@@ -293,8 +454,16 @@ std::string generate_report(const CaptureResult& result, const std::string& game
              "    front_index:    %d\n"
              "    source:         %s\n"
              "    wait_time:      %.3f seconds\n"
+             "    stability:      %d polls\n"
              "    output:         %s\n"
              "    bytes_written:  %zu\n"
+             "\n"
+             "--- Content Validation ---\n"
+             "    validated:      %s\n"
+             "    unique_colors:  %llu\n"
+             "    is_uniform:     %s\n"
+             "    mean_luminance: %.4f\n"
+             "    color_variance:  %.6f\n"
              "\n"
              "--- Evidence ---\n"
              "    %s\n"
@@ -303,6 +472,7 @@ std::string generate_report(const CaptureResult& result, const std::string& game
              "    Modified files:     tools/boot_trace/first_frame_capture.{hpp,cpp}\n"
              "    Runtime behavior changed: NO (observer only)\n"
              "    Synthetic/fake data used: NO\n"
+             "    Content validation:    YES (rejects uniform/empty frames)\n"
              "\n"
              "Conclusion: %s\n"
              "\n"
@@ -311,16 +481,23 @@ std::string generate_report(const CaptureResult& result, const std::string& game
              game_path.empty() ? "(not specified)" : game_path.c_str(),
              (result.captured || result.no_real_frame_presented) ? "PASS" : "FAIL",
              result.captured ? "PASS" : (result.no_real_frame_presented ? "NO_REAL_FRAME_PRESENTED" : "FAIL"),
+             result.content_validated ? "PASS" : (result.captured ? "N/A" : "FAIL"),
              result.width, result.height, result.pitch,
              (unsigned long long)result.frame_seq,
              (unsigned long long)result.present_count,
              result.front_index,
              result.source.empty() ? "N/A" : result.source.c_str(),
              result.wait_seconds,
+             result.stability_polls_seen,
              result.output_path.empty() ? "(none)" : result.output_path.c_str(),
              result.bytes_written,
+             result.content_validated ? "YES" : "NO",
+             (unsigned long long)result.content.unique_colors,
+             result.content.is_uniform ? "YES" : "NO",
+             result.content.mean_luminance,
+             result.content.color_variance,
              result.evidence.empty() ? "(none)" : result.evidence.c_str(),
-             result.captured ? "REAL FRAME CAPTURED" : "REAL FRAME NOT YET CAPTURED");
+             result.captured ? "VALIDATED REAL FRAME CAPTURED" : "REAL FRAME NOT YET CAPTURED");
     
     return std::string(buf);
 }

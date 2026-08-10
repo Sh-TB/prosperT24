@@ -15,10 +15,25 @@
 
 namespace prosper::first_frame {
 
+// Content validation result - proves frame contains meaningful rendered content
+struct ContentValidation {
+    bool is_valid = false;          // Does frame pass content validation?
+    bool is_uniform = false;        // Is frame a single solid color (black/white/etc)?
+    uint64_t unique_colors = 0;     // Number of distinct RGBA pixel values
+    double mean_luminance = 0.0;    // Average brightness (0.0 = black, 1.0 = white)
+    double color_variance = 0.0;     // Pixel-to-pixel variance (0.0 = uniform)
+    
+    // Validation thresholds (configurable for testing)
+    static constexpr uint64_t MIN_UNIQUE_COLORS = 16;      // Reject < 16 unique colors
+    static constexpr double MAX_UNIFORM_RATIO = 0.999;     // Reject > 99.9% same color
+    static constexpr double MIN_LUMINANCE_VARIANCE = 0.001; // Minimum variance threshold
+};
+
 // Frame capture result - records what actually happened (evidence, not fabrication)
 struct CaptureResult {
     bool captured = false;           // Was a real frame captured?
     bool no_real_frame_presented = false;  // Explicit: no frame was available
+    bool content_validated = false; // Did frame pass content validation?
     
     // Frame metadata (all from actual runtime, zero if no frame)
     uint32_t width = 0;
@@ -31,12 +46,18 @@ struct CaptureResult {
     // Source classification (from PresentSource enum)
     std::string source;             // "Rendered", "RawScanout", "GuestScanout", or "None"
     
+    // Content validation metrics
+    ContentValidation content;      // Proves frame has meaningful rendered content
+    
     // Output info
     std::string output_path;        // Where BMP was written (empty if not written)
     size_t bytes_written = 0;
     
     // Timing
     double wait_seconds = 0;        // How long we waited for the frame
+    
+    // Stability tracking
+    int stability_polls_seen = 0;   // How many polls showed this frame seq
     
     // Evidence fields
     std::string evidence;           // Human-readable evidence string

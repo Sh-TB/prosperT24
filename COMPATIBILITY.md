@@ -16,7 +16,6 @@ Last updated: 2026-08-11
 | --- | --- | --- | --- | --- |
 | *The Messenger* | `PPSA24651` | Unity / IL2CPP | ✅ First level gameplay | [#1865](https://github.com/mattias800/prosper/issues/1865) |
 | *Dead Cells* | `PPSA15552` | Custom | ✅ Prisoners' Quarters gameplay | [#1866](https://github.com/mattias800/prosper/issues/1866) |
-| *Dreaming Sarah* | `PPSA02929` | Unity / IL2CPP | 🔬 Real rendered boot/splash frame via CLI | [ProsperT24](https://github.com/Sh-TB/prosperT24) |
 | *Blasphemous 2* | `PPSA13579` | Unity | ✅ First playable room | [#1867](https://github.com/mattias800/prosper/issues/1867) |
 | *Evergate* | `PPSA01885` | Unity | ✅ First tutorial-room gameplay | [#1868](https://github.com/mattias800/prosper/issues/1868) |
 | *GRIS* | `PPSA09804` | Unity / IL2CPP | ✅ Opening gameplay | [#1869](https://github.com/mattias800/prosper/issues/1869) |
@@ -422,30 +421,6 @@ composited, so the menu sits on a flat grey background. See the
 
 A direct, unmodified native 1920×1080 frontend capture reaches the title screen and its `Press Any Button To Start`
 prompt. Gameplay has not yet been reached. See the [tracker](https://github.com/mattias800/prosper/issues/1898).
-
-## Dreaming Sarah — `PPSA02929`
-
-<p align="center"><img src="assets/screenshots/dreaming-sarah.png" alt="Dreaming Sarah — boot/splash frame"></p>
-
-Prosper CLI successfully boots PPSA02929 / Dreaming Sarah and reaches a real rendered boot/splash frame through the VideoOut/present path.
-The frame was captured using the observer-only `--capture-first-frame` option in `boot_trace`.
-
-**Demonstrated result:** `REAL_FRAME_CAPTURED`
-
-The capture reported:
-- 3840×2160 VideoOut target
-- RGBA8 format
-- Frame sequence 1, present count 2
-- Rendered source (observer-only capture)
-
-This is a real game frame, not a synthetic test pattern. The observed execution path was:
-```
-Game boot → guest execution → render submission → Vulkan renderer
-→ VideoOut/present → real rendered frame → first-frame observer → captured image
-```
-
-Gameplay progression is **not claimed** by this milestone. See the [evidence repository](https://github.com/Sh-TB/prosperT24)
-for the full frame sequence and validation details.
 
 ## Reproducible routes
 
