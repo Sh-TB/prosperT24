@@ -6123,8 +6123,23 @@ void record_scalar_write(RegState& rs, const Rdna2Inst& in,
                sop2_b32_mask_domain || vopc_b32_mask || vop3_b32_mask_write)));
         const bool writes_b64_mask = effective_width == 2 && !vopc_b32_mask &&
             scalar_write_is_b64_mask(in, base);
+        // The dedicated Wave64 half domain is a spelling of this physical SGPR's current bits,
+        // not provenance attached to the register number forever.  V_READLANE clears the old
+        // entry before emission and republishes it only for a MUST-proven mask-half reload; every
+        // other scalar write ends that lifetime.  This post-emission hook runs before the next
+        // instruction, so a later sibling-half reload cannot promote a stale Bool together with
+        // the fresh half.
+        const bool publishes_wave64_mask_half =
+            in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
+            effective_width == 1 && base == in.dst.value &&
+            rs.sreg_wave64_mask_half.contains(base) &&
+            rs.sreg_wave64_mask_half_index.contains(base);
         for (uint32_t word = 0; word < effective_width; ++word) {
             const int reg = base + static_cast<int>(word);
+            if (!publishes_wave64_mask_half || reg != base) {
+                rs.sreg_wave64_mask_half.erase(reg);
+                rs.sreg_wave64_mask_half_index.erase(reg);
+            }
             if (!rs.sreg_bool_b32.contains(reg) || (writes_b32_mask && reg == base))
                 continue;
             rs.sreg_bool_b32.erase(reg);
@@ -9906,6 +9921,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
             if (in.opcode == 0x360) {                                 // v_readlane_b32 sDST, vSRC, lane
+                // V_READLANE is an architectural scalar write.  Drop an older dedicated half
+                // before selecting this read's source domain; only the exact CFG-proven mask-slot
+                // path below may publish a replacement.  record_scalar_write consequently knows
+                // that map presence after emission describes this instruction, not stale state.
+                rs.sreg_wave64_mask_half.erase(in.dst.value);
+                rs.sreg_wave64_mask_half_index.erase(in.dst.value);
                 if (b.is_fragment && b.wave_size == 32 &&
                     in.src[1].kind == OperandKind::InlineInt && in.src[1].value >= 32) {
                     ok = false; return true;
