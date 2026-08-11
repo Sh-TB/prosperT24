@@ -8169,7 +8169,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (row_ror8) {
                     // Direct shuffle is valid only when one native subgroup is exactly one guest
                     // wave. Portable/default-subgroup compute is routed through synchronized CFG
-                    // scratch below. FI=0 checks the rotated source's EXEC bit and BC1 supplies 0.
+                    // scratch below. FI=0 makes an EXEC-inactive rotated source read as zero; a
+                    // ROW_ROR source is always in-range, so BOUND_CTRL does not decide this case.
                     if (!b.is_compute || dpp_row_ror8_op(in) != DppRowRor8Op::MovB32 ||
                         !b.native_subgroup_size) {
                         ok = false; return true;
@@ -15406,7 +15407,8 @@ bool emit_cfg_state_machine(
             }
             if (b.native_subgroup_size) {
                 // One exact native subgroup is one guest wave and this case is subgroup-uniform.
-                // FI=0 checks the rotated source's EXEC bit; BC1 substitutes zero when it is clear.
+                // FI=0 makes an EXEC-inactive rotated source read as zero. ROW_ROR:8 always names
+                // an in-range lane in its 16-lane row, so BOUND_CTRL does not decide this case.
                 uint32_t valid_source = 0;
                 const uint32_t rotated = b.subgroup_row_ror8(
                     src0_value, state.exec, &valid_source);
@@ -15981,7 +15983,7 @@ bool emit_cfg_state_machine(
     const uint32_t dpp_source_in_bounds = b.ucmp(
         Op_ULessThan, dpp_rotated_index, b.uconst(b.local_count));
     // A partial final DPP16 row has no invocation to initialize the rotated slot. Address this
-    // lane's initialized placeholder and let BC1's validity gate supply zero for the missing peer.
+    // lane's initialized placeholder and let FI=0's validity gate supply zero for the missing peer.
     const uint32_t dpp_source_index = b.sel(
         dpp_source_in_bounds, dpp_rotated_index, b.linear_localid);
     const uint32_t dpp_rotated = b.cfg_scratch_load(
