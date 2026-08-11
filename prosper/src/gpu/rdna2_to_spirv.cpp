@@ -5984,9 +5984,13 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
                 // produce scalar SGPR data, so carrying a scalar value through a loop/if merge is
                 // both unnecessary and semantically wrong.
                 if (in.opcode != 0x21 || (in.dst.value != 126 && in.dst.value != 127)) {
-                    sregs.insert(in.dst.value);
-                    if (in.opcode == 0x1f || in.opcode == 0x21)
-                        sregs.insert(in.dst.value + 1);
+                    uint32_t words = 1;
+                    if (in.opcode == 0x0b)
+                        words = scalar_write_width(in);
+                    else if (in.opcode == 0x1f || in.opcode == 0x21)
+                        words = 2;
+                    for (uint32_t word = 0; word < words; ++word)
+                        sregs.insert(in.dst.value + static_cast<int>(word));
                 }
                 break;
             case Rdna2Format::SMEM: {                                      // s_load/s_buffer_load: N consecutive SGPRs
@@ -14376,8 +14380,10 @@ bool emit_cfg_state_machine(
     std::unordered_map<uint32_t, int> proven_wave64_mbcnt_mask_root_for_pc;
     // Retain the entry facts beyond the consumer-specialization pass below. Function Bool
     // variables persist values only; this MUST set is the separate lifetime tag load_state needs
-    // before reconstructing a saved-mask RegState entry in each dispatcher case.
+    // before reconstructing a saved-mask RegState entry in each dispatcher case. Domain conflicts
+    // at joins remain ambiguous until a definite overwrite and reject on their first read.
     std::vector<std::set<int>> wave64_b64_mask_in(starts.size());
+    std::vector<std::set<int>> wave64_b64_ambiguous_in(starts.size());
     std::vector<bool> wave64_b64_reachable(starts.size(), false);
     auto wave64_mask_reduction_source = [&](const Rdna2Inst& in) -> int {
         if (!b.is_compute || b.wave_size != 64 || in.fmt != Rdna2Format::SOP1 ||
@@ -14410,8 +14416,32 @@ bool emit_cfg_state_machine(
         if (initial.vcc) wave64_b64_mask_in.front().insert(106);
         wave64_b64_reachable.front() = true;
 
-        auto advance_wave64_b64_masks = [&](std::set<int>& masks, const Rdna2Inst& in,
+        auto advance_wave64_b64_masks = [&](std::set<int>& masks,
+                                            std::set<int>& ambiguous,
+                                            const Rdna2Inst& in,
                                             bool record_compare) {
+            // A block-entry join where the same physical pair is a mask on one predecessor and
+            // scalar data on another has no runtime type tag. Reject the first observable read;
+            // loading either the Bool's false placeholder or the scalar variable's zero placeholder
+            // would silently choose one predecessor's domain for both paths.
+            bool reads_ambiguous = false;
+            for (uint32_t source = 0; source < in.n_src; ++source) {
+                const Operand& operand = in.src[source];
+                if (operand.kind != OperandKind::SGPR &&
+                    operand.kind != OperandKind::Special)
+                    continue;
+                for (int base : ambiguous)
+                    reads_ambiguous |= operand.value == base || operand.value == base + 1;
+            }
+            const bool implicit_vcc_read =
+                (in.fmt == Rdna2Format::SOPP &&
+                 (in.opcode == 0x06 || in.opcode == 0x07)) ||
+                (in.fmt == Rdna2Format::VOP2 &&
+                 (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2a)));
+            reads_ambiguous |= implicit_vcc_read && ambiguous.contains(106);
+            if (reads_ambiguous)
+                return reject_cfg(in.pc, "wave64-ambiguous-mask-read");
+
             const int reduction_source = wave64_mask_reduction_source(in);
             if (record_compare && reduction_source >= 0 && masks.contains(reduction_source))
                 proven_wave64_mask_reduction_pcs.insert(in.pc);
@@ -14470,14 +14500,18 @@ bool emit_cfg_state_machine(
             }
 
             auto erase_overlapping = [&](int base, uint32_t width) {
-                for (auto it = masks.begin(); it != masks.end();) {
-                    const int mask_base = *it;
-                    if (base < mask_base + 2 &&
-                        mask_base < base + static_cast<int>(width))
-                        it = masks.erase(it);
-                    else
-                        ++it;
-                }
+                auto erase = [&](std::set<int>& values) {
+                    for (auto it = values.begin(); it != values.end();) {
+                        const int mask_base = *it;
+                        if (base < mask_base + 2 &&
+                            mask_base < base + static_cast<int>(width))
+                            it = values.erase(it);
+                        else
+                            ++it;
+                    }
+                };
+                erase(masks);
+                erase(ambiguous);
             };
             for_each_scalar_write(in, erase_overlapping, /*wave32_one_word_masks*/false);
             // An implicit VOPC destination is architectural VCC and is absent from the explicit
@@ -14485,7 +14519,11 @@ bool emit_cfg_state_machine(
             if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
                 !(in.dst.kind == OperandKind::SGPR && in.dst.value <= 105))
                 erase_overlapping(106, 2);
-            if (mask_write >= 0) masks.insert(mask_write);
+            if (mask_write >= 0) {
+                masks.insert(mask_write);
+                ambiguous.erase(mask_write);
+            }
+            return true;
         };
 
         std::vector<uint32_t> pending{0};
@@ -14493,27 +14531,41 @@ bool emit_cfg_state_machine(
             const uint32_t block = pending.back();
             pending.pop_back();
             std::set<int> masks = wave64_b64_mask_in[block];
+            std::set<int> ambiguous = wave64_b64_ambiguous_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
-                advance_wave64_b64_masks(masks, in, /*record_compare*/false);
+                if (!advance_wave64_b64_masks(
+                        masks, ambiguous, in, /*record_compare*/false))
+                    return false;
             }
             for (uint32_t successor : successors[block]) {
                 if (!wave64_b64_reachable[successor]) {
                     wave64_b64_reachable[successor] = true;
                     wave64_b64_mask_in[successor] = masks;
+                    wave64_b64_ambiguous_in[successor] = ambiguous;
                     pending.push_back(successor);
                     continue;
                 }
                 std::set<int> joined;
+                std::set<int> joined_ambiguous = wave64_b64_ambiguous_in[successor];
                 std::set_intersection(
                     wave64_b64_mask_in[successor].begin(),
                     wave64_b64_mask_in[successor].end(),
                     masks.begin(), masks.end(),
                     std::inserter(joined, joined.end()));
-                if (joined != wave64_b64_mask_in[successor]) {
+                for (int base : wave64_b64_mask_in[successor])
+                    if (!masks.contains(base)) joined_ambiguous.insert(base);
+                for (int base : masks)
+                    if (!wave64_b64_mask_in[successor].contains(base))
+                        joined_ambiguous.insert(base);
+                joined_ambiguous.insert(ambiguous.begin(), ambiguous.end());
+                for (int base : joined_ambiguous) joined.erase(base);
+                if (joined != wave64_b64_mask_in[successor] ||
+                    joined_ambiguous != wave64_b64_ambiguous_in[successor]) {
                     wave64_b64_mask_in[successor] = std::move(joined);
+                    wave64_b64_ambiguous_in[successor] = std::move(joined_ambiguous);
                     pending.push_back(successor);
                 }
             }
@@ -14521,11 +14573,14 @@ bool emit_cfg_state_machine(
         for (uint32_t block = 0; block < starts.size(); ++block) {
             if (!wave64_b64_reachable[block]) continue;
             std::set<int> masks = wave64_b64_mask_in[block];
+            std::set<int> ambiguous = wave64_b64_ambiguous_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
-                advance_wave64_b64_masks(masks, in, /*record_compare*/true);
+                if (!advance_wave64_b64_masks(
+                        masks, ambiguous, in, /*record_compare*/true))
+                    return false;
             }
         }
     }
