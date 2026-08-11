@@ -17454,7 +17454,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             bool compute_ok = !Ls.empty();
             const BarrierPhasedCompute phased = analyze_barrier_phased_compute(ins);
             auto has_stable_post_barrier_lds_reads = [&](const DivLoop& loop) {
-                if (!phased.found) return false;
+                // The structured emitter performs the Workgroup load before predicating the VGPR
+                // result. Limit this exception to a top-tested EXEC loop, where the body entry
+                // proves this invocation active, and keep that proof live through every DS read.
+                if (!phased.found || loop.condition != DivLoop::Condition::Exec ||
+                    loop.bottom_tested) return false;
                 size_t phase_begin = ins.size();
                 size_t phase_end = phased.end_index;
                 for (size_t barrier : phased.barriers) {
@@ -17476,6 +17480,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     if (ins[i].fmt == Rdna2Format::DS &&
                         (ins[i].opcode != 0x36 || ins[i].ds_gds))
                         return false;
+                for (const auto& read : ins) {
+                    if (read.pc <= loop.exit_branch_pc || read.pc >= loop.backedge_pc ||
+                        read.fmt != Rdna2Format::DS) continue;
+                    for (const auto& prior : ins) {
+                        if (prior.pc <= loop.exit_branch_pc || prior.pc >= read.pc) continue;
+                        if (rdna2_instruction_may_change_exec(prior)) return false;
+                    }
+                }
                 return true;
             };
             for (const auto& L : Ls) {
