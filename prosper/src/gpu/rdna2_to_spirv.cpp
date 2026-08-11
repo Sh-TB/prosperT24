@@ -10303,6 +10303,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             in.pc, in.opcode);
                 ok = false; return true;
             }
+            // The front half proved all four live SBASE words at this exact scalar-buffer load and
+            // decoded NUM_RECORDS=0. Every possible immediate/register SOFFSET is therefore OOB, so
+            // the result is exact zero without declaring or touching a dummy storage binding. Check
+            // this before SOFFSET tracking: the point of the proof is that even an unknown runtime
+            // offset cannot change the result.
+            const ShaderResource* zero_record_sbuffer =
+                rt && in.opcode >= 0x8u ? rt->by_fetch_pc(in.pc) : nullptr;
+            if (zero_record_sbuffer && is_zero_record_raw_buffer(*zero_record_sbuffer)) {
+                for (uint32_t k = 0; k < n; ++k) {
+                    rs.sreg[in.dst.value + static_cast<int>(k)] = b.uconst(0);
+                    rs.sreg_srt.erase(in.dst.value + static_cast<int>(k));
+                }
+                return true;
+            }
             // SOFFSET handling. Immediate-only loads encode SOFFSET = SGPR_NULL (125). A register
             // SOFFSET adds an SGPR-computed byte offset:
             //  * a DESCRIPTOR s_load (x4/x8 = V#/T#) with a computed offset is the bindless fetch's
@@ -10737,6 +10751,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 rt ? rt->resources.size() : 0u);
                     }
                     ok = false; return true;
+                }
+                if (is_zero_record_raw_buffer(*res)) {
+                    // The exact live V# is empty, so format selection is never observed: every load
+                    // component returns zero and no backing buffer exists. Apply the result only to
+                    // active EXEC lanes, preserving the old destination in masked lanes.
+                    if (is_store) { ok = false; return true; }
+                    for (uint32_t k = 0; k < n; ++k) {
+                        const int d = in.dst.value + static_cast<int>(k);
+                        const uint32_t old = vreg_old(b, rs, d);
+                        rs.vreg[d] = b.uconst(0);
+                        predicate_write(b, rs, d, old);
+                    }
+                    return true;
                 }
                 resolved_buffer = res;
                 binding = res->binding;
