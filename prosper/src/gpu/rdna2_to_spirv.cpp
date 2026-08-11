@@ -7849,6 +7849,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                                                        mask_write_clobbers_pair(rs, in.dst.value); }
                 else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true;
                        mask_write_clobbers_pair(rs, in.dst.value); }
+                // One exact native subgroup per guest Wave64 also makes the logical result's
+                // architectural SGPR pair available. GTA joins an early scalar EXEC ballot with
+                // a later S_ANDN2_B64 survivor mask and then compares s[56:57] as u64. Preserve
+                // both views from the same Bool; portable/unknown subgroup modes remain mask-only.
+                if (!is_exec(in.dst) && b.is_compute && b.wave_size == 64 &&
+                    b.native_subgroup_size == 64) {
+                    rs.sreg[in.dst.value] = b.native_wave_ballot_half(r, 0);
+                    rs.sreg[in.dst.value + 1] = b.native_wave_ballot_half(r, 1);
+                    rs.sreg_srt.erase(in.dst.value);
+                    rs.sreg_srt.erase(in.dst.value + 1);
+                }
                 return true;
             }
             // The NGG wave-packing s_lshr_b64 form (dst = EXEC) sets EXEC to the count of active
@@ -14926,7 +14937,7 @@ bool emit_cfg_state_machine(
                     }
                 case Rdna2Format::VOP3:
                     // Decode exposes an unused SRC2=s0 on the lane read/write encodings. Their real
-                    // scalar data and lane-selector operands are each one dword. The three ordinary
+                    // scalar data and lane-selector operands are each one dword. The six ordinary
                     // VOP3A operations below are the exact GTA consumers in this reject family and
                     // likewise broadcast one scalar dword per source. Retain the conservative pair
                     // rule for every un-inventoried VOP3 opcode, including explicit mask inputs.
@@ -14934,7 +14945,14 @@ bool emit_cfg_state_machine(
                         return source < 2 ? ScalarSourceRead::B32 : ScalarSourceRead::None;
                     if (in.opcode == 0x365 || in.opcode == 0x366)
                         return source < 2 ? ScalarSourceRead::B32 : ScalarSourceRead::None;
-                    if (in.opcode == 0x141 || in.opcode == 0x143 || in.opcode == 0x347)
+                    if (in.opcode == 0x11f)
+                        return source < 2 ? ScalarSourceRead::B32 : ScalarSourceRead::None;
+                    // CNDMASK's two data operands are dwords; SRC2 remains a Wave64 condition
+                    // pair and deliberately keeps the conservative full-pair inventory.
+                    if (in.opcode == 0x101)
+                        return source < 2 ? ScalarSourceRead::B32 : ScalarSourceRead::Pair;
+                    if (in.opcode == 0x141 || in.opcode == 0x143 ||
+                        in.opcode == 0x347 || in.opcode == 0x36f)
                         return ScalarSourceRead::B32;
                     return ScalarSourceRead::Pair;
                 default:
@@ -15046,8 +15064,9 @@ bool emit_cfg_state_machine(
                     mask_write = in.dst.value;
                 else if (in.opcode >= 0x0f && in.opcode <= 0x1d &&
                          (in.opcode & 1u) == 1)
-                    // Emission for every B64 logical is mask-only. Scalar pairs are projected to
-                    // their per-lane bit before the operation, so the result is never scalar DATA.
+                    // Every B64 logical has a Bool-domain result. Exact native Wave64 additionally
+                    // materializes that result's ballot words below, but its mask lifetime remains
+                    // the primary classification here.
                     mask_write = in.dst.value;
                 else if (in.opcode == 0x0b && in.dst.value == 106 &&
                          !b.cselect_b64_low_only_pcs.contains(in.pc))
@@ -15131,8 +15150,12 @@ bool emit_cfg_state_machine(
                     !b.cselect_b64_low_only_pcs.contains(in.pc) &&
                     !(source_is_mask(in.src[0]) && source_is_mask(in.src[1])) &&
                     complete_scalar_pair(in.src[0]) && complete_scalar_pair(in.src[1]);
+                const bool logical_native_ballot = in.fmt == Rdna2Format::SOP2 &&
+                    in.opcode >= 0x0f && in.opcode <= 0x1d &&
+                    (in.opcode & 1u) == 1 && b.is_compute && b.wave_size == 64 &&
+                    b.native_subgroup_size == 64;
                 const bool dual_domain_scalar_write =
-                    mov_dual_domain || cselect_scalar_branch;
+                    mov_dual_domain || cselect_scalar_branch || logical_native_ballot;
                 if (!dual_domain_scalar_write) {
                     scalar_words.erase(mask_write);
                     scalar_words.erase(mask_write + 1);
