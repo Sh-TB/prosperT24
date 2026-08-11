@@ -16570,19 +16570,20 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         if (phased.found &&
             (phased.guarded || initial_dispatch_active || force_barrier_phases)) {
             // Every phase shares one immutable Workgroup OpTypeArray. Size it from the complete
-            // phased stream before the first dispatcher: a later portable DPP add needs a second
-            // per-lane plane even when the earlier phase needed only votes/liveness.
+            // phased stream before the first dispatcher: a later portable DPP operation needs a
+            // second per-lane plane even when the earlier phase needed only votes/liveness.
             if (!b.native_subgroup_size) {
                 const uint32_t wave_count =
                     (b.local_count + b.wave_size - 1) / b.wave_size;
                 const uint32_t padded_lanes = wave_count * b.wave_size;
-                const bool has_portable_dpp_add = std::any_of(
+                const bool has_portable_dpp = std::any_of(
                     ins.begin(), ins.begin() + phased.end_index,
                     [](const Rdna2Inst& in) {
-                        return is_inplace_vadd_nc_u32_dpp_row_shr(in);
+                        return is_inplace_vadd_nc_u32_dpp_row_shr(in) ||
+                            is_vmin_f32_dpp_row_ror8(in);
                     });
                 const uint32_t scratch_dwords = padded_lanes +
-                    (has_portable_dpp_add ? padded_lanes : 0u) + wave_count + 1;
+                    (has_portable_dpp ? padded_lanes : 0u) + wave_count + 1;
                 if (!b.declare_cfg_scratch(scratch_dwords)) return false;
             }
             uint32_t merge_label = 0;
