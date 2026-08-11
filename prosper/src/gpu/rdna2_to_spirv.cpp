@@ -162,7 +162,8 @@ enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Gls
                   Glsl_FindUMsb=75,   // bit index of the highest set bit (undefined at zero)
                   Glsl_NMin=79, Glsl_NMax=80 };   // NaN-aware min/max: one-NaN operand -> the other operand
 enum : uint32_t {
-    Cap_Shader=1, Cap_Geometry=2, Cap_Int64=11, Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
+    Cap_Shader=1, Cap_Geometry=2, Cap_Int64=11, Cap_Int64Atomics=12,
+    Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
     Cap_GroupNonUniformArithmetic=63, Cap_GroupNonUniformBallot=64, Cap_GroupNonUniformShuffle=65, Cap_GroupNonUniformQuad=68,
     Cap_TransformFeedback=53,   // VK_EXT_transform_feedback (geometry-probe capture of gl_Position, gated)
     // Descriptor indexing (#2412 stage 4b). These are CORE only from SPIR-V 1.5; this emitter writes
@@ -384,11 +385,13 @@ struct SpirvCompute {
     uint32_t linear_localid = 0, local_count = 64, wave_size = 64;
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
     uint32_t t_ptr_sb_struct_u=0;                    // shared runtime-u32 Block pointer type
+    uint32_t t_ptr_sb_u64=0, t_ptr_sb_struct_u64=0; // lazy alias view for 64-bit buffer atomics
     uint32_t t_ptr_img_u32=0;                       // OpImageTexelPointer result for R32_UINT atomics
     uint32_t guest_scratch=0, t_ptr_guest_scratch_u32=0;
     int32_t guest_scratch_min_byte=0, guest_scratch_saddr=-1;
     uint32_t guest_scratch_dwords=0;
     std::map<uint32_t, uint32_t> cbuf_var;          // binding -> storage-buffer var (N-buffer model; 2/3 map to v_cbuf/v_cbuf1)
+    std::map<uint32_t, uint32_t> cbuf_u64_var;      // binding -> runtime-u64 alias variable
     // binding -> declared array length for a TABLE-INDEXED binding (#2412). Absent means an ordinary
     // single descriptor, so an access chain for it takes no leading index. Kept beside `cbuf_var`
     // because every consumer of the variable also needs to know whether it is an array.
@@ -427,6 +430,7 @@ struct SpirvCompute {
     // subgroup size equal to the PS5 wave. Native votes/scans are then architecture-exact.
     uint32_t native_subgroup_size=0;
     uint32_t native_storage_format_support=0;
+    bool storage_buffer_int64_atomics=false;
     bool packed_r11_storage=true;
     uint32_t compute_min_subgroup_size=0;             // non-semantic backend contract (4/16/32/64)
     uint32_t fragment_required_subgroup_size=0;       // exact guest-wave contract (32 or 64)
@@ -1277,7 +1281,7 @@ struct SpirvCompute {
     uint32_t bfe_u(uint32_t base, uint32_t off, uint32_t cnt) { uint32_t offc = uext2(Glsl_UMin, off, uconst(32)); uint32_t r = id(); put(code, Op_BitFieldUExtract, {t_u32, r, base, offc, bfe_clamp_cnt(offc, cnt)}); return r; }
     uint32_t bfe_s(uint32_t base, uint32_t off, uint32_t cnt) { uint32_t offc = uext2(Glsl_UMin, off, uconst(32)); uint32_t ri = id(); put(code, Op_BitFieldSExtract, {t_i32, ri, bcs(base), offc, bfe_clamp_cnt(offc, cnt)}); return i2u(ri); }
     // Lazily declared 64-bit uint (+ Int64 capability), for s_bfe_u64 etc. that operate on SGPR pairs.
-    uint32_t t_u64_cache = 0; bool declared_int64 = false;
+    uint32_t t_u64_cache = 0; bool declared_int64 = false, declared_int64_atomics = false;
     uint32_t t_u64() { if (!t_u64_cache) { if (!declared_int64) { put(caps, Op_Capability, {Cap_Int64}); declared_int64 = true; }
                        t_u64_cache = id(); put(types, Op_TypeInt, {t_u64_cache, 64, 0}); } return t_u64_cache; }
     // A 64-bit uint constant needs two value words. Shift amounts MUST be u64 here: a u32 shift operand on
@@ -1325,6 +1329,9 @@ struct SpirvCompute {
     uint32_t u64_lo(uint32_t v64) { uint32_t r = id(); put(code, Op_UConvert, {t_u32, r, v64}); return r; }  // truncate low 32
     uint32_t u64_hi(uint32_t v64) { uint32_t s = id(); put(code, Op_ShiftRightLogical, {t_u64(), s, v64, uconst64(32)});
         uint32_t r = id(); put(code, Op_UConvert, {t_u32, r, s}); return r; }
+    uint32_t sel64(uint32_t cond, uint32_t yes, uint32_t no) {
+        uint32_t r = id(); put(code, Op_Select, {t_u64(), r, cond, yes, no}); return r;
+    }
     uint32_t u64_bit(uint32_t v64, uint32_t bit) {
         uint32_t shift = id(); put(code, Op_UConvert, {t_u64(), shift, bit});
         uint32_t shifted = id(); put(code, Op_ShiftRightLogical, {t_u64(), shifted, v64, shift});
@@ -2111,6 +2118,32 @@ struct SpirvCompute {
         if (binding == 3) return v_cbuf1;
         auto it = cbuf_var.find(binding); return it != cbuf_var.end() ? it->second : v_cbuf;
     }
+    // Logical-addressing SPIR-V cannot bitcast a pointer into the ordinary runtime-u32 Block to a
+    // u64 pointer. Declare a second, aliased StorageBuffer variable at the SAME descriptor binding.
+    // Vulkan binds both declarations to one VkBuffer; ArrayStride=8 gives the qword atomics their
+    // natural record index. The narrow caller excludes descriptor arrays.
+    uint32_t u64_buf_for_binding(uint32_t binding) {
+        if (auto found = cbuf_u64_var.find(binding); found != cbuf_u64_var.end())
+            return found->second;
+        if (!t_ptr_sb_struct_u64) {
+            const uint32_t runtime_array = id(), block = id();
+            t_ptr_sb_struct_u64 = id();
+            t_ptr_sb_u64 = id();
+            put(deco, Op_Decorate, {runtime_array, Dec_ArrayStride, 8});
+            put(deco, Op_MemberDecorate, {block, 0, Dec_Offset, 0});
+            put(deco, Op_Decorate, {block, Dec_Block});
+            put(types, Op_TypeRuntimeArray, {runtime_array, t_u64()});
+            put(types, Op_TypeStruct, {block, runtime_array});
+            put(types, Op_TypePointer, {t_ptr_sb_struct_u64, SC_StorageBuffer, block});
+            put(types, Op_TypePointer, {t_ptr_sb_u64, SC_StorageBuffer, t_u64()});
+        }
+        const uint32_t variable = id();
+        put(deco, Op_Decorate, {variable, Dec_DescriptorSet, desc_set});
+        put(deco, Op_Decorate, {variable, Dec_Binding, binding});
+        declare_external_storage_buffer(t_ptr_sb_struct_u64, variable);
+        cbuf_u64_var[binding] = variable;
+        return variable;
+    }
     void mark_cbuf_coherent(uint32_t binding) {
         const uint32_t buf = buf_for_binding(binding);
         if (cbuf_coherent_vars.insert(buf).second)
@@ -2225,6 +2258,37 @@ struct SpirvCompute {
         put(code, Op_Branch, {merge});
         put(code, Op_Label, {merge}); cur_block = merge;
         return emit_phi_2way(t_u32, result, then_end, fallback, entry);
+    }
+    // One true 64-bit RMW for the exact naturally-strided guest contract. The caller supplies the
+    // SPIR-V atomic opcode and original qword record index, and range-checks it before entry.
+    uint32_t cbuf_atomic_x2_rtn(uint32_t op, uint32_t index, uint32_t value, uint32_t binding,
+                                uint32_t pred, uint32_t fallback) {
+        cbuf_ordinary_accesses.insert(binding);
+        if (!declared_int64_atomics) {
+            put(caps, Op_Capability, {Cap_Int64Atomics});
+            declared_int64_atomics = true;
+        }
+        const uint32_t buf = u64_buf_for_binding(binding);
+        auto emit = [&]() {
+            const uint32_t pointer = id();
+            putv(code, Op_AccessChain,
+                 {t_ptr_sb_u64, pointer, buf, uconst(0), index});
+            const uint32_t result = id();
+            put(code, op,
+                {t_u64(), result, pointer, uconst(Scope_Device),
+                 uconst(MemSem_UniformAcqRel), value});
+            return result;
+        };
+        const uint32_t entry = cur_block;
+        const uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then}); cur_block = then;
+        const uint32_t result = emit();
+        const uint32_t then_end = cur_block;
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
+        return emit_phi_2way(t_u64(), result, then_end, fallback, entry);
     }
     // RADV currently hangs/reset-poisons the device on Astro Bot's compute R32_UINT image atomic.
     // Compute lowers that exact 2D resource through a detiled storage-buffer view instead. The live
@@ -10927,7 +10991,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // later register consumers, so reject until status-return semantics are implemented.
             if (in.fmt == Rdna2Format::MTBUF && in.mtbuf_tfe) { ok = false; return true; }
             uint32_t n = 0; bool is_format = false, is_store = false, is_atomic = false;
+            bool is_atomic_x2 = false;
             uint32_t atomic_op = 0;   // SPIR-V atomic RMW opcode for is_atomic (set by the switch)
+            uint32_t atomic_x2_record_count = 0;
             bool raw_subword = false, raw_signed = false;
             uint32_t raw_bits = 32;
             switch (in.opcode) {
@@ -10957,8 +11023,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // mem = mem OP VDATA and returns the PRE-op value in VDATA. They all share the generic
                 // OpAtomic<Op>(ptr, Device, AcqRel, value) shape emitted by cbuf_atomic_rtn. VDATA is one
                 // dword. CMPSWAP (0x31, two-operand), CSUB (0x34, conditional-subtract), INC/DEC
-                // (0x3c/0x3d, wrap semantics), and the x2 64-bit variants stay deferred (fail-visible)
-                // via the default case below — they need distinct lowering, not a plain RMW.
+                // (0x3c/0x3d, wrap semantics), and most x2 64-bit variants stay deferred
+                // (fail-visible) via the default case below. Opcodes 0x50/0x5a have separately
+                // guarded GTA V lowerings: one true qword RMW, never two ordinary 32-bit atomics.
                 case 0x30: n = 1; is_atomic = true; atomic_op = Op_AtomicExchange; break; // swap
                 case 0x32: n = 1; is_atomic = true; atomic_op = Op_AtomicIAdd;     break; // add
                 case 0x33: n = 1; is_atomic = true; atomic_op = Op_AtomicISub;     break; // sub
@@ -10969,6 +11036,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x39: n = 1; is_atomic = true; atomic_op = Op_AtomicAnd;      break; // and
                 case 0x3a: n = 1; is_atomic = true; atomic_op = Op_AtomicOr;       break; // or
                 case 0x3b: n = 1; is_atomic = true; atomic_op = Op_AtomicXor;      break; // xor
+                case 0x50: n = 2; is_atomic = true; is_atomic_x2 = true;
+                           atomic_op = Op_AtomicExchange; break;                    // swap_x2
+                case 0x5a: n = 2; is_atomic = true; is_atomic_x2 = true;
+                           atomic_op = Op_AtomicOr; break;                          // or_x2
                 default: ok = false; return true;           // remaining typed/atomic opcodes deferred
             }
             uint32_t offset = in.literal & 0xFFFu;
@@ -11205,6 +11276,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (raw_bits == 8) fmt = raw_signed ? DataFormat::Sint8 : DataFormat::Uint8;
                 else               fmt = raw_signed ? DataFormat::Sint16 : DataFormat::Uint16;
             }
+            if (is_atomic_x2) {
+                const bool zero_soffset =
+                    (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                    (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                const bool exact_shape = b.storage_buffer_int64_atomics && resolved_buffer &&
+                    resolved_buffer->fetch_pc == in.pc &&
+                    resolved_buffer->table_index_count == 0u &&
+                    resolved_buffer->stride == 8u &&
+                    resolved_buffer->atomic_x2_record_count != 0u &&
+                    resolved_buffer->atomic_x2_record_count <= 0x02000000u &&
+                    static_cast<uint64_t>(resolved_buffer->atomic_x2_record_count) * 8u ==
+                        resolved_buffer->size &&
+                    (resolved_buffer->gpu_addr & 7u) == 0u && idxen && !offen &&
+                    offset == 0u && zero_soffset && !in.mubuf_dlc &&
+                    !in.mubuf_lds && (in.words[0] & 0x00020000u) == 0u &&
+                    (in.words[1] & 0x00e00000u) == 0u &&
+                    in.src[0].kind == OperandKind::VGPR;
+                if (!exact_shape) { ok = false; return true; }
+                atomic_x2_record_count = resolved_buffer->atomic_x2_record_count;
+            }
             // else (rt == nullptr): table-less offline compute shell (recompile_valu without a resource
             // table — the unit-test harness). Keep the legacy single-cbuf convention: binding 2, stride 0.
             // The live graphics path can never reach here table-less: recompile_vertex/recompile_fragment
@@ -11371,6 +11462,34 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             auto load_dword = [&](uint32_t dword_idx) {
                 return b.cbuf_load(dword_idx, binding, coherent_load);
             };
+            if (is_atomic_x2) {
+                const int d = in.dst.value;
+                const uint32_t old_lo = vreg_old(b, rs, d);
+                const uint32_t old_hi = vreg_old(b, rs, d + 1);
+                const auto lo_it = rs.vreg.find(d), hi_it = rs.vreg.find(d + 1);
+                const uint32_t value_lo = lo_it == rs.vreg.end() ? b.uconst(0) : lo_it->second;
+                const uint32_t value_hi = hi_it == rs.vreg.end() ? b.uconst(0) : hi_it->second;
+                const uint32_t value = b.u64_from_lohi(value_lo, value_hi);
+                // Range-check the original qword record index against this dispatch's concrete V#.
+                // Each valid index addresses its natural eight-byte record; larger indices are OOB.
+                const uint32_t record_index = val(in.src[0]);
+                const uint32_t in_bounds =
+                    b.ucmp(Op_ULessThan, record_index, b.uconst(atomic_x2_record_count));
+                const uint32_t access = rs.exec_narrowed
+                    ? b.land(rs.exec, in_bounds) : in_bounds;
+                uint32_t fallback = b.uconst64(0);
+                if (rs.exec_narrowed)
+                    fallback = b.sel64(rs.exec, fallback, b.u64_from_lohi(old_lo, old_hi));
+                const uint32_t pre = b.cbuf_atomic_x2_rtn(
+                    atomic_op, record_index, value, binding, access, fallback);
+                // GLC=0 preserves BOTH data VGPRs. GLC=1 returns the pre-op qword; active OOB lanes
+                // receive zero and inactive EXEC lanes receive their original pair via fallback.
+                if (in.mubuf_glc) {
+                    rs.vreg[d] = b.u64_lo(pre);
+                    rs.vreg[d + 1] = b.u64_hi(pre);
+                }
+                return true;
+            }
             if (is_atomic) {
                 const int d = in.dst.value;
                 const uint32_t old = vreg_old(b, rs, d);
@@ -18649,6 +18768,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                                     "of waves")))));
     }
     b.native_storage_format_support = config.native_storage_format_support;
+    b.storage_buffer_int64_atomics = config.storage_buffer_int64_atomics;
     b.packed_r11_storage = config.packed_r11_storage;
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
             static_cast<uint32_t>(config.user_sgprs.size()));
