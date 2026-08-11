@@ -434,6 +434,10 @@ struct SpirvCompute {
     // also identifies which physical ballot half the slot represents, V_READLANE can publish the
     // corresponding scalar dword without guessing from the SGPR number or spill lane.
     std::unordered_map<uint32_t, uint32_t> wave64_mask_readlane_half_for_pc;
+    // A mask half restored to an ordinary SGPR may be written back to a spill lane after crossing
+    // a dispatcher edge. Keep the exact proven V_WRITELANE sites separate from the SGPR number:
+    // physical SGPRs are routinely recycled as scalar data elsewhere in the same shader.
+    std::unordered_set<uint32_t> wave64_mask_writelane_alias_pcs;
     bool     declared_subgroup=0, declared_subgroup_vote=0, declared_subgroup_arithmetic=0;
     // When non-zero, the backend promises to create this compute pipeline with an exact required
     // subgroup size equal to the PS5 wave. Native votes/scans are then architecture-exact.
@@ -9856,10 +9860,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     mask_value = rs.exec; mask_source = true;
                 } else if ((in.src[0].value == 106 || in.src[0].value == 107) &&
                            !rs.sreg.count(in.src[0].value)) {
+                    if (b.is_compute && b.wave_size == 64 &&
+                        b.native_subgroup_size == 64) {
+                        // A physical VCC word has no runtime mask/data tag. The Wave64 half proof
+                        // deliberately seeds only EXEC; until VCC is tied to the mask-domain MUST
+                        // analysis, persisting this spill could resurrect a false Bool placeholder.
+                        ok = false; return true;
+                    }
                     mask_value = rs.vcc; mask_source = true;
                 } else if (in.src[0].kind == OperandKind::SGPR) {
                     auto saved = rs.sreg_bool.find(in.src[0].value);
                     if (saved != rs.sreg_bool.end()) { mask_value = saved->second; mask_source = true; }
+                }
+                if (b.wave64_mask_writelane_alias_pcs.contains(in.pc) && !mask_source) {
+                    // The CFG MUST proof says this exact source is a restored mask half. Falling
+                    // back to its parallel uint Function variable would silently select a scalar
+                    // placeholder if dispatcher persistence ever drifts from that proof.
+                    ok = false; return true;
                 }
                 rs.vreg.erase(in.dst.value);                            // spill-array lifetime
                 if (mask_source) {
@@ -15339,6 +15356,8 @@ bool emit_cfg_state_machine(
     // loop. The Bool slot alone loses whether it was LO or HI, while a dispatcher uint placeholder
     // is not a validity tag. Track that identity as a CFG MUST fact and publish it only at exact
     // native-Wave64 readlane PCs. Joins retain equal facts; every ordinary overwrite kills them.
+    std::vector<std::map<int, uint32_t>> wave64_mask_half_sreg_in(starts.size());
+    std::vector<bool> wave64_mask_half_reachable(starts.size(), false);
     if (b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64 && !starts.empty()) {
         struct MaskHalfState {
             std::map<int, uint32_t> sreg;
@@ -15410,7 +15429,11 @@ bool emit_cfg_state_machine(
                 int half = special_half(in.src[0]);
                 if (half < 0 && in.src[0].kind == OperandKind::SGPR) {
                     const auto source = state.sreg.find(in.src[0].value);
-                    if (source != state.sreg.end()) half = source->second;
+                    if (source != state.sreg.end()) {
+                        half = source->second;
+                        if (record)
+                            b.wave64_mask_writelane_alias_pcs.insert(in.pc);
+                    }
                 }
                 if (half < 0) state.slot.erase(key);
                 else state.slot[key] = static_cast<uint32_t>(half);
@@ -15457,6 +15480,8 @@ bool emit_cfg_state_machine(
         }
         for (uint32_t block = 0; block < starts.size(); ++block) {
             if (!half_reachable[block]) continue;
+            wave64_mask_half_reachable[block] = true;
+            wave64_mask_half_sreg_in[block] = half_in[block].sreg;
             MaskHalfState state = half_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
@@ -15596,6 +15621,10 @@ bool emit_cfg_state_machine(
 
     // Saved mask pairs and scalar-spill lane slots have their own value domains.
     std::set<int> mask_keys = static_mask_keys;
+    for (uint32_t block = 0; block < starts.size(); ++block)
+        if (wave64_mask_half_reachable[block])
+            for (const auto& alias : wave64_mask_half_sreg_in[block])
+                mask_keys.insert(alias.first);
     std::set<std::pair<int, int>> lane_slots, mask_lane_slots;
     // A lane spill can precede another static definition of its mask in a back-edge block, hence the
     // complete discovery pass above occurs before classifying any spill slots here.
@@ -15606,7 +15635,9 @@ bool emit_cfg_state_machine(
             const std::pair<int, int> slot{in.dst.value, in.src[1].value};
             const bool is_mask = in.src[0].value == 106 || in.src[0].value == 107 ||
                                  in.src[0].value == 126 || in.src[0].value == 127 ||
-                                 (in.src[0].kind == OperandKind::SGPR && mask_keys.count(in.src[0].value));
+                                 (in.src[0].kind == OperandKind::SGPR &&
+                                  (static_mask_keys.count(in.src[0].value) ||
+                                   b.wave64_mask_writelane_alias_pcs.contains(in.pc)));
             (is_mask ? mask_lane_slots : lane_slots).insert(slot);
         }
     }
@@ -15849,6 +15880,7 @@ bool emit_cfg_state_machine(
         const std::set<int>* entry_b64 = nullptr;
         const std::set<int>* entry_wave64_b64 = nullptr;
         const std::set<int>* entry_wave64_scalar_words = nullptr;
+        const std::map<int, uint32_t>* entry_wave64_mask_halves = nullptr;
         uint32_t entry_block = UINT32_MAX;
         if (dispatch != UINT32_MAX)
             entry_block = dispatch_blocks[dispatch].front();
@@ -15868,14 +15900,21 @@ bool emit_cfg_state_machine(
             entry_wave64_b64 = &wave64_b64_mask_in[entry_block];
             entry_wave64_scalar_words = &wave64_scalar_word_in[entry_block];
         }
+        if (entry_block != UINT32_MAX &&
+            wave64_mask_half_reachable[entry_block])
+            entry_wave64_mask_halves = &wave64_mask_half_sreg_in[entry_block];
         for (const auto& kv : mv) {
             if (b.allow_b32_masks &&
                 (!entry_b64 || !entry_b64->contains(kv.first)) &&
                 (!entry_b32 || !entry_b32->contains(kv.first)))
                 continue;
-            if (filters_wave64_b64 &&
-                (!entry_wave64_b64 || !entry_wave64_b64->contains(kv.first)))
-                continue;
+            if (filters_wave64_b64) {
+                const bool live_b64_mask =
+                    entry_wave64_b64 && entry_wave64_b64->contains(kv.first);
+                const bool live_mask_half_alias = entry_wave64_mask_halves &&
+                    entry_wave64_mask_halves->contains(kv.first);
+                if (!live_b64_mask && !live_mask_half_alias) continue;
+            }
             state.sreg_bool[kv.first] = b.load_function(b.t_bool, kv.second);
             state.sreg_bool_narrowed[kv.first] = true;
         }
