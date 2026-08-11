@@ -17481,8 +17481,12 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         (ins[i].opcode != 0x36 || ins[i].ds_gds))
                         return false;
                 for (const auto& read : ins) {
-                    if (read.pc <= loop.exit_branch_pc || read.pc >= loop.backedge_pc ||
+                    if (read.pc < loop.header_pc || read.pc >= loop.backedge_pc ||
                         read.fmt != Rdna2Format::DS) continue;
+                    // The condition region runs before the top-of-loop EXEC test. A load there has
+                    // no active-lane proof yet, so the emitter's unconditional Workgroup access is
+                    // not safe even though the rest of the phase is read-only.
+                    if (read.pc <= loop.exit_branch_pc) return false;
                     for (const auto& prior : ins) {
                         if (prior.pc <= loop.exit_branch_pc || prior.pc >= read.pc) continue;
                         if (rdna2_instruction_may_change_exec(prior)) return false;
