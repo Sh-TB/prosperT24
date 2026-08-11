@@ -17452,8 +17452,36 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // differ across a workgroup, so a barrier inside the loop would be workgroup-divergent
             // control flow (UB); barriers AFTER the loop are fine (the loop merge reconverges).
             bool compute_ok = !Ls.empty();
+            const BarrierPhasedCompute phased = analyze_barrier_phased_compute(ins);
+            auto has_stable_post_barrier_lds_reads = [&](const DivLoop& loop) {
+                if (!phased.found) return false;
+                size_t phase_begin = ins.size();
+                size_t phase_end = phased.end_index;
+                for (size_t barrier : phased.barriers) {
+                    if (ins[barrier].pc < loop.header_pc) {
+                        phase_begin = barrier + 1;
+                        continue;
+                    }
+                    phase_end = barrier;
+                    break;
+                }
+                if (phase_begin == ins.size() ||
+                    (phase_end < ins.size() && loop.exit_pc > ins[phase_end].pc))
+                    return false;
+                // This narrow exception is read-only for the COMPLETE phase. A preceding proved
+                // top-level barrier publishes earlier LDS initialization; with no later LDS write,
+                // atomic, GDS access, or other DS opcode, each per-lane loop may repeat its own
+                // ordinary DS_READ_B32 without introducing visibility or synchronization edges.
+                for (size_t i = phase_begin; i < phase_end; ++i)
+                    if (ins[i].fmt == Rdna2Format::DS &&
+                        (ins[i].opcode != 0x36 || ins[i].ds_gds))
+                        return false;
+                return true;
+            };
             for (const auto& L : Ls) {
                 if (!compute_ok) break;
+                const bool stable_post_barrier_reads =
+                    has_stable_post_barrier_lds_reads(L);
                 for (const auto& in : ins) {
                     if (in.is_end || in.pc >= L.exit_pc) break;
                     if (in.pc < L.header_pc) continue;
@@ -17461,11 +17489,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         (in.opcode == 0x35 || in.opcode == 0x3d || in.opcode == 0x3e);
                     // SCC is architectural scalar control, so an SCC loop executes ordinary LDS
                     // effects uniformly within each guest wave just like the existing CountedLoop
-                    // path. EXEC/VCC loops retain their per-invocation approximation and therefore
-                    // keep rejecting all LDS. Cross-lane DS collectives, MBCNT, and a guest barrier
-                    // remain unavailable in every multi-loop condition domain.
+                    // path. EXEC/VCC loops retain their per-invocation approximation: only ordinary
+                    // read-only LDS in the proved stable post-barrier phase above is safe. Cross-lane
+                    // DS collectives, writes/atomics, MBCNT, and a guest barrier remain unavailable.
+                    const bool stable_lds_read = stable_post_barrier_reads &&
+                        in.fmt == Rdna2Format::DS && in.opcode == 0x36 && !in.ds_gds;
                     if ((in.fmt == Rdna2Format::DS &&
-                         (L.condition != DivLoop::Condition::Scc || ds_wave_collective)) ||
+                         ((L.condition != DivLoop::Condition::Scc && !stable_lds_read) ||
+                          ds_wave_collective)) ||
                         (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a) ||
                         (in.fmt == Rdna2Format::VOP3 &&
                          (in.opcode == 0x365 || in.opcode == 0x366))) { compute_ok = false; break; }
