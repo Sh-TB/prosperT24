@@ -4509,6 +4509,7 @@ struct DivLoop {
     std::vector<uint32_t> break_pcs;   // extra forward vccz/execz -> exit_pc (lowered as body ifs)
     bool direct_exec_breaks = false;   // unconditional back-edge: an interior execz exits directly
     bool direct_wave_breaks = false;   // fragment wave64: an interior vccz exits the complete wave
+    bool bottom_tested = false;        // s_cbranch_execnz back-edge is the condition (do-while)
     Condition condition = Condition::Exec;
     // EXECZ/VCCZ and SCC0 all continue while their represented predicate is set. SCC1 is the one
     // admitted opposite-polarity canonical exit: it leaves the loop while SCC is set.
@@ -4769,24 +4770,48 @@ std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
             }
             // (tgt <= backedge_pc: an interior forward if — validated by detect_forward_ifs.)
         }
-        if (!L.exit_branch_pc) return {};         // no exit test: not this shape
-        // The canonical exit must be the FIRST branch in the loop, so the condition region
-        // [header, exit_branch) is branch-free (it is emitted straight-line).
-        for (const auto& in : ins) {
-            if (in.pc >= L.exit_branch_pc) break;
-            if (in.pc < L.header_pc || in.fmt != Rdna2Format::SOPP) continue;
-            if (in.opcode >= 0x02 && in.opcode <= 0x09 && in.opcode != 0x03 && !safe.count(in.pc))
-                return {};
+        if (!L.exit_branch_pc) {
+            // Bottom-tested EXEC loop: the back-edge itself is `s_cbranch_execnz HEADER`, so the
+            // complete body executes once before the first condition. Require the instruction
+            // immediately preceding the branch to update EXEC; accepting a stale entry mask here
+            // would turn an arbitrary backward branch into a do-while (and commonly an infinite
+            // one). GTA V's nested lighting loop ends in V_CMPX; the regression uses S_MOV_B64
+            // EXEC,0. Nested child branches were already validated and skipped above.
+            if (!execnz) return {};
+            const Rdna2Inst* condition_writer = nullptr;
+            for (const auto& in : ins) {
+                if (in.pc < L.header_pc) continue;
+                if (in.pc >= L.backedge_pc) break;
+                condition_writer = &in;
+            }
+            if (!condition_writer ||
+                !rdna2_instruction_may_change_exec(*condition_writer)) return {};
+            L.exit_branch_pc = L.backedge_pc;
+            L.condition = DivLoop::Condition::Exec;
+            L.continue_on_set = true;
+            L.bottom_tested = true;
+        }
+        if (!L.bottom_tested) {
+            // A top-tested loop's canonical exit must be the FIRST branch, so its condition region
+            // [header, exit_branch) is branch-free and can be emitted straight-line. A bottom-tested
+            // loop instead puts its complete, already-validated structured body in this region.
+            for (const auto& in : ins) {
+                if (in.pc >= L.exit_branch_pc) break;
+                if (in.pc < L.header_pc || in.fmt != Rdna2Format::SOPP) continue;
+                if (in.opcode >= 0x02 && in.opcode <= 0x09 && in.opcode != 0x03 &&
+                    !safe.count(in.pc)) return {};
+            }
         }
         // The execnz flavor's unconditional-continue lowering requires the header check to
         // immediately re-test EXEC (empty condition region) — see the shape comment.
-        if (execnz && L.exit_branch_pc != L.header_pc) return {};
+        if (execnz && !L.bottom_tested && L.exit_branch_pc != L.header_pc) return {};
     }
     // A nested child must lie entirely within its parent's BODY: after the parent's canonical exit
     // test (the condition region [header, exit_branch) stays branch-free) and before its back-edge.
     for (size_t i = 0; i < out.size(); i++)
         for (size_t j = i + 1; j < out.size(); j++)
             if (out[j].exit_pc <= out[i].backedge_pc &&        // nested per the classification above
+                !out[i].bottom_tested &&
                 out[j].header_pc <= out[i].exit_branch_pc) return {};
     // Pass 3: no branch from OUTSIDE a loop may target its interior (an unstructured entry edge).
     for (const auto& in : ins) {
@@ -17721,9 +17746,16 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // An EXEC-governed loop predicates vector writes. VCC/SCC-governed loops branch on their
             // represented predicate but do not themselves change EXEC, matching the hardware body.
             if (L.condition == DivLoop::Condition::Exec) rs.exec_narrowed = true;
-            // Condition region [header, exit_branch): branch-free (validated), straight-line.
+            // A top-tested condition region is branch-free. For a bottom-tested EXEC loop the
+            // same interval is the complete do-while body and may contain validated nested loops;
+            // recurse so those children keep their own structured merges before the latch test.
             const uint32_t condition_entry_scc = rs.scc;
-            if (!emit_range(L.header_pc, L.exit_branch_pc)) return false;
+            if (L.bottom_tested) {
+                if (!emit_structured(
+                        L.header_pc, L.exit_branch_pc, L.exit_branch_pc)) return false;
+            } else if (!emit_range(L.header_pc, L.exit_branch_pc)) {
+                return false;
+            }
             // A canonical SCC loop must compute a fresh representable scalar predicate on every
             // header visit. Reusing the header phi would admit stale SCC, while a B64 wave-mask
             // producer poisons rs.scc to zero; both remain fail-visible.
@@ -17757,7 +17789,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             uint32_t* prior_direct_wave_continue = active_direct_wave_continue;
             active_direct_wave_loop = &L;
             active_direct_wave_continue = &direct_wave_continue;
-            const bool body_ok = emit_structured(
+            const bool body_ok = L.bottom_tested || emit_structured(
                 L.exit_branch_pc + 1, L.backedge_pc, L.backedge_pc);
             active_direct_wave_loop = prior_direct_wave_loop;
             active_direct_wave_continue = prior_direct_wave_continue;
