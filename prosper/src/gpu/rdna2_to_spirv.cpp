@@ -1121,6 +1121,22 @@ struct SpirvCompute {
                               uint32_t* valid_lane = nullptr) {
         return subgroup_row_shr_dynamic(value, active, uconst(amount), 0, valid_lane);
     }
+    uint32_t subgroup_row_ror8(uint32_t value, uint32_t active,
+                               uint32_t* valid_lane = nullptr) {
+        mark_subgroup_min16();
+        const uint32_t lane = subgroup_local_id();
+        // ROW_ROR:8 swaps the two eight-lane halves of each architectural DPP16 row. XOR 8 is
+        // exactly (row_lane - 8) modulo 16 while preserving every row/subgroup bit above bit 3.
+        const uint32_t source_lane = ibin(Op_BitwiseXor, lane, uconst(8));
+        const uint32_t rotated = subgroup_shuffle(value, source_lane);
+        // FI=0 makes an EXEC-inactive source invalid. The one admitted form has BOUND_CTRL=1,
+        // whose caller substitutes zero for that invalid source before V_MIN_F32.
+        const uint32_t source_active = subgroup_shuffle(
+            sel(active, uconst(1), uconst(0)), source_lane);
+        const uint32_t valid = ucmp(Op_INotEqual, source_active, uconst(0));
+        if (valid_lane) *valid_lane = valid;
+        return sel(valid, rotated, value);
+    }
     uint32_t subgroup_quad_permute(uint32_t value, uint32_t ctrl) {
         const uint32_t lane = subgroup_local_id();
         const uint32_t quad_lane = ibin(Op_BitwiseAnd, lane, uconst(3));
@@ -8610,10 +8626,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // ROW_SHR in the proven one-live-lane NGG projection supplies zero for lane 0.
             if (in.has_dpp) {
                 const bool row_shr = in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11Fu;
+                const bool row_ror8 = in.dpp_ctrl == 0x128u;
                 const bool fop = in.opcode == 0x03 || in.opcode == 0x04 || in.opcode == 0x05 ||
                                  in.opcode == 0x08 || in.opcode == 0x0F || in.opcode == 0x10 ||
                                  in.opcode == 0x1F || in.opcode == 0x2B;
-                if (row_shr) {
+                if (row_ror8) {
+                    // The decoder admits only GTA V's full-mask, BC1, FI0 V_MIN_F32 packet. Repeat
+                    // that contract at the production emission site: a straight-line region is
+                    // wave-visible, while structured compute requires one exact native guest wave.
+                    if (!b.is_compute || in.opcode != 0x0fu || !in.dpp_bound_ctrl ||
+                        in.dpp_row_mask != 0xfu || in.dpp_bank_mask != 0xfu ||
+                        (!allow_wave && !b.native_subgroup_size)) {
+                        ok = false; return true;
+                    }
+                    uint32_t valid_source = 0;
+                    const uint32_t rotated = b.subgroup_row_ror8(a, rs.exec, &valid_source);
+                    a = b.sel(valid_source, rotated, b.uconst(0));
+                } else if (row_shr) {
                     if (b.is_vertex) {
                         if (!b.ngg_one_lane || in.opcode != 0x25 || !in.dpp_bound_ctrl) {
                             ok = false; return true;
