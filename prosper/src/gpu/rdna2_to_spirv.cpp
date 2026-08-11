@@ -11169,7 +11169,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // four-dword BVH descriptor and eleven NSA VGPR operands. Vulkan ray-query support is
             // not available on every backend/device Prosper supports, so lower the exact RTIP 1.1
             // contract used by Astro Bot to ordinary read-only SSBO loads and scalar ALU. The
-            // front-half admits only TYPE=8, triangle-return-mode=1, unsorted descriptors; keeping
+            // front-half admits only TYPE=8, triangle-return-mode=1 descriptors; keeping
             // the instruction gate equally narrow makes every unverified variant fail visibly.
             if (in.opcode == 0xe6u) {
                 const ShaderResource* bvh = rt->by_fetch_pc(in.pc);
@@ -11320,9 +11320,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 tri_out[3] = swizzled_bary(j_selector);
 
                 // Convert each FP16 box payload to the same six-float representation as an FP32
-                // box, then apply the slab test to all four children. Sorting is deliberately absent:
-                // the admitted Astro descriptor has BOX_SORT_EN=0, so architectural order is kept.
+                // box, then apply the slab test to all four children. BOX_SORT_EN orders valid hits
+                // by increasing near intersection time; misses receive +INF and therefore remain at
+                // the end. Strict compare-swaps retain physical child order for equal-time hits.
                 uint32_t box_out[4]{};
+                uint32_t box_key[4]{};
                 uint32_t ray_inv[3] = {a[8], a[9], a[10]};
                 for (uint32_t child = 0; child < 4; ++child) {
                     const uint32_t hbase = 4u + child * 3u;
@@ -11360,7 +11362,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         b.logical_not(nan_interval),
                         b.fcmp(Op_FOrdLessThanEqual, near_t,
                                fmul(far_t, b.uconst(std::bit_cast<uint32_t>(box_multiplier)))));
-                    box_out[child] = b.sel(b.land(box_valid, hit), w[child], invalid);
+                    const uint32_t valid_hit = b.land(box_valid, hit);
+                    box_out[child] = b.sel(valid_hit, w[child], invalid);
+                    box_key[child] = b.sel(valid_hit, near_t, b.uconst(0x7f800000u));
+                }
+                if (bvh->bvh_sort_enabled) {
+                    auto compare_swap = [&](uint32_t left, uint32_t right) {
+                        const uint32_t left_key = box_key[left];
+                        const uint32_t right_key = box_key[right];
+                        const uint32_t left_out = box_out[left];
+                        const uint32_t right_out = box_out[right];
+                        const uint32_t swap = b.fcmp(
+                            Op_FOrdGreaterThan, left_key, right_key);
+                        box_key[left] = b.sel(swap, right_key, left_key);
+                        box_key[right] = b.sel(swap, left_key, right_key);
+                        box_out[left] = b.sel(swap, right_out, left_out);
+                        box_out[right] = b.sel(swap, left_out, right_out);
+                    };
+                    compare_swap(0, 1);
+                    compare_swap(2, 3);
+                    compare_swap(0, 2);
+                    compare_swap(1, 3);
+                    compare_swap(1, 2);
                 }
 
                 for (uint32_t k = 0; k < 4; ++k) {
