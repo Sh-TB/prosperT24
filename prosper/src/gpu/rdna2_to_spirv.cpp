@@ -14374,6 +14374,11 @@ bool emit_cfg_state_machine(
     std::unordered_set<uint32_t> proven_exec_saved_mask_compare_pcs;
     std::unordered_set<uint32_t> proven_wave64_mask_reduction_pcs;
     std::unordered_map<uint32_t, int> proven_wave64_mbcnt_mask_root_for_pc;
+    // Retain the entry facts beyond the consumer-specialization pass below. Function Bool
+    // variables persist values only; this MUST set is the separate lifetime tag load_state needs
+    // before reconstructing a saved-mask RegState entry in each dispatcher case.
+    std::vector<std::set<int>> wave64_b64_mask_in(starts.size());
+    std::vector<bool> wave64_b64_reachable(starts.size(), false);
     auto wave64_mask_reduction_source = [&](const Rdna2Inst& in) -> int {
         if (!b.is_compute || b.wave_size != 64 || in.fmt != Rdna2Format::SOP1 ||
             (in.opcode != 0x10 && in.opcode != 0x14))
@@ -14399,8 +14404,6 @@ bool emit_cfg_state_machine(
         return root >= 0 && root <= 105 ? root : -1;
     };
     if ((b.is_compute || b.is_fragment) && b.wave_size == 64 && !starts.empty()) {
-        std::vector<std::set<int>> wave64_b64_mask_in(starts.size());
-        std::vector<bool> wave64_b64_reachable(starts.size(), false);
         for (const auto& mask : initial.sreg_bool)
             if (!initial.sreg_bool_b32.contains(mask.first) && mask.first <= 105)
                 wave64_b64_mask_in.front().insert(mask.first);
@@ -14450,6 +14453,12 @@ bool emit_cfg_state_machine(
             } else if (in.fmt == Rdna2Format::SOP2 && in.dst.value <= 107) {
                 if (in.opcode == 0x25)
                     mask_write = in.dst.value;
+                else if (in.opcode == 0x0b && in.dst.value == 106 &&
+                         !b.cselect_b64_low_only_pcs.contains(in.pc))
+                    // A complete scalar-data pair selected into VCC has a dual lifetime: emit_alu
+                    // derives its per-lane predicate even though neither input is a mask. The one
+                    // incomplete GTA form deliberately has no predicate and is excluded here.
+                    mask_write = 106;
                 else if ((in.opcode == 0x0b ||
                           (in.opcode >= 0x0f && in.opcode <= 0x1d &&
                            (in.opcode & 1u) == 1)) &&
@@ -14902,22 +14911,31 @@ bool emit_cfg_state_machine(
         for (const auto& kv : sv) state.sreg[kv.first] = b.load_function(b.t_u32, kv.second);
         const std::set<int>* entry_b32 = nullptr;
         const std::set<int>* entry_b64 = nullptr;
+        const std::set<int>* entry_wave64_b64 = nullptr;
+        uint32_t entry_block = UINT32_MAX;
+        if (dispatch != UINT32_MAX)
+            entry_block = dispatch_blocks[dispatch].front();
+        else if (const auto terminal = block_for_pc.find(end_pc);
+                 terminal != block_for_pc.end())
+            entry_block = terminal->second;
         if (b.allow_b32_masks) {
-            uint32_t entry_block = UINT32_MAX;
-            if (dispatch != UINT32_MAX)
-                entry_block = dispatch_blocks[dispatch].front();
-            else if (const auto terminal = block_for_pc.find(end_pc);
-                     terminal != block_for_pc.end())
-                entry_block = terminal->second;
             if (entry_block != UINT32_MAX && b32_mask_reachable[entry_block]) {
                 entry_b32 = &b32_mask_in[entry_block];
                 entry_b64 = &b64_mask_in[entry_block];
             }
         }
+        const bool filters_wave64_b64 = (b.is_compute || b.is_fragment) &&
+            b.wave_size == 64;
+        if (filters_wave64_b64 && entry_block != UINT32_MAX &&
+            wave64_b64_reachable[entry_block])
+            entry_wave64_b64 = &wave64_b64_mask_in[entry_block];
         for (const auto& kv : mv) {
             if (b.allow_b32_masks &&
                 (!entry_b64 || !entry_b64->contains(kv.first)) &&
                 (!entry_b32 || !entry_b32->contains(kv.first)))
+                continue;
+            if (filters_wave64_b64 &&
+                (!entry_wave64_b64 || !entry_wave64_b64->contains(kv.first)))
                 continue;
             state.sreg_bool[kv.first] = b.load_function(b.t_bool, kv.second);
             state.sreg_bool_narrowed[kv.first] = true;
@@ -14929,8 +14947,10 @@ bool emit_cfg_state_machine(
             state.vgpr_lane_mask_slots[kv.first.first][kv.first.second] =
                 b.load_function(b.t_bool, kv.second);
         state.scc = b.load_function(b.t_bool, scc_var);
-        state.vcc = (!entry_b32 || entry_b32->contains(106))
-            ? b.load_function(b.t_bool, vcc_var) : 0;
+        const bool live_vcc = filters_wave64_b64
+            ? entry_wave64_b64 && entry_wave64_b64->contains(106)
+            : (!entry_b32 || entry_b32->contains(106));
+        state.vcc = live_vcc ? b.load_function(b.t_bool, vcc_var) : 0;
         state.exec = b.load_function(b.t_bool, exec_var);
         if (entry_b32) {
             for (int reg : *entry_b32) {
@@ -18492,6 +18512,16 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
         }
     }
     return cov;
+}
+
+std::vector<uint32_t> cselect_b64_low_only_pcs_for_test(
+        const uint32_t* code, size_t dwords) {
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code, dwords, ins);
+    const auto proven = proven_cselect_b64_low_only_pcs(ins);
+    std::vector<uint32_t> result(proven.begin(), proven.end());
+    std::sort(result.begin(), result.end());
+    return result;
 }
 
 static uint64_t shader_program_hash(const uint32_t* code, size_t dwords) {
