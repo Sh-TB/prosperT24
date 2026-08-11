@@ -58,6 +58,10 @@ public:
     
     const std::string& output_directory() const { return output_dir_; }
     
+    // Public utility methods (shared with AiContextWriter)
+    std::string format_timestamp(std::chrono::system_clock::time_point tp) const;
+    std::string format_duration_ms(uint64_t ms) const;
+    
 private:
     std::string output_dir_;
     
@@ -66,8 +70,6 @@ private:
     
     // JSON helpers (minimal - avoid dependency on full JSON library)
     std::string escape_json(const std::string& s) const;
-    std::string format_timestamp(std::chrono::system_clock::time_point tp) const;
-    std::string format_duration_ms(uint64_t ms) const;
 };
 
 // --- AI-Optimized Markdown Output -------------------------------------------

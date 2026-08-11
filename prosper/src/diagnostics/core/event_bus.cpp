@@ -1,6 +1,7 @@
 // diagnostics/core/event_bus.cpp — EventBus implementation
 #include "event_bus.hpp"
 #include <cstdio>
+#include <algorithm>
 
 namespace prosper {
 namespace diagnostics {

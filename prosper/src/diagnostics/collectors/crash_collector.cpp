@@ -143,24 +143,24 @@ std::string CrashCollector::registers_to_json(const RegisterState& r) const {
     std::ostringstream ss;
     
     ss << "{\n";
-    ss << "        \"rip\": "0x" << std::hex << r.rip << "\",\n";
-    ss << "        \"rsp\": "0x" << std::hex << r.rsp << "\",\n";
-    ss << "        \"rbp\": "0x" << std::hex << r.rbp << "\",\n";
-    ss << "        \"rax\": "0x" << std::hex << r.rax << "\",\n";
-    ss << "        \"rbx\": "0x" << std::hex << r.rbx << "\",\n";
-    ss << "        \"rcx\": "0x" << std::hex << r.rcx << "\",\n";
-    ss << "        \"rdx\": "0x" << std::hex << r.rdx << "\",\n";
-    ss << "        \"rsi\": "0x" << std::hex << r.rsi << "\",\n";
-    ss << "        \"rdi\": "0x" << std::hex << r.rdi << "\",\n";
-    ss << "        \"r8\": "0x" << std::hex << r.r8 << "\",\n";
-    ss << "        \"r9\": "0x\" << std::hex << r.r9 << "\",\n";
-    ss << "        \"r10\": "0x\" << std::hex << r.r10 << "\",\n";
-    ss << "        \"r11\": "0x\" << std::hex << r.r11 << "\",\n";
-    ss << "        \"r12\": "0x\" << std::hex << r.r12 << "\",\n";
-    ss << "        \"r13\": "0x\" << std::hex << r.r13 << "\",\n";
-    ss << "        \"r14\": "0x\" << std::hex << r.r14 << "\",\n";
-    ss << "        \"r15\": "0x\" << std::hex << r.r15 << "\",\n";
-    ss << "        \"rflags\": "0x\" << std::hex << r.rflags << "\"\n";
+    ss << "        \"rip\": \"0x" << std::hex << r.rip << "\",\n";
+    ss << "        \"rsp\": \"0x" << std::hex << r.rsp << "\",\n";
+    ss << "        \"rbp\": \"0x" << std::hex << r.rbp << "\",\n";
+    ss << "        \"rax\": \"0x" << std::hex << r.rax << "\",\n";
+    ss << "        \"rbx\": \"0x" << std::hex << r.rbx << "\",\n";
+    ss << "        \"rcx\": \"0x" << std::hex << r.rcx << "\",\n";
+    ss << "        \"rdx\": \"0x" << std::hex << r.rdx << "\",\n";
+    ss << "        \"rsi\": \"0x" << std::hex << r.rsi << "\",\n";
+    ss << "        \"rdi\": \"0x" << std::hex << r.rdi << "\",\n";
+    ss << "        \"r8\": \"0x" << std::hex << r.r8 << "\",\n";
+    ss << "        \"r9\": \"0x" << std::hex << r.r9 << "\",\n";
+    ss << "        \"r10\": \"0x" << std::hex << r.r10 << "\",\n";
+    ss << "        \"r11\": \"0x" << std::hex << r.r11 << "\",\n";
+    ss << "        \"r12\": \"0x" << std::hex << r.r12 << "\",\n";
+    ss << "        \"r13\": \"0x" << std::hex << r.r13 << "\",\n";
+    ss << "        \"r14\": \"0x" << std::hex << r.r14 << "\",\n";
+    ss << "        \"r15\": \"0x" << std::hex << r.r15 << "\",\n";
+    ss << "        \"rflags\": \"0x" << std::hex << r.rflags << "\"\n";
     ss << "      }";
     
     return ss.str();
@@ -173,8 +173,8 @@ std::string CrashCollector::stack_trace_to_json() const {
     for (size_t i = 0; i < report_.stack_trace.size(); ++i) {
         const auto& frame = report_.stack_trace[i];
         ss << "        {\n";
-        ss << "          \"return_addr\": "0x" << std::hex << frame.return_address << "\",\n";
-        ss << "          \"frame_ptr\": "0x" << std::hex << frame.frame_pointer << "\",\n";
+        ss << "          \"return_addr\": \"0x" << std::hex << frame.return_address << "\",\n";
+        ss << "          \"frame_ptr\": \"0x" << std::hex << frame.frame_pointer << "\",\n";
         ss << "          \"module\": \"" << frame.module_name << "\"";
         if (!frame.function_name.empty()) {
             ss << ",\n          \"function\": \"" << frame.function_name << "\"";
@@ -200,7 +200,7 @@ std::string CrashCollector::generate_report() const {
     ss << "    \"type\": \"" << crash_type_string(report_.type) << "\",\n";
     ss << "    \"signal\": \"" << report_.signal_name << "\",\n";
     ss << "    \"reason\": \"" << report_.signal_reason << "\",\n";
-    ss << "    \"fault_address\": "0x" << std::hex << report_.fault_address << "\",\n";
+    ss << "    \"fault_address\": \"0x" << std::hex << report_.fault_address << "\",\n";
     ss << "    \"uptime_ms\": " << std::dec << report_.uptime_ms << "\n";
     ss << "  },\n";
     

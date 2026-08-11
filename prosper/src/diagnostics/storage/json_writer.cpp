@@ -4,6 +4,7 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+#include <algorithm>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -367,12 +368,13 @@ void AiContextWriter::write(
     uint64_t warnings,
     BootPhase final_phase
 ) {
+    JsonWriter json_helper(output_dir_);
     std::string path = output_dir_.empty() ? "ai_context.md" : output_dir_ + "/ai_context.md";
     std::ofstream out(path);
     if (!out.is_open()) return;
     
     out << "# Prosper Diagnostics — AI Analysis Context\n\n";
-    out << "**Generated**: " << JsonWriter("").format_timestamp(std::chrono::system_clock::now()) << "\n\n";
+    out << "**Generated**: " << json_helper.format_timestamp(std::chrono::system_clock::now()) << "\n\n";
     
     // Game identification
     out << "## Game\n\n";
@@ -486,6 +488,7 @@ std::string AiContextWriter::generate_boot_status(BootPhase phase, bool had_erro
 
 std::string AiContextWriter::generate_phase_details(const std::vector<TimelineEntry>& timeline) const {
     std::ostringstream ss;
+    JsonWriter json_helper(output_dir_);
     
     ss << "| Phase | Status | Duration | Notes |\n";
     ss << "|-------|--------|----------|-------|\n";
@@ -493,7 +496,7 @@ std::string AiContextWriter::generate_phase_details(const std::vector<TimelineEn
     for (const auto& entry : timeline) {
         ss << "| `" << boot_phase_string(entry.phase) << "` | ";
         ss << (entry.success ? "✅ OK" : "❌ FAIL");
-        ss << " | " << JsonWriter("").format_duration_ms(entry.duration_ms) << " | ";
+        ss << " | " << json_helper.format_duration_ms(entry.duration_ms) << " | ";
         if (!entry.error_message.empty()) {
             ss << entry.error_message;
         }

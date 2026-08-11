@@ -1,5 +1,6 @@
 // diagnostics/core/context.cpp — DiagnosticContext implementation
 #include "context.hpp"
+#include "../collectors/collector.hpp"
 #include "../storage/json_writer.hpp"
 #include <cstdio>
 #include <cstdlib>
