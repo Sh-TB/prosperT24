@@ -194,8 +194,8 @@ enum : uint32_t {
     ImgFmt_R32ui=kSpirvImageFormatR32ui, // exact uint32 storage image format required by image atomics
     ImgOp_Bias=1, ImgOp_Lod=2, ImgOp_Grad=4, ImgOp_Sample=0x40,   // ImageOperands bits.
     SC_Workgroup=4, Scope_Device=1, Scope_Workgroup=2, Scope_Subgroup=3,
-    MemSem_UniformRelease=0x44,                          // Release | UniformMemory
-    MemSem_UniformAcqRel=0x48, MemSem_WGAcquire=0x102,
+    MemSem_UniformAcquire=0x42, MemSem_UniformRelease=0x44,
+    MemSem_UniformAcqRel=0x48, MemSem_WGAcquire=0x102,   // memory class + ordering
     MemSem_WGAcqRel=0x108,                              // storage-buffer/LDS AcquireRelease semantics
     MemSem_ImageAcqRel=0x808,                            // AcquireRelease | ImageMemory
     MemAccess_Volatile=0x1,
@@ -2272,6 +2272,80 @@ struct SpirvCompute {
         put(code, Op_Label, {merge}); cur_block = merge;
         return emit_phi_2way(t_u32, result, then_end, fallback, entry);
     }
+    // RDNA2 BUFFER_ATOMIC_FMIN/FMAX share DS_MIN/MAX_F32's MINNUM/MAXNUM bit semantics, but
+    // operate on descriptor-backed Device memory and optionally return the pre-operation value.
+    // SPIR-V 1.3 has no core floating-point min/max atomic, so use the same raw-u32 CAS loop as LDS.
+    // Keeping all selection arithmetic in integer space also preserves denormal ordering regardless
+    // of the host shader float mode.
+    uint32_t atomic_fminmax_bits(uint32_t resident, uint32_t value, bool is_min) {
+        auto ordered_key = [&](uint32_t bits) {
+            const uint32_t negative = ucmp(
+                Op_INotEqual, ibin(Op_BitwiseAnd, bits, uconst(0x80000000u)), uconst(0));
+            return sel(negative, iun(Op_Not, bits),
+                       ibin(Op_BitwiseXor, bits, uconst(0x80000000u)));
+        };
+        const uint32_t resident_abs = ibin(
+            Op_BitwiseAnd, resident, uconst(0x7fffffffu));
+        const uint32_t value_abs = ibin(
+            Op_BitwiseAnd, value, uconst(0x7fffffffu));
+        const uint32_t resident_nan = ucmp(
+            Op_UGreaterThan, resident_abs, uconst(0x7f800000u));
+        const uint32_t value_nan = ucmp(
+            Op_UGreaterThan, value_abs, uconst(0x7f800000u));
+        const uint32_t ordered = ucmp(
+            is_min ? Op_ULessThan : Op_UGreaterThan,
+            ordered_key(value), ordered_key(resident));
+        const uint32_t numeric = sel(ordered, value, resident);
+        const uint32_t resident_number = sel(value_nan, resident, numeric);
+        const uint32_t quiet_resident = ibin(
+            Op_BitwiseOr, resident, uconst(0x00400000u));
+        return sel(resident_nan, sel(value_nan, quiet_resident, value), resident_number);
+    }
+    uint32_t cbuf_atomic_fminmax_rtn(uint32_t idx, uint32_t value, uint32_t binding,
+                                     bool is_min, bool predicated, uint32_t pred,
+                                     uint32_t fallback) {
+        cbuf_ordinary_accesses.insert(binding);
+        const uint32_t buf = buf_for_binding(binding);
+        auto emit = [&]() {
+            const uint32_t pointer = cbuf_element_ptr(buf, binding, idx);
+            const uint32_t initial = id();
+            put(code, Op_AtomicLoad,
+                {t_u32, initial, pointer, uconst(Scope_Device),
+                 uconst(MemSem_UniformAcquire)});
+
+            const uint32_t preheader = cur_block;
+            const uint32_t header = id(), again = id(), merge = id();
+            put(code, Op_Branch, {header});
+            put(code, Op_Label, {header}); cur_block = header;
+            size_t retry_patch = 0;
+            const uint32_t expected = emit_phi2(t_u32, initial, preheader, retry_patch);
+            const uint32_t desired = atomic_fminmax_bits(expected, value, is_min);
+            const uint32_t observed = id();
+            put(code, Op_AtomicCompareExchange,
+                {t_u32, observed, pointer, uconst(Scope_Device),
+                 uconst(MemSem_UniformAcqRel), uconst(MemSem_UniformAcquire),
+                 desired, expected});
+            const uint32_t succeeded = ucmp(Op_IEqual, observed, expected);
+            put(code, Op_LoopMerge, {merge, again, 0});
+            put(code, Op_BranchConditional, {succeeded, merge, again});
+            put(code, Op_Label, {again}); cur_block = again;
+            put(code, Op_Branch, {header});
+            patch_phi(retry_patch, observed, again);
+            put(code, Op_Label, {merge}); cur_block = merge;
+            return expected;
+        };
+        if (!predicated) return emit();
+        const uint32_t entry = cur_block;
+        const uint32_t then = id(), merge = id();
+        put(code, Op_SelectionMerge, {merge, 0});
+        put(code, Op_BranchConditional, {pred, then, merge});
+        put(code, Op_Label, {then}); cur_block = then;
+        const uint32_t result = emit();
+        const uint32_t then_end = cur_block;
+        put(code, Op_Branch, {merge});
+        put(code, Op_Label, {merge}); cur_block = merge;
+        return emit_phi_2way(t_u32, result, then_end, fallback, entry);
+    }
     // One true 64-bit RMW for the exact naturally-strided guest contract. The caller supplies the
     // SPIR-V atomic opcode and original qword record index, and range-checks it before entry.
     uint32_t cbuf_atomic_x2_rtn(uint32_t op, uint32_t index, uint32_t value, uint32_t binding,
@@ -2432,30 +2506,6 @@ struct SpirvCompute {
     // first operand; the resident `*ptr` value is that first operand for an atomic min/max update.
     void lds_atomic_fminmax(uint32_t idx, uint32_t value, bool is_min,
                             bool predicated, uint32_t pred) {
-        auto ordered_key = [&](uint32_t bits) {
-            const uint32_t negative = ucmp(
-                Op_INotEqual, ibin(Op_BitwiseAnd, bits, uconst(0x80000000u)), uconst(0));
-            return sel(negative, iun(Op_Not, bits),
-                       ibin(Op_BitwiseXor, bits, uconst(0x80000000u)));
-        };
-        auto minmax_bits = [&](uint32_t resident) {
-            const uint32_t resident_abs = ibin(
-                Op_BitwiseAnd, resident, uconst(0x7fffffffu));
-            const uint32_t value_abs = ibin(
-                Op_BitwiseAnd, value, uconst(0x7fffffffu));
-            const uint32_t resident_nan = ucmp(
-                Op_UGreaterThan, resident_abs, uconst(0x7f800000u));
-            const uint32_t value_nan = ucmp(
-                Op_UGreaterThan, value_abs, uconst(0x7f800000u));
-            const uint32_t ordered = ucmp(
-                is_min ? Op_ULessThan : Op_UGreaterThan,
-                ordered_key(value), ordered_key(resident));
-            const uint32_t numeric = sel(ordered, value, resident);
-            const uint32_t resident_number = sel(value_nan, resident, numeric);
-            const uint32_t quiet_resident = ibin(
-                Op_BitwiseOr, resident, uconst(0x00400000u));
-            return sel(resident_nan, sel(value_nan, quiet_resident, value), resident_number);
-        };
         auto emit = [&]() {
             const uint32_t p = id();
             putv(code, Op_AccessChain, {t_ptr_lds_u32, p, lds_var, idx});
@@ -2469,7 +2519,7 @@ struct SpirvCompute {
             put(code, Op_Label, {header}); cur_block = header;
             size_t retry_patch = 0;
             const uint32_t expected = emit_phi2(t_u32, initial, preheader, retry_patch);
-            const uint32_t desired = minmax_bits(expected);
+            const uint32_t desired = atomic_fminmax_bits(expected, value, is_min);
             const uint32_t observed = id();
             put(code, Op_AtomicCompareExchange,
                 {t_u32, observed, p, uconst(Scope_Workgroup), uconst(MemSem_WGAcqRel),
@@ -11253,7 +11303,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // later register consumers, so reject until status-return semantics are implemented.
             if (in.fmt == Rdna2Format::MTBUF && in.mtbuf_tfe) { ok = false; return true; }
             uint32_t n = 0; bool is_format = false, is_store = false, is_atomic = false;
-            bool is_atomic_x2 = false;
+            bool is_atomic_x2 = false, is_atomic_fminmax = false, atomic_fmin = false;
             uint32_t atomic_op = 0;   // SPIR-V atomic RMW opcode for is_atomic (set by the switch)
             uint32_t atomic_x2_record_count = 0;
             bool raw_subword = false, raw_signed = false;
@@ -11298,6 +11348,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x39: n = 1; is_atomic = true; atomic_op = Op_AtomicAnd;      break; // and
                 case 0x3a: n = 1; is_atomic = true; atomic_op = Op_AtomicOr;       break; // or
                 case 0x3b: n = 1; is_atomic = true; atomic_op = Op_AtomicXor;      break; // xor
+                case 0x3f: n = 1; is_atomic = true; is_atomic_fminmax = true;
+                           atomic_fmin = true; break;                              // fmin
+                case 0x40: n = 1; is_atomic = true; is_atomic_fminmax = true;
+                           atomic_fmin = false; break;                             // fmax
                 case 0x50: n = 2; is_atomic = true; is_atomic_x2 = true;
                            atomic_op = Op_AtomicExchange; break;                    // swap_x2
                 case 0x5a: n = 2; is_atomic = true; is_atomic_x2 = true;
@@ -11757,8 +11811,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t old = vreg_old(b, rs, d);
                 const auto it = rs.vreg.find(d);
                 const uint32_t value = it == rs.vreg.end() ? b.uconst(0) : it->second;
-                const uint32_t pre = b.cbuf_atomic_rtn(atomic_op, idx, value, binding,
-                                                       rs.exec_narrowed, rs.exec, old);
+                const uint32_t pre = is_atomic_fminmax
+                    ? b.cbuf_atomic_fminmax_rtn(idx, value, binding, atomic_fmin,
+                                                rs.exec_narrowed, rs.exec, old)
+                    : b.cbuf_atomic_rtn(atomic_op, idx, value, binding,
+                                        rs.exec_narrowed, rs.exec, old);
                 // ISA 8.1 / Table 98: for atomics GLC means "return pre-op value to VGPR". With
                 // GLC=0 hardware leaves VDATA untouched (it still holds the DATA operand) — the
                 // unconditional write clobbered it (the exercised Astro packet 0xe0e00004 is GLC=0).
