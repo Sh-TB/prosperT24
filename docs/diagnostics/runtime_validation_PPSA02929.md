@@ -18,10 +18,12 @@
 ## 2. Boot Result
 
 ```
-Status: REAL_FRAME_CAPTURED ✅
-First Frame Path: VideoOut/present
+Status: REAL_RENDERED_BOOT_SPLASH_FRAME ✅
+First Frame Type: VideoOut boot/splash frame (NOT gameplay)
+Frame Path: VideoOut present callback
 Boot Phase Reached: BOOT_COMPLETE (Phase 13/13)
 Total Boot Time: ~26.3 seconds
+Note: This is the initial rendered frame during boot sequence, not gameplay progression.
 ```
 
 ### Boot Timeline Summary
@@ -39,7 +41,7 @@ Total Boot Time: ~26.3 seconds
 | ENTRYPOINT_EXECUTED | 55ms | ✅ | IL2CPP entry reached |
 | RUNTIME_INITIALIZED | 5.2s | ✅ | Unity runtime init complete |
 | VIDEOOUT_INITIALIZED | 334ms | ✅ | Display buffer configured |
-| FIRST_FRAME_CAPTURED | 36ms | ✅ | **1920×1080 RGBA8888 presented** |
+| FIRST_FRAME_CAPTURED | 36ms | ✅ | **1920×1080 RGBA8888 boot/splash frame presented** |
 | BOOT_COMPLETE | 40ms | ✅ | Full boot achieved |
 
 ## 3. Generated Output Files
@@ -277,7 +279,7 @@ All required files were generated in `diagnostic_run_20260812_143522/`:
 ```markdown
 # Diagnostics Summary: PPSA02929 / Dreaming Sarah
 
-**Status**: ✅ **Boot Successful - Real Frame Captured**
+**Status**: ✅ **Boot Successful - REAL Rendered Boot/Splash Frame Captured**
 
 **Engine**: Unity / IL2CPP
 
@@ -341,7 +343,7 @@ The diagnostics observer layer captured the complete boot sequence without inter
 | **ELF Loading** | ✅ Observed | eboot.bin opened, parsed, 9 segments mapped |
 | **PRX Loading** | ✅ Observed | 24 modules tracked with load order |
 | **HLE Events** | ✅ Observed | 15,847 calls across 234 functions |
-| **VideoOut Frame Detection** | ✅ Observed | First frame at 24.156s (1920×1080) |
+| **VideoOut Frame Detection** | ✅ Observed | Boot/splash frame at 24.156s (1920×1080) |
 | **Crash Telemetry** | ✅ Ready | CrashCollector registered (no crash occurred) |
 | **Boot Timeline** | ✅ Complete | All 13 phases tracked with durations |
 
@@ -363,7 +365,7 @@ The diagnostics observer layer captured the complete boot sequence without inter
 | Boot Success | ✅ | ✅ | — | ✅ Identical |
 | First Frame Time | ~24.1s | ~24.156s | +56ms | ✅ Within tolerance |
 | Console Output | Clean | Clean (no spew) | — | ✅ No regression |
-| Behavior | Game runs | Game runs | — | ✅ Identical |
+| Behavior | Boot completes | Boot completes | — | ✅ Identical |
 | Exit Code | 0 | 0 | — | ✅ Identical |
 
 ### Disabled Path Verification

@@ -1,6 +1,6 @@
 # Diagnostics Summary: PPSA02929 / Dreaming Sarah
 
-**Status**: ✅ **Boot Successful - Real Frame Captured**
+**Status**: ✅ **Boot Successful - REAL Rendered Boot/Splash Frame Captured**
 
 **Engine**: Unity / IL2CPP
 
@@ -21,7 +21,7 @@
 | Entry Point Execution | 55ms | ✅ |
 | Runtime Initialization (Unity) | 5.2s | ✅ |
 | VideoOut Initialization | 334ms | ✅ |
-| First Frame Capture | 36ms | ✅ |
+| First Frame Capture (boot/splash) | 36ms | ✅ |
 
 ---
 
@@ -67,7 +67,8 @@ Top called functions:
 2. `scePthreadMutexUnlock` - 3,198 calls
 3. `sceKernelGetProcessId` - 2,156 calls
 
-### 5. VideoOut / First Frame
+### 5. VideoOut / Boot-Splash Frame
+- **First Frame Type**: Boot/splash frame (initial rendered output, NOT gameplay)
 - **First Frame Time**: 24.156s after boot start
 - **Resolution**: 1920 × 1080
 - **Format**: RGBA8888
@@ -119,8 +120,8 @@ RELOCATIONS ──→ THREAD_CREATION ──→ ENTRYPOINT ──→ RUNTIME_INI
 RUNTIME_INIT ──→ VIDEOOUT_INIT ──→ FIRST_FRAME ──→ BOOT_COMPLETE
       │                  │                 │                │
       ▼                  ▼                 ▼                ▼
- [Display        [1920x1080       [Real frame      [Dreaming Sarah
-  configured]     buffer set]     captured! ✓       running! ✓]
+ [Display        [1920x1080       [Boot/splash      [Dreaming Sarah
+  configured]     buffer set]     frame captured! ✓  boot complete! ✓]
     334ms              334ms             36ms             40ms
 ```
 
@@ -128,7 +129,7 @@ RUNTIME_INIT ──→ VIDEOOUT_INIT ──→ FIRST_FRAME ──→ BOOT_COMPLE
 
 ## Recommendation
 
-### Verdict: ✅ TITLE BOOTS CORRECTLY
+### Verdict: ✅ TITLE BOOTS CORRECTLY - BOOT/SPLASH FRAME RENDERED
 
 **No action required.**
 
@@ -136,7 +137,7 @@ The diagnostics observer layer captured the complete boot sequence without inter
 
 1. All subsystems initialized correctly
 2. Unity/IL2CPP runtime fully operational
-3. Real frame presented via VideoOut
+3. Boot/splash frame presented via VideoOut (initial rendered output)
 4. Stub imports are for optional features only
 5. HLE errors handled gracefully by game code
 
