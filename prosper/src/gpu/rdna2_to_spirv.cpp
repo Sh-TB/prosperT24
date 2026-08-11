@@ -10304,10 +10304,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 ok = false; return true;
             }
             // The front half proved all four live SBASE words at this exact scalar-buffer load and
-            // decoded NUM_RECORDS=0. Every possible immediate/register SOFFSET is therefore OOB, so
-            // the result is exact zero without declaring or touching a dummy storage binding. Check
-            // this before SOFFSET tracking: the point of the proof is that even an unknown runtime
-            // offset cannot change the result.
+            // proved that its minimum unsigned offset begins beyond the effective scalar bound. The
+            // result is therefore exact zero without declaring or touching a dummy storage binding.
+            // Check this before SOFFSET tracking: even an unknown runtime offset cannot reduce it.
             const ShaderResource* zero_record_sbuffer =
                 rt && in.opcode >= 0x8u ? rt->by_fetch_pc(in.pc) : nullptr;
             if (zero_record_sbuffer && is_zero_record_raw_buffer(*zero_record_sbuffer)) {
@@ -10753,11 +10752,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     ok = false; return true;
                 }
                 if (is_zero_record_raw_buffer(*res)) {
-                    // The exact live V# is empty, so format selection is never observed: every load
-                    // component returns zero and no backing buffer exists. Apply the result only to
-                    // active EXEC lanes, preserving the old destination in masked lanes.
+                    // The exact live V# is empty. The producer admitted only selectors whose OOB
+                    // result is zero; re-check that contract so a malformed table cannot silently
+                    // turn SQ_SEL_1 into zero. Apply the result only to active EXEC lanes, preserving
+                    // the old destination in masked lanes, and never declare a backing buffer.
                     if (is_store) { ok = false; return true; }
                     for (uint32_t k = 0; k < n; ++k) {
+                        const uint32_t selector = res->swizzle[k];
+                        if (selector != 0u && selector < 4u) { ok = false; return true; }
                         const int d = in.dst.value + static_cast<int>(k);
                         const uint32_t old = vreg_old(b, rs, d);
                         rs.vreg[d] = b.uconst(0);
