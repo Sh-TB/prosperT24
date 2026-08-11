@@ -3681,6 +3681,21 @@ inline bool sopk_writes_scalar_data(uint32_t opcode) {
            opcode == 0x10 || opcode == 0x12;
 }
 
+inline bool sopk_sets_full_flat_scratch_base(const Rdna2Inst& in) {
+    if (in.fmt != Rdna2Format::SOPK || in.opcode != 0x13 ||
+        in.dst.kind != OperandKind::SGPR)
+        return false;
+    // S_SETREG_B32's SIMM16 is HWREG(id, offset, width-1). Prosper represents guest scratch as a
+    // private Function-storage array and intentionally has no physical FLAT_SCR base, so the exact
+    // full-half base relocation emitted by GTA V is semantically absorbed by that abstraction.
+    // Partial fields and every other hardware register remain fail-visible.
+    const uint32_t hwreg = static_cast<uint16_t>(in.simm16);
+    const uint32_t id = hwreg & 0x3fu;
+    const uint32_t offset = (hwreg >> 6) & 0x1fu;
+    const uint32_t width_minus_one = (hwreg >> 11) & 0x1fu;
+    return (id == 20u || id == 21u) && offset == 0u && width_minus_one == 31u;
+}
+
 namespace {
 uint32_t scalar_write_width(const Rdna2Inst& in);
 }
@@ -8088,6 +8103,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         b.device_uniform_release_barrier();
                     break;
                 case 0x18: case 0x19: case 0x1A: break;
+                case 0x13:                                // s_setreg_b32
+                    // The encoded SDST field is the SOURCE SGPR. Do not read it: this admission
+                    // discards only the physical FLAT_SCR relocation which Prosper's private
+                    // scratch model does not expose. Unsupported/dynamic scratch accesses still
+                    // reject independently in the FLAT emitter.
+                    if (!b.is_compute || !sopk_sets_full_flat_scratch_base(in)) ok = false;
+                    break;
                 default: ok = false;
             }
             return true;
@@ -9852,6 +9874,30 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     vreg[in.dst.value] = b.sel(
                         b.ucmp(Op_ULessThan, byte, b.uconst(4)), low,
                         b.sel(b.ucmp(Op_ULessThan, byte, b.uconst(8)), upper, b.uconst(0)));
+                }
+            } else if (in.opcode == 0x2FF) {                          // v_lshlrev_b64
+                // GTA V constructs a per-lane bit as `1ull << lane` immediately after MBCNT. This
+                // bounded admission keeps SRC1 at the exact inline integer 1; general register-pair
+                // and floating-inline sources need wider source-span/provenance handling.
+                const uint32_t opsel = (in.words[0] >> 11) & 0xFu;
+                const bool exact_one = in.src[1].kind == OperandKind::InlineInt &&
+                                       in.src[1].value == 1;
+                if (in.dst.value < 0 || in.dst.value >= 255 || !exact_one ||
+                    in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
+                    in.src_neg[0] || in.src_neg[1] || in.src_neg[2] ||
+                    in.clamp || in.omod || opsel) {
+                    ok = false;
+                } else {
+                    const uint32_t amount = b.ibin(
+                        Op_BitwiseAnd, val(in.src[0]), b.uconst(63));
+                    const uint32_t result = b.u64_shift(
+                        Op_ShiftLeftLogical,
+                        b.u64_from_lohi(b.uconst(1), b.uconst(0)), amount);
+                    const int hi_dst = in.dst.value + 1;
+                    const uint32_t old_hi = vreg_old(b, rs, hi_dst);
+                    vreg[in.dst.value] = b.u64_lo(result);
+                    vreg[hi_dst] = b.u64_hi(result);
+                    predicate_write(b, rs, hi_dst, old_hi);
                 }
             } else if (in.opcode == 0x363) {                          // v_bfm_b32
                 // RDNA2: D.u32 = ((1 << S0[4:0]) - 1) << S1[4:0]. Mask both shift
