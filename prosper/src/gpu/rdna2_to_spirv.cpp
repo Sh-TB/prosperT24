@@ -9255,14 +9255,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // predicate_write.
             // VERIFIED(round-trip llvm-mc gfx1030: 0xd761 v_writelane_b32 / 0xd760 v_readlane_b32).
             if (in.opcode == 0x361) {                                 // v_writelane_b32 vDST, sSRC, lane
-                if (b.is_compute && b.wave_size == 32 && b.native_subgroup_size == 32 &&
+                if (b.is_compute && (b.wave_size == 32 || b.wave_size == 64) &&
+                    b.native_subgroup_size == b.wave_size &&
                     in.src[1].kind != OperandKind::InlineInt) {
-                    // RDNA2 masks the scalar selector to the Wave32 lane range and replaces VDST
-                    // only in that physical lane. Under the enforced 32-wide native-subgroup
+                    // RDNA2 masks the scalar selector to the active wave width and replaces VDST
+                    // only in that physical lane. Under the enforced exact-width native-subgroup
                     // contract, SubgroupLocalInvocationId is that architectural lane. The scalar
                     // source and selector are uniform, so this needs no shuffle or barrier. Astro's
-                    // traversal kernel reaches this form after readlane publishes its chosen hit as
-                    // scalar data.
+                    // Wave32 and GTA V's Wave64 traversal kernels reach this form after readlane or
+                    // a mask scan publishes the chosen hit as scalar data.
                     if (in.src[1].kind == OperandKind::VGPR ||
                         rs.vgpr_lane_slots.count(in.dst.value) ||
                         rs.vgpr_lane_mask_slots.count(in.dst.value)) {
@@ -9274,7 +9275,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     const uint32_t lane = b.subgroup_local_id();
                     const uint32_t selected = b.ucmp(
                         Op_IEqual, lane,
-                        b.ibin(Op_BitwiseAnd, selector, b.uconst(31)));
+                        b.ibin(Op_BitwiseAnd, selector, b.uconst(b.wave_size - 1u)));
                     rs.vreg[in.dst.value] = b.sel(
                         selected, value, vreg_old(b, rs, in.dst.value));
                     rs.invalidated_vgpr_lane_slots.erase(in.dst.value);
