@@ -3690,6 +3690,12 @@ struct RegState {
     std::unordered_set<int> sreg_written;
     std::unordered_map<int, uint32_t> sreg_bool;   // SGPR (pairs) holding a saved per-lane mask (bool id)
     std::unordered_map<int, bool> sreg_bool_narrowed;  // was EXEC narrowed when this mask was saved? (restores it)
+    // One restored physical dword of a Wave64 mask is not a complete B64 predicate. Keep its Bool
+    // value out of sreg_bool so an overlapping S_MOV_B64/logical cannot ignore the sibling SGPR.
+    // Only exact CFG-proven V_WRITELANE aliases consume this domain; ordinary scalar consumers use
+    // the separately materialized ballot dword in sreg.
+    std::unordered_map<int, uint32_t> sreg_wave64_mask_half;
+    std::unordered_map<int, uint32_t> sreg_wave64_mask_half_index;
     // Wave32 saves occupy exactly one physical SGPR. Track those lifetimes separately so a later
     // scalar-data write can invalidate the bool without also clobbering an unrelated neighbor.
     std::unordered_set<int> sreg_bool_b32;
@@ -9856,7 +9862,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.invalidated_vgpr_lane_slots.erase(in.dst.value);
                 uint32_t mask_value = 0;
                 bool mask_source = false;
-                if (in.src[0].value == 126 || in.src[0].value == 127) {
+                const bool proven_half_alias =
+                    b.wave64_mask_writelane_alias_pcs.contains(in.pc);
+                if (proven_half_alias) {
+                    const auto half = rs.sreg_wave64_mask_half.find(in.src[0].value);
+                    if (half == rs.sreg_wave64_mask_half.end()) {
+                        ok = false; return true;
+                    }
+                    mask_value = half->second;
+                    mask_source = true;
+                } else if (in.src[0].value == 126 || in.src[0].value == 127) {
                     mask_value = rs.exec; mask_source = true;
                 } else if ((in.src[0].value == 106 || in.src[0].value == 107) &&
                            !rs.sreg.count(in.src[0].value)) {
@@ -9871,12 +9886,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 } else if (in.src[0].kind == OperandKind::SGPR) {
                     auto saved = rs.sreg_bool.find(in.src[0].value);
                     if (saved != rs.sreg_bool.end()) { mask_value = saved->second; mask_source = true; }
-                }
-                if (b.wave64_mask_writelane_alias_pcs.contains(in.pc) && !mask_source) {
-                    // The CFG MUST proof says this exact source is a restored mask half. Falling
-                    // back to its parallel uint Function variable would silently select a scalar
-                    // placeholder if dispatcher persistence ever drifts from that proof.
-                    ok = false; return true;
                 }
                 rs.vreg.erase(in.dst.value);                            // spill-array lifetime
                 if (mask_source) {
@@ -9942,18 +9951,56 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (mit != rs.vgpr_lane_mask_slots.end()) {
                     auto sit = mit->second.find(lane);
                     if (sit != mit->second.end()) {
-                        rs.sreg_bool[in.dst.value] = sit->second;
-                        rs.sreg_bool_narrowed[in.dst.value] = true;
                         const auto proven_half =
                             b.wave64_mask_readlane_half_for_pc.find(in.pc);
                         if (b.is_compute && b.wave_size == 64 &&
                             b.native_subgroup_size == 64 &&
                             proven_half != b.wave64_mask_readlane_half_for_pc.end()) {
+                            // This is one scalar dword plus one Bool spelling of the SAME physical
+                            // half, not a complete saved B64 predicate. End every overlapping full
+                            // mask alias and retain the Bool only in the dedicated re-spill domain.
+                            auto erase_full_mask = [&](int base) {
+                                rs.sreg_bool.erase(base);
+                                rs.sreg_bool_narrowed.erase(base);
+                                rs.sreg_bool_b32.erase(base);
+                            };
+                            if (in.dst.value > 0) erase_full_mask(in.dst.value - 1);
+                            erase_full_mask(in.dst.value);
+                            if (in.dst.value == 106 || in.dst.value == 107) rs.vcc = 0;
+                            rs.sreg_wave64_mask_half[in.dst.value] = sit->second;
+                            rs.sreg_wave64_mask_half_index[in.dst.value] = proven_half->second;
                             // Override even an existing scalar placeholder: a physical spill lane
                             // can be allocated in both dispatcher domains, and its uint Function
                             // variable is zero on mask-only paths.
                             rs.sreg[in.dst.value] = b.native_wave_ballot_half(
                                 sit->second, proven_half->second);
+                            // Two adjacent scalar words become one complete B64 predicate only in
+                            // architectural LO/HI order. Combine their per-lane Bool spellings;
+                            // they need not originate from the same historical EXEC value.
+                            const int base = in.dst.value & ~1;
+                            const auto low = rs.sreg_wave64_mask_half.find(base);
+                            const auto high = rs.sreg_wave64_mask_half.find(base + 1);
+                            const auto low_index =
+                                rs.sreg_wave64_mask_half_index.find(base);
+                            const auto high_index =
+                                rs.sreg_wave64_mask_half_index.find(base + 1);
+                            if (low != rs.sreg_wave64_mask_half.end() &&
+                                high != rs.sreg_wave64_mask_half.end() &&
+                                low_index != rs.sreg_wave64_mask_half_index.end() &&
+                                high_index != rs.sreg_wave64_mask_half_index.end() &&
+                                low_index->second == 0 && high_index->second == 1) {
+                                const uint32_t lane = b.ibin(
+                                    Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
+                                rs.sreg_bool[base] = b.bsel(
+                                    b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)),
+                                    high->second, low->second);
+                                rs.sreg_bool_narrowed[base] = true;
+                            }
+                        } else {
+                            rs.sreg_wave64_mask_half.erase(in.dst.value);
+                            rs.sreg_wave64_mask_half_index.erase(in.dst.value);
+                            rs.sreg_bool[in.dst.value] = sit->second;
+                            rs.sreg_bool_narrowed[in.dst.value] = true;
                         }
                         // The compute CFG dispatcher can persist a physical spill lane that is
                         // recycled between scalar-data and wave-mask lifetimes. It exposes both
@@ -14479,6 +14526,21 @@ bool emit_cfg_state_machine(
     for (const auto& kv : initial.vreg) vregs.insert(kv.first);
     for (const auto& kv : initial.sreg) sregs.insert(kv.first);
 
+    // Most vector destinations are one static consecutive range. V_MOVRELD is different: M0 can
+    // select any observable VGPR at or above VDST, exactly the range emit_alu updates. Analyses that
+    // protect v_writelane spill lifetimes must invalidate that full range as well, or a dynamic
+    // ordinary write can leave a stale mask-half proof attached to an erased slot.
+    const int max_observable_vgpr = shader_max_vgpr(ins);
+    auto for_each_possible_vector_write = [&](const Rdna2Inst& in, const auto& callback) {
+        if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x42) {
+            for (int reg = in.dst.value; reg <= max_observable_vgpr; ++reg) callback(reg);
+            return;
+        }
+        const uint32_t writes = rdna2_vgpr_write_count(in);
+        for (uint32_t word = 0; word < writes; ++word)
+            callback(in.dst.value + static_cast<int>(word));
+    };
+
     // Direct user-data descriptors are deliberately absent from the initial scalar SSA map: their
     // identity lives in the resource table, and presence in sreg means shader code overwrote them.
     // The dispatcher persists every referenced SGPR in a Function variable, so recover that
@@ -15440,14 +15502,12 @@ bool emit_cfg_state_machine(
                 return;
             }
 
-            const uint32_t vector_writes = rdna2_vgpr_write_count(in);
-            for (uint32_t word = 0; word < vector_writes; ++word) {
-                const int vgpr = in.dst.value + static_cast<int>(word);
+            for_each_possible_vector_write(in, [&](int vgpr) {
                 for (auto it = state.slot.begin(); it != state.slot.end();) {
                     if (it->first.first == vgpr) it = state.slot.erase(it);
                     else ++it;
                 }
-            }
+            });
         };
 
         std::vector<MaskHalfState> half_in(starts.size());
@@ -15621,10 +15681,11 @@ bool emit_cfg_state_machine(
 
     // Saved mask pairs and scalar-spill lane slots have their own value domains.
     std::set<int> mask_keys = static_mask_keys;
+    std::set<int> mask_half_alias_keys;
     for (uint32_t block = 0; block < starts.size(); ++block)
         if (wave64_mask_half_reachable[block])
             for (const auto& alias : wave64_mask_half_sreg_in[block])
-                mask_keys.insert(alias.first);
+                mask_half_alias_keys.insert(alias.first);
     std::set<std::pair<int, int>> lane_slots, mask_lane_slots;
     // A lane spill can precede another static definition of its mask in a back-edge block, hence the
     // complete discovery pass above occurs before classifying any spill slots here.
@@ -15681,11 +15742,9 @@ bool emit_cfg_state_machine(
                 if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
                     invalidated.contains(in.src[0].value))
                     return reject_cfg(in.pc, "invalidated-vgpr-lane-slot");
-                const uint32_t writes = rdna2_vgpr_write_count(in);
-                for (uint32_t word = 0; word < writes; ++word) {
-                    const int reg = in.dst.value + static_cast<int>(word);
+                for_each_possible_vector_write(in, [&](int reg) {
                     if (spill_vgprs.contains(reg)) invalidated.insert(reg);
-                }
+                });
                 const int tfe_status = rdna2_tfe_status_vgpr(in);
                 if (spill_vgprs.contains(tfe_status)) invalidated.insert(tfe_status);
             }
@@ -15709,11 +15768,12 @@ bool emit_cfg_state_machine(
     }
 
     uint32_t ptr_u32 = 0, ptr_bool = 0;
-    std::map<int, uint32_t> vv, sv, mv;
+    std::map<int, uint32_t> vv, sv, mv, mhv;
     std::map<std::pair<int, int>, uint32_t> lv, lmv;
     for (int r : vregs) vv[r] = b.function_var(b.t_u32, ptr_u32);
     for (int r : sregs) sv[r] = b.function_var(b.t_u32, ptr_u32);
     for (int r : mask_keys) mv[r] = b.function_var(b.t_bool, ptr_bool);
+    for (int r : mask_half_alias_keys) mhv[r] = b.function_var(b.t_bool, ptr_bool);
     for (const auto& slot : lane_slots) lv[slot] = b.function_var(b.t_u32, ptr_u32);
     for (const auto& slot : mask_lane_slots) lmv[slot] = b.function_var(b.t_bool, ptr_bool);
     const uint32_t scc_var = b.function_var(b.t_bool, ptr_bool);
@@ -15807,6 +15867,7 @@ bool emit_cfg_state_machine(
         auto it = initial.sreg_bool.find(kv.first);
         b.store_function(kv.second, it == initial.sreg_bool.end() ? no : it->second);
     }
+    for (const auto& kv : mhv) b.store_function(kv.second, no);
     for (const auto& kv : lv) {
         uint32_t value = zero;
         auto vg = initial.vgpr_lane_slots.find(kv.first.first);
@@ -15908,15 +15969,37 @@ bool emit_cfg_state_machine(
                 (!entry_b64 || !entry_b64->contains(kv.first)) &&
                 (!entry_b32 || !entry_b32->contains(kv.first)))
                 continue;
-            if (filters_wave64_b64) {
-                const bool live_b64_mask =
-                    entry_wave64_b64 && entry_wave64_b64->contains(kv.first);
-                const bool live_mask_half_alias = entry_wave64_mask_halves &&
-                    entry_wave64_mask_halves->contains(kv.first);
-                if (!live_b64_mask && !live_mask_half_alias) continue;
-            }
+            if (filters_wave64_b64 &&
+                (!entry_wave64_b64 || !entry_wave64_b64->contains(kv.first)))
+                continue;
             state.sreg_bool[kv.first] = b.load_function(b.t_bool, kv.second);
             state.sreg_bool_narrowed[kv.first] = true;
+        }
+        if (entry_wave64_mask_halves)
+            for (const auto& kv : mhv)
+                if (const auto half = entry_wave64_mask_halves->find(kv.first);
+                    half != entry_wave64_mask_halves->end()) {
+                    state.sreg_wave64_mask_half[kv.first] =
+                        b.load_function(b.t_bool, kv.second);
+                    state.sreg_wave64_mask_half_index[kv.first] = half->second;
+                }
+        for (const auto& low : state.sreg_wave64_mask_half) {
+            const int base = low.first;
+            if (base & 1) continue;
+            const auto high = state.sreg_wave64_mask_half.find(base + 1);
+            const auto low_index = state.sreg_wave64_mask_half_index.find(base);
+            const auto high_index = state.sreg_wave64_mask_half_index.find(base + 1);
+            if (high == state.sreg_wave64_mask_half.end() ||
+                low_index == state.sreg_wave64_mask_half_index.end() ||
+                high_index == state.sreg_wave64_mask_half_index.end() ||
+                low_index->second != 0 || high_index->second != 1)
+                continue;
+            const uint32_t lane = b.ibin(
+                Op_BitwiseAnd, b.guest_lane_id(), b.uconst(63));
+            state.sreg_bool[base] = b.bsel(
+                b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)),
+                high->second, low.second);
+            state.sreg_bool_narrowed[base] = true;
         }
         for (const auto& kv : lv)
             state.vgpr_lane_slots[kv.first.first][kv.first.second] =
@@ -15985,6 +16068,12 @@ bool emit_cfg_state_machine(
             if (!dispatch_scalar_writes[dispatch].contains(kv.first)) continue;
             auto it = state.sreg_bool.find(kv.first);
             b.store_function(kv.second, it == state.sreg_bool.end() ? no : it->second);
+        }
+        for (const auto& kv : mhv) {
+            if (!dispatch_scalar_writes[dispatch].contains(kv.first)) continue;
+            auto it = state.sreg_wave64_mask_half.find(kv.first);
+            b.store_function(kv.second,
+                             it == state.sreg_wave64_mask_half.end() ? no : it->second);
         }
         for (const auto& kv : lv) {
             uint32_t value = zero;
