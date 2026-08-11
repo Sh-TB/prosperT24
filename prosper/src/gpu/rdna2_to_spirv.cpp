@@ -3743,6 +3743,33 @@ struct RegState {
     std::unordered_map<uint64_t, uint32_t> lds_addtid;
 };
 
+inline bool has_wave64_mask_half_pair(const RegState& rs, int base) {
+    const auto low = rs.sreg_wave64_mask_half.find(base);
+    const auto high = rs.sreg_wave64_mask_half.find(base + 1);
+    const auto low_index = rs.sreg_wave64_mask_half_index.find(base);
+    const auto high_index = rs.sreg_wave64_mask_half_index.find(base + 1);
+    return low != rs.sreg_wave64_mask_half.end() &&
+        high != rs.sreg_wave64_mask_half.end() &&
+        low_index != rs.sreg_wave64_mask_half_index.end() &&
+        high_index != rs.sreg_wave64_mask_half_index.end() &&
+        low_index->second == 0 && high_index->second == 1;
+}
+
+// Expire the Bool and physical-half spellings together. The complete-mask alias is erased only
+// when its two dedicated halves prove that it came from adjacent-half promotion; unrelated VCC or
+// saved-mask lifetimes remain under their existing architectural transfer functions. A B64 mask
+// writer may replace the promoted alias after emit_alu, so its new Bool can be preserved explicitly.
+inline void expire_wave64_mask_half(RegState& rs, int reg, int preserved_pair = -1) {
+    for (int base : {reg - 1, reg}) {
+        if (base < 0 || base == preserved_pair || !has_wave64_mask_half_pair(rs, base))
+            continue;
+        rs.sreg_bool.erase(base);
+        rs.sreg_bool_narrowed.erase(base);
+    }
+    rs.sreg_wave64_mask_half.erase(reg);
+    rs.sreg_wave64_mask_half_index.erase(reg);
+}
+
 // Predicate a just-computed VGPR write against EXEC: under a narrowed mask, inactive lanes keep their
 // prior value. A no-op when EXEC is full (the straight-line common case), so nothing is perturbed.
 inline void predicate_write(SpirvCompute& b, RegState& rs, int idx, uint32_t old_val) {
@@ -6137,8 +6164,7 @@ void record_scalar_write(RegState& rs, const Rdna2Inst& in,
         for (uint32_t word = 0; word < effective_width; ++word) {
             const int reg = base + static_cast<int>(word);
             if (!publishes_wave64_mask_half || reg != base) {
-                rs.sreg_wave64_mask_half.erase(reg);
-                rs.sreg_wave64_mask_half_index.erase(reg);
+                expire_wave64_mask_half(rs, reg, writes_b64_mask ? base : -1);
             }
             if (!rs.sreg_bool_b32.contains(reg) || (writes_b32_mask && reg == base))
                 continue;
@@ -9925,8 +9951,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // before selecting this read's source domain; only the exact CFG-proven mask-slot
                 // path below may publish a replacement.  record_scalar_write consequently knows
                 // that map presence after emission describes this instruction, not stale state.
-                rs.sreg_wave64_mask_half.erase(in.dst.value);
-                rs.sreg_wave64_mask_half_index.erase(in.dst.value);
+                expire_wave64_mask_half(rs, in.dst.value);
                 if (b.is_fragment && b.wave_size == 32 &&
                     in.src[1].kind == OperandKind::InlineInt && in.src[1].value >= 32) {
                     ok = false; return true;
