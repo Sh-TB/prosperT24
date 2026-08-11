@@ -909,6 +909,18 @@ struct SpirvCompute {
             {t_u32, first, uconst(Scope_Subgroup), GroupOp_Reduce, selected_lane});
         return sel(native_wave_any(mask_bit), first, uconst(0xffffffffu));
     }
+    uint32_t native_wave_popcount(uint32_t mask_bit) {
+        if (!native_subgroup_size || !mask_bit) return 0;
+        if (!declared_subgroup_arithmetic) {
+            put(caps, Op_Capability, {Cap_GroupNonUniformArithmetic});
+            declared_subgroup_arithmetic = true;
+        }
+        const uint32_t contribution = sel(mask_bit, uconst(1), uconst(0));
+        uint32_t result = id();
+        put(code, Op_GroupNonUniformIAdd,
+            {t_u32, result, uconst(Scope_Subgroup), GroupOp_Reduce, contribution});
+        return result;
+    }
     uint32_t native_compute_mbcnt(uint32_t mask_bit, uint32_t acc_bits, uint32_t lo) {
         if (!native_subgroup_size) return 0;
         const uint32_t lane = subgroup_local_id();
@@ -3615,8 +3627,10 @@ uint32_t inline_int_mask_bit_hi(SpirvCompute& b, int value) {
 
 // Per-invocation bit of a 64-bit mask consumed by V_MBCNT. The HI instruction names the odd SGPR
 // of an aligned scalar pair (for example s7 for s[6:7]), while our bool-domain mask is keyed by the
-// pair's low register. Accept the exact key first for unusual compiler allocations, then the aligned
-// low half. VCC/EXEC are represented directly rather than through the scalar-data register file —
+// pair's low register. The LOW instruction names that root directly; the HIGH instruction names the
+// following register, so only source-1 can represent its mask bits. An exact HIGH key would instead
+// describe source:source+1 and silently read the wrong physical dword. VCC/EXEC are represented
+// directly rather than through the scalar-data register file —
 // but only in the canonical pairing (LO with the low half, HI with the high half); a cross-pairing
 // (e.g. v_mbcnt_lo with exec_hi) reads OTHER lanes' bits, which the per-invocation model cannot
 // represent, so it returns the 0 reject sentinel.
@@ -3630,13 +3644,10 @@ uint32_t mbcnt_source_bit(SpirvCompute& b, const RegState& rs, const Operand& so
         return high_half ? inline_int_mask_bit_hi(b, source.value)
                          : inline_int_mask_bit(b, source.value);
     if (source.kind != OperandKind::SGPR) return 0;
-    auto found = rs.sreg_bool.find(source.value);
-    if (found != rs.sreg_bool.end()) return found->second;
-    if (high_half && source.value > 0) {
-        found = rs.sreg_bool.find(source.value - 1);
-        if (found != rs.sreg_bool.end()) return found->second;
-    }
-    return 0;
+    const int root = high_half ? source.value - 1 : source.value;
+    if (root < 0) return 0;
+    const auto found = rs.sreg_bool.find(root);
+    return found == rs.sreg_bool.end() ? 0 : found->second;
 }
 
 bool sopp_is_noop(const Rdna2Inst& in) {
@@ -6180,6 +6191,57 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
             }
+            if (b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64 &&
+                in.opcode == 0x14) { // s_ff1_i32_b64
+                // RDNA2 scans the complete 64-bit source from its least-significant bit and
+                // returns the first set index, or 0xffffffff for an empty mask.  The captured GTA
+                // compute sites feed EXEC, VCC, or a VOPC-saved mask pair into this scalar result.
+                // A required native Wave64 subgroup makes native_wave_first_active architectural;
+                // a 32-wide or unknown subgroup would silently lose bits 32..63.
+                const auto data_word_present = [&](int reg) {
+                    return rs.sreg.contains(reg) || rs.sreg_input.contains(reg);
+                };
+                const int source = in.src[0].value;
+                uint32_t mask = 0;
+                // EXEC is architectural mask state, even when structured-loop or dispatcher state
+                // bookkeeping also leaves synthetic scalar placeholders for physical s126/s127.
+                // Unlike VCC and saved SGPR pairs, those words cannot carry competing scalar data.
+                if (in.src[0].kind == OperandKind::Special && source == 126) {
+                    mask = rs.exec;
+                } else {
+                    const bool competing_data = data_word_present(source) ||
+                        data_word_present(source + 1);
+                    if (!competing_data && source == 106) {
+                        mask = rs.vcc;
+                    } else if (!competing_data && in.src[0].kind == OperandKind::SGPR &&
+                               !rs.sreg_bool_b32.contains(source)) {
+                        const auto saved = rs.sreg_bool.find(source);
+                        if (saved != rs.sreg_bool.end()) mask = saved->second;
+                    }
+                }
+                if (!mask || in.dst.value == 126 || in.dst.value == 127) {
+                    ok = false;
+                    return true;
+                }
+
+                const uint32_t result = b.native_wave_first_active(mask);
+                rs.sreg[in.dst.value] = result;
+                rs.sreg_srt.erase(in.dst.value);
+
+                // S_FF1 writes ordinary 32-bit scalar DATA.  End every complete-mask lifetime
+                // overlapping that physical dword, including a pair rooted one register earlier;
+                // otherwise a later implicit predicate consumer could observe the pre-S_FF1 mask.
+                const auto erase_mask_alias = [&](int base) {
+                    rs.sreg_bool.erase(base);
+                    rs.sreg_bool_narrowed.erase(base);
+                    rs.sreg_bool_b32.erase(base);
+                };
+                erase_mask_alias(in.dst.value);
+                if (in.dst.value > 0) erase_mask_alias(in.dst.value - 1);
+                if (in.dst.value == 106 || in.dst.value == 107) rs.vcc = 0;
+                // S_FF1 does not modify SCC.
+                return true;
+            }
             if (b.is_compute && b.wave_size == 32 && b.native_subgroup_size == 32 &&
                 in.opcode == 0x13) { // s_ff1_i32_b32
                 // RDNA2 returns the first set bit from the low end, or 0xffffffff for an empty
@@ -6501,16 +6563,53 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // A VOPC may write an arbitrary SGPR pair as a wave mask.  In the portable vertex
                 // shell that pair contains the one represented guest lane, so its exact population
                 // count is 0/1.  Ordinary data pairs retain full uint semantics and use two native
-                // OpBitCount operations.  Multi-lane mask reductions remain fail-closed here; their
-                // compute/fragment lowering needs a real wave reduction rather than scalar data.
+                // OpBitCount operations.  GTA's compute shaders also count EXEC, VCC, and saved
+                // VOPC masks.  Those are exact only when one native subgroup is the complete guest
+                // Wave64; a narrower or unknown host width would silently discard guest lanes.
+                // EXEC is tracked separately from scalar DATA.  Until the scalar count can be
+                // expanded into architectural EXEC bits, reject either EXEC destination for every
+                // source domain rather than only for the native-wave reduction below.
+                if (in.dst.value == 126 || in.dst.value == 127) {
+                    ok = false;
+                    return true;
+                }
                 uint32_t result = 0;
+                bool reduced_wave_mask = false;
                 auto mask = rs.sreg_bool.find(in.src[0].value);
-                if (!b.is_compute && !b.is_fragment && b.ngg_one_lane &&
-                    mask != rs.sreg_bool.end()) {
+                if (b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64) {
+                    const auto data_word_present = [&](int reg) {
+                        return rs.sreg.contains(reg) || rs.sreg_input.contains(reg);
+                    };
+                    const int source = in.src[0].value;
+                    uint32_t source_mask = 0;
+                    // Match S_FF1's EXEC rule above: canonical special:126 names architectural
+                    // EXEC, while structured state may also carry synthetic scalar placeholders
+                    // for the same physical words.  VCC and saved SGPR pairs can genuinely be
+                    // recycled as scalar data and therefore retain their ambiguity checks.
+                    if (in.src[0].kind == OperandKind::Special && source == 126) {
+                        source_mask = rs.exec;
+                    } else {
+                        const bool competing_data = data_word_present(source) ||
+                                                    data_word_present(source + 1);
+                        if (!competing_data && source == 106) {
+                            source_mask = rs.vcc;
+                        } else if (!competing_data && in.src[0].kind == OperandKind::SGPR &&
+                                   !rs.sreg_bool_b32.contains(source) &&
+                                   mask != rs.sreg_bool.end()) {
+                            source_mask = mask->second;
+                        }
+                    }
+                    if (source_mask) {
+                        result = b.native_wave_popcount(source_mask);
+                        reduced_wave_mask = true;
+                    }
+                }
+                if (!reduced_wave_mask && !b.is_compute && !b.is_fragment && b.ngg_one_lane &&
+                           mask != rs.sreg_bool.end()) {
                     result = b.sel(mask->second, b.uconst(1), b.uconst(0));
-                } else {
+                } else if (!reduced_wave_mask) {
                     // A Boolean-domain pair is a whole wave mask, not two ordinary scalar dwords.
-                    // Only the byte-exact one-lane NGG projection above can reduce it locally.
+                    // Only the exact native-wave and one-lane NGG projections above can reduce it.
                     if (mask != rs.sreg_bool.end()) { ok = false; return true; }
                     auto scalar_half = [&](int reg, uint32_t& value) {
                         auto current = rs.sreg.find(reg);
@@ -6535,6 +6634,18 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     result = b.ibin(Op_IAdd, b.iun(Op_BitCount, lo), b.iun(Op_BitCount, hi));
                 }
+                // The result is ordinary scalar DATA regardless of whether its source was a wave
+                // mask or a scalar pair.  A one-dword write can overlap either half of a saved B64
+                // mask, so terminate both possible Boolean-domain aliases.  VCC has the same
+                // split-register hazard and must not retain an older implicit predicate.
+                const auto erase_mask_alias = [&](int base) {
+                    rs.sreg_bool.erase(base);
+                    rs.sreg_bool_narrowed.erase(base);
+                    rs.sreg_bool_b32.erase(base);
+                };
+                erase_mask_alias(in.dst.value);
+                if (in.dst.value > 0) erase_mask_alias(in.dst.value - 1);
+                if (in.dst.value == 106 || in.dst.value == 107) rs.vcc = 0;
                 rs.sreg[in.dst.value] = result;
                 rs.sreg_srt.erase(in.dst.value);
                 // A B32 write to VCC_LO also replaces virtual lane zero's architectural mask bit.
@@ -9742,6 +9853,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         b.ucmp(Op_ULessThan, byte, b.uconst(4)), low,
                         b.sel(b.ucmp(Op_ULessThan, byte, b.uconst(8)), upper, b.uconst(0)));
                 }
+            } else if (in.opcode == 0x363) {                          // v_bfm_b32
+                // RDNA2: D.u32 = ((1 << S0[4:0]) - 1) << S1[4:0]. Mask both shift
+                // amounts before emitting SPIR-V so neither can reach the undefined >=32 range;
+                // in particular, an input width of 32 wraps to zero rather than producing all ones.
+                // The instruction has no defined modifier forms. OP_SEL is not retained by the
+                // generic decoder for this opcode, so reject its raw field explicitly as well.
+                const uint32_t opsel = (in.words[0] >> 11) & 0xFu;
+                if (in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
+                    in.src_neg[0] || in.src_neg[1] || in.src_neg[2] ||
+                    in.clamp || in.omod || opsel) {
+                    ok = false;
+                } else {
+                    const uint32_t width = b.ibin(
+                        Op_BitwiseAnd, val(in.src[0]), b.uconst(31));
+                    const uint32_t offset = b.ibin(
+                        Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
+                    const uint32_t mask = b.ibin(
+                        Op_ISub,
+                        b.ibin(Op_ShiftLeftLogical, b.uconst(1), width),
+                        b.uconst(1));
+                    vreg[in.dst.value] = b.ibin(Op_ShiftLeftLogical, mask, offset);
+                }
             } else if (in.opcode == 0x364) {                          // v_bcnt_u32_b32
                 // AMD RDNA2: D = popcount(S0) + S1. The third VOP3 source field is unused.
                 vreg[in.dst.value] = b.ibin(Op_IAdd,
@@ -10536,11 +10669,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (is_zero_record_raw_buffer(*res)) {
                     // The front half proved all four live V# words at this exact instruction and
                     // decoded NUM_RECORDS=0. RDNA2's OOB contract returns zero for every raw load
-                    // component and drops raw stores. Keep inactive lanes' destination values just
-                    // like a normal EXEC-predicated load, and never touch a shared dummy buffer on
-                    // the store side. Atomics are outside the producer's admitted subset and remain
-                    // fail-closed if a hand-built table tries to apply the marker to one.
-                    if (is_atomic) { ok = false; return true; }
+                    // component, drops raw stores, and performs no memory operation for an atomic.
+                    // For atomics GLC=0 leaves VDATA untouched; GLC=1 returns the pre-op value, which
+                    // is zero for an empty descriptor. Apply that return only to active EXEC lanes,
+                    // exactly like an ordinary predicated VGPR write. Never declare or touch a dummy
+                    // binding: one empty operation cannot then leak state into another.
+                    if (is_atomic) {
+                        if (in.mubuf_glc) {
+                            const int d = in.dst.value;
+                            const uint32_t old = vreg_old(b, rs, d);
+                            rs.vreg[d] = b.uconst(0);
+                            predicate_write(b, rs, d, old);
+                        }
+                        return true;
+                    }
                     if (is_store) return true;
                     for (uint32_t k = 0; k < n; ++k) {
                         const int d = in.dst.value + static_cast<int>(k);
@@ -13895,6 +14037,32 @@ bool emit_cfg_state_machine(
     // live VCC mask from a physical VCC pair that has been recycled as scalar data.
     std::unordered_set<uint32_t> proven_wave64_mask_zero_compare_pcs;
     std::unordered_set<uint32_t> proven_exec_saved_mask_compare_pcs;
+    std::unordered_set<uint32_t> proven_wave64_mask_reduction_pcs;
+    std::unordered_map<uint32_t, int> proven_wave64_mbcnt_mask_root_for_pc;
+    auto wave64_mask_reduction_source = [&](const Rdna2Inst& in) -> int {
+        if (!b.is_compute || b.wave_size != 64 || in.fmt != Rdna2Format::SOP1 ||
+            (in.opcode != 0x10 && in.opcode != 0x14))
+            return -1;
+        if (in.src[0].kind == OperandKind::SGPR &&
+            in.src[0].value >= 0 && in.src[0].value <= 105)
+            return in.src[0].value;
+        if (in.src[0].kind == OperandKind::Special && in.src[0].value == 106)
+            return 106;
+        // Canonical EXEC is already resolved from architectural state by emit_alu.  No other
+        // special register or odd half is a complete B64 mask source.
+        return -1;
+    };
+    auto wave64_mbcnt_mask_root = [&](const Rdna2Inst& in) -> int {
+        if (!b.is_compute || b.wave_size != 64 || in.fmt != Rdna2Format::VOP3 ||
+            (in.opcode != 0x365 && in.opcode != 0x366) ||
+            in.src[0].kind != OperandKind::SGPR)
+            return -1;
+        // LOW names the mask pair's low word. HIGH names its high word, while the Bool-domain
+        // value remains keyed by the low word. Architectural EXEC/VCC use Special operands and
+        // continue through mbcnt_source_bit without this saved-SGPR lifetime proof.
+        const int root = in.opcode == 0x366 ? in.src[0].value - 1 : in.src[0].value;
+        return root >= 0 && root <= 105 ? root : -1;
+    };
     if ((b.is_compute || b.is_fragment) && b.wave_size == 64 && !starts.empty()) {
         std::vector<std::set<int>> wave64_b64_mask_in(starts.size());
         std::vector<bool> wave64_b64_reachable(starts.size(), false);
@@ -13906,6 +14074,12 @@ bool emit_cfg_state_machine(
 
         auto advance_wave64_b64_masks = [&](std::set<int>& masks, const Rdna2Inst& in,
                                             bool record_compare) {
+            const int reduction_source = wave64_mask_reduction_source(in);
+            if (record_compare && reduction_source >= 0 && masks.contains(reduction_source))
+                proven_wave64_mask_reduction_pcs.insert(in.pc);
+            const int mbcnt_root = wave64_mbcnt_mask_root(in);
+            if (record_compare && mbcnt_root >= 0 && masks.contains(mbcnt_root))
+                proven_wave64_mbcnt_mask_root_for_pc.emplace(in.pc, mbcnt_root);
             const int zero_compare_source = mask_zero_compare_candidate_source(in);
             if (record_compare && zero_compare_source >= 0 &&
                 masks.contains(zero_compare_source))
@@ -14706,6 +14880,24 @@ bool emit_cfg_state_machine(
                     if (!exp_fn(state, in)) return reject_cfg(in.pc, "export");
                     continue;
                 }
+                if (proven_wave64_mask_reduction_pcs.contains(in.pc)) {
+                    const int source = wave64_mask_reduction_source(in);
+                    const bool mask_available = source == 106
+                        ? state.vcc != 0
+                        : state.sreg_bool.contains(source);
+                    if (source < 0 || !mask_available)
+                        return reject_cfg(in.pc, "proven mask reduction missing mask state");
+                    // The dispatcher persists the physical SGPR file and Bool-domain masks in
+                    // separate function variables.  At this exact MUST-proven consumer, the u32
+                    // pair is only a synthetic placeholder from an earlier scalar lifetime; leave
+                    // the generic S_FF1/S_BCNT ambiguity guard intact and expose the proven mask by
+                    // removing only those two stale data views.
+                    for (int reg = source; reg <= source + 1; ++reg) {
+                        state.sreg.erase(reg);
+                        state.sreg_input.erase(reg);
+                        state.sreg_srt.erase(reg);
+                    }
+                }
                 bool ok = true;
                 const bool handled = emit_alu(b, state, in, ok, allow_exec_update, &safe,
                                               allow_smem, rt, /*allow_wave*/false);
@@ -14787,8 +14979,22 @@ bool emit_cfg_state_machine(
                 return false;
             }
             bool operand_ok = true;
-            const uint32_t mask = mbcnt_source_bit(
-                b, state, mbcnt->src[0], mbcnt->opcode == 0x366);
+            uint32_t mask = 0;
+            if (b.wave_size == 64 && mbcnt->src[0].kind == OperandKind::SGPR) {
+                // Dispatcher Bool variables preserve values after a scalar overwrite by storing
+                // false, so map membership is not a lifetime proof. Admit a saved SGPR mask only
+                // at the exact consumer where the Wave64 MUST analysis proves its pair root live.
+                const auto proof = proven_wave64_mbcnt_mask_root_for_pc.find(mbcnt->pc);
+                if (proof == proven_wave64_mbcnt_mask_root_for_pc.end())
+                    return reject_cfg(mbcnt->pc, "mbcnt-unproven-saved-mask");
+                const auto live = state.sreg_bool.find(proof->second);
+                if (live == state.sreg_bool.end())
+                    return reject_cfg(mbcnt->pc, "mbcnt-proven-mask-missing-state");
+                mask = live->second;
+            } else {
+                mask = mbcnt_source_bit(
+                    b, state, mbcnt->src[0], mbcnt->opcode == 0x366);
+            }
             const uint32_t acc = operand_bits(b, state, *mbcnt, mbcnt->src[1], &operand_ok);
             const auto event = mbcnt_event_for_pc.find(mbcnt->pc);
             if (!mask || !operand_ok || event == mbcnt_event_for_pc.end()) return false;
@@ -16680,8 +16886,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 return in.fmt != Rdna2Format::SOPP || in.opcode != 0x0a ||
                        top_level_pc(in.pc);
             });
+        const bool structured_has_cross_lane_mbcnt =
+            std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+                return in.fmt == Rdna2Format::VOP3 &&
+                       (in.opcode == 0x365 || in.opcode == 0x366) &&
+                       !(in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1);
+            });
         const bool structured_compute_wave_cfg = exact_compute_wave_cfg && !cf_rejected &&
-            barriers_are_top_level &&
+            barriers_are_top_level && !structured_has_cross_lane_mbcnt &&
             std::all_of(Fs.begin(), Fs.end(), [&](const ForwardIf& branch) {
                 // An exact native guest-size subgroup performs the vote without synthesized
                 // workgroup barriers, so nested wave branches are safe. Portable scratch votes
