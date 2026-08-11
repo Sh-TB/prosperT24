@@ -6120,15 +6120,29 @@ bool is_inplace_vadd_nc_u32_dpp_row_shr(const Rdna2Inst& in) {
         in.dst.value == in.src[1].value;
 }
 
-// Exact bounded row rotate emitted by GTA V's screen-space compute passes. The decoder has already
-// proved FI=0/no source modifiers; repeat every retained control field here so both the ordinary
-// emitter and CFG dispatcher share one fail-closed contract.
-bool is_vmin_f32_dpp_row_ror8(const Rdna2Inst& in) {
-    return in.fmt == Rdna2Format::VOP2 && in.opcode == 0x0f && in.has_dpp &&
-        in.dpp_bound_ctrl && in.dpp_ctrl == 0x128u &&
-        in.dpp_row_mask == 0xfu && in.dpp_bank_mask == 0xfu &&
-        in.dst.kind == OperandKind::VGPR && in.src[0].kind == OperandKind::VGPR &&
-        in.src[1].kind == OperandKind::VGPR;
+enum class DppRowRor8Op : uint32_t {
+    None = 0,
+    MovB32 = 1,
+    MinF32 = 2,
+    MaxF32 = 3,
+};
+
+// Exact bounded row-rotate family emitted by GTA V's screen-space compute passes. The decoder has
+// already proved FI=0/no source modifiers; repeat every retained control field here so the ordinary
+// emitter and CFG dispatcher share one fail-closed contract. VOP1 MOV has only the permuted SRC0;
+// the two VOP2 float operations combine that value with the destination lane's unpermuted SRC1.
+DppRowRor8Op dpp_row_ror8_op(const Rdna2Inst& in) {
+    if (!in.has_dpp || !in.dpp_bound_ctrl || in.dpp_ctrl != 0x128u ||
+        in.dpp_row_mask != 0xfu || in.dpp_bank_mask != 0xfu ||
+        in.dst.kind != OperandKind::VGPR || in.src[0].kind != OperandKind::VGPR)
+        return DppRowRor8Op::None;
+    if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x01)
+        return DppRowRor8Op::MovB32;
+    if (in.fmt != Rdna2Format::VOP2 || in.src[1].kind != OperandKind::VGPR)
+        return DppRowRor8Op::None;
+    if (in.opcode == 0x0f) return DppRowRor8Op::MinF32;
+    if (in.opcode == 0x10) return DppRowRor8Op::MaxF32;
+    return DppRowRor8Op::None;
 }
 
 // Exact identity-QUAD_PERM tail of the same reduction. No value crosses lanes; ROW_MASK selects
@@ -8151,7 +8165,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // when the host subgroup width differs from the guest wave width.
             if (in.has_dpp) {
                 const bool row_shr = in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11Fu;
-                if (row_shr) {
+                const bool row_ror8 = in.dpp_ctrl == 0x128u;
+                if (row_ror8) {
+                    // Direct shuffle is valid only when one native subgroup is exactly one guest
+                    // wave. Portable/default-subgroup compute is routed through synchronized CFG
+                    // scratch below. FI=0 checks the rotated source's EXEC bit and BC1 supplies 0.
+                    if (!b.is_compute || dpp_row_ror8_op(in) != DppRowRor8Op::MovB32 ||
+                        !b.native_subgroup_size) {
+                        ok = false; return true;
+                    }
+                    uint32_t valid_source = 0;
+                    const uint32_t rotated = b.subgroup_row_ror8(a, rs.exec, &valid_source);
+                    a = b.sel(valid_source, rotated, b.uconst(0));
+                } else if (row_shr) {
                     // The portable NGG vertex shell represents the one live guest lane as lane 0.
                     // Every non-zero row-right shift therefore addresses a lane before the start of
                     // its row; BOUND_CTRL=1 supplies the architectural zero.  An unbounded access
@@ -8642,10 +8668,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                  in.opcode == 0x08 || in.opcode == 0x0F || in.opcode == 0x10 ||
                                  in.opcode == 0x1F || in.opcode == 0x2B;
                 if (row_ror8) {
-                    // The decoder admits only GTA V's full-mask, BC1, FI0 V_MIN_F32 packet. Direct
-                    // subgroup shuffle is valid only when one native subgroup is exactly one guest
-                    // wave; portable/default-subgroup compute is routed through CFG scratch below.
-                    if (!b.is_compute || !is_vmin_f32_dpp_row_ror8(in) ||
+                    // The decoder admits only GTA V's full-mask, BC1, FI0 MIN/MAX packets here.
+                    // Direct subgroup shuffle is valid only when one native subgroup is exactly one
+                    // guest wave; portable/default-subgroup compute uses CFG scratch below.
+                    if (!b.is_compute || dpp_row_ror8_op(in) == DppRowRor8Op::None ||
                         !b.native_subgroup_size) {
                         ok = false; return true;
                     }
@@ -13524,11 +13550,11 @@ bool emit_cfg_state_machine(
         return b.is_compute && is_inplace_vadd_nc_u32_dpp_row_shr(in);
     };
 
-    // GTA V's V_MIN_F32 ROW_ROR:8 has the same synchronization requirement as the add ladder:
-    // exact native waves can shuffle in the uniform dispatcher case, while portable waves publish
-    // an event-tagged source through workgroup scratch in the common phase.
-    auto compute_dpp_min_row_ror8 = [&](const Rdna2Inst& in) {
-        return b.is_compute && is_vmin_f32_dpp_row_ror8(in);
+    // GTA V's MOV/MIN/MAX ROW_ROR:8 family has the same synchronization requirement as the add
+    // ladder: exact native waves can shuffle in the uniform dispatcher case, while portable waves
+    // publish an event-tagged source through workgroup scratch in the common phase.
+    auto compute_dpp_row_ror8 = [&](const Rdna2Inst& in) {
+        return b.is_compute && dpp_row_ror8_op(in) != DppRowRor8Op::None;
     };
 
     // The row reduction is followed by an identity QUAD_PERM whose partial ROW_MASK selects rows
@@ -13672,9 +13698,9 @@ bool emit_cfg_state_machine(
     std::unordered_set<uint32_t> compute_dpp_add_row_shr_pcs;
     std::unordered_map<uint32_t, uint32_t> compute_dpp_add_event_for_pc;
     std::set<int> compute_dpp_add_row_shr_dsts;
-    std::unordered_set<uint32_t> compute_dpp_min_row_ror8_pcs;
-    std::unordered_map<uint32_t, uint32_t> compute_dpp_min_ror8_event_for_pc;
-    std::set<int> compute_dpp_min_row_ror8_dsts;
+    std::unordered_set<uint32_t> compute_dpp_row_ror8_pcs;
+    std::unordered_map<uint32_t, uint32_t> compute_dpp_ror8_event_for_pc;
+    std::set<int> compute_dpp_row_ror8_dsts;
     uint32_t next_compute_dpp_event = 1;
     std::unordered_set<uint32_t> compute_dpp_add_row_mask_pcs;
     for (size_t i = 0; i < ins.size(); ++i) {
@@ -13721,11 +13747,11 @@ bool emit_cfg_state_machine(
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
         }
-        if (compute_dpp_min_row_ror8(in)) {
-            compute_dpp_min_row_ror8_pcs.insert(in.pc);
-            compute_dpp_min_ror8_event_for_pc.emplace(
+        if (compute_dpp_row_ror8(in)) {
+            compute_dpp_row_ror8_pcs.insert(in.pc);
+            compute_dpp_ror8_event_for_pc.emplace(
                 in.pc, next_compute_dpp_event++);
-            compute_dpp_min_row_ror8_dsts.insert(in.dst.value);
+            compute_dpp_row_ror8_dsts.insert(in.dst.value);
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
@@ -13776,10 +13802,10 @@ bool emit_cfg_state_machine(
     }
     const bool has_portable_compute_dpp_add =
         !b.native_subgroup_size && !compute_dpp_add_row_shr_pcs.empty();
-    const bool has_portable_compute_dpp_min_ror8 =
-        !b.native_subgroup_size && !compute_dpp_min_row_ror8_pcs.empty();
+    const bool has_portable_compute_dpp_ror8 =
+        !b.native_subgroup_size && !compute_dpp_row_ror8_pcs.empty();
     const bool has_portable_compute_dpp =
-        has_portable_compute_dpp_add || has_portable_compute_dpp_min_ror8;
+        has_portable_compute_dpp_add || has_portable_compute_dpp_ror8;
     // Portable DPP needs a full-width value beside an event/EXEC word for every invocation. The
     // first plane remains reusable by MBCNT/votes after DPP's trailing barrier; only shaders that
     // actually contain this event pay for the second plane.
@@ -14463,7 +14489,7 @@ bool emit_cfg_state_machine(
                 swizzle_pcs.contains(in.pc) ||
                 fragment_dpp_min_row_shr_pcs.contains(in.pc) ||
                 compute_dpp_add_row_shr_pcs.contains(in.pc) ||
-                compute_dpp_min_row_ror8_pcs.contains(in.pc) ||
+                compute_dpp_row_ror8_pcs.contains(in.pc) ||
                 compute_dpp_add_row_mask_pcs.contains(in.pc) ||
                 mask_zero_compare_candidate_source(in) >= 0 ||
                 exec_saved_mask_compare_source(in) >= 0 ||
@@ -14660,17 +14686,19 @@ bool emit_cfg_state_machine(
         ? b.function_var(b.t_u32, ptr_u32) : 0;
     const uint32_t dpp_add_event_var = has_portable_compute_dpp_add
         ? b.function_var(b.t_u32, ptr_u32) : 0;
-    const uint32_t dpp_min_ror8_pending_var = has_portable_compute_dpp_min_ror8
+    const uint32_t dpp_ror8_pending_var = has_portable_compute_dpp_ror8
         ? b.function_var(b.t_bool, ptr_bool) : 0;
-    const uint32_t dpp_min_ror8_active_var = has_portable_compute_dpp_min_ror8
+    const uint32_t dpp_ror8_active_var = has_portable_compute_dpp_ror8
         ? b.function_var(b.t_bool, ptr_bool) : 0;
-    const uint32_t dpp_min_ror8_src0_var = has_portable_compute_dpp_min_ror8
+    const uint32_t dpp_ror8_src0_var = has_portable_compute_dpp_ror8
         ? b.function_var(b.t_u32, ptr_u32) : 0;
-    const uint32_t dpp_min_ror8_src1_var = has_portable_compute_dpp_min_ror8
+    const uint32_t dpp_ror8_src1_var = has_portable_compute_dpp_ror8
         ? b.function_var(b.t_u32, ptr_u32) : 0;
-    const uint32_t dpp_min_ror8_dst_var = has_portable_compute_dpp_min_ror8
+    const uint32_t dpp_ror8_op_var = has_portable_compute_dpp_ror8
         ? b.function_var(b.t_u32, ptr_u32) : 0;
-    const uint32_t dpp_min_ror8_event_var = has_portable_compute_dpp_min_ror8
+    const uint32_t dpp_ror8_dst_var = has_portable_compute_dpp_ror8
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t dpp_ror8_event_var = has_portable_compute_dpp_ror8
         ? b.function_var(b.t_u32, ptr_u32) : 0;
 
     const uint32_t zero = b.uconst(0), no = b.bfalse(), yes = b.btrue();
@@ -14733,11 +14761,12 @@ bool emit_cfg_state_machine(
         b.store_function(dpp_add_dst_var, zero);
         b.store_function(dpp_add_event_var, zero);
     }
-    if (has_portable_compute_dpp_min_ror8) {
-        b.store_function(dpp_min_ror8_src0_var, zero);
-        b.store_function(dpp_min_ror8_src1_var, zero);
-        b.store_function(dpp_min_ror8_dst_var, zero);
-        b.store_function(dpp_min_ror8_event_var, zero);
+    if (has_portable_compute_dpp_ror8) {
+        b.store_function(dpp_ror8_src0_var, zero);
+        b.store_function(dpp_ror8_src1_var, zero);
+        b.store_function(dpp_ror8_op_var, zero);
+        b.store_function(dpp_ror8_dst_var, zero);
+        b.store_function(dpp_ror8_event_var, zero);
     }
 
     auto load_state = [&](uint32_t dispatch = UINT32_MAX) {
@@ -14907,10 +14936,10 @@ bool emit_cfg_state_machine(
         b.store_function(dpp_add_active_var, no);
         b.store_function(dpp_add_event_var, zero);
     }
-    if (has_portable_compute_dpp_min_ror8) {
-        b.store_function(dpp_min_ror8_pending_var, no);
-        b.store_function(dpp_min_ror8_active_var, no);
-        b.store_function(dpp_min_ror8_event_var, zero);
+    if (has_portable_compute_dpp_ror8) {
+        b.store_function(dpp_ror8_pending_var, no);
+        b.store_function(dpp_ror8_active_var, no);
+        b.store_function(dpp_ror8_event_var, zero);
     }
     b.emit_loopmerge(loop_merge, loop_continue);
     b.emit_branch(switch_header);
@@ -14964,7 +14993,7 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* swizzle = nullptr;
         const Rdna2Inst* dpp_min_row_shr = nullptr;
         const Rdna2Inst* dpp_add_row_shr = nullptr;
-        const Rdna2Inst* dpp_min_row_ror8 = nullptr;
+        const Rdna2Inst* dpp_row_ror8 = nullptr;
         const Rdna2Inst* dpp_add_row_mask = nullptr;
         const Rdna2Inst* mask_compare = nullptr;
         const Rdna2Inst* exec_saved_mask_compare = nullptr;
@@ -14984,7 +15013,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_swizzle = nullptr;
             const Rdna2Inst* block_dpp_min_row_shr = nullptr;
             const Rdna2Inst* block_dpp_add_row_shr = nullptr;
-            const Rdna2Inst* block_dpp_min_row_ror8 = nullptr;
+            const Rdna2Inst* block_dpp_row_ror8 = nullptr;
             const Rdna2Inst* block_dpp_add_row_mask = nullptr;
             const Rdna2Inst* block_mask_compare = nullptr;
             const Rdna2Inst* block_exec_saved_mask_compare = nullptr;
@@ -15030,14 +15059,15 @@ bool emit_cfg_state_machine(
                     block_dpp_add_row_shr = &in;
                     break;
                 }
-                if (compute_dpp_min_row_ror8_pcs.contains(in.pc)) {
+                if (compute_dpp_row_ror8_pcs.contains(in.pc)) {
                     if (getenv("PROSPER_DBG"))
                         std::fprintf(stderr,
-                                     "[compute-cfg-dpp-min-row-ror8] "
-                                     "pc=%u dst=v%d src0=v%d src1=v%d\n",
-                                     in.pc, in.dst.value,
-                                     in.src[0].value, in.src[1].value);
-                    block_dpp_min_row_ror8 = &in;
+                                     "[compute-cfg-dpp-row-ror8] "
+                                     "pc=%u op=%u dst=v%d src0=v%d src1=v%d\n",
+                                     in.pc, static_cast<uint32_t>(dpp_row_ror8_op(in)),
+                                     in.dst.value, in.src[0].value,
+                                     in.n_src > 1 ? in.src[1].value : -1);
+                    block_dpp_row_ror8 = &in;
                     break;
                 }
                 if (compute_dpp_add_row_mask_pcs.contains(in.pc)) {
@@ -15178,7 +15208,7 @@ bool emit_cfg_state_machine(
                 // Group construction admits only one-successor plain blocks before the tail.
                 if (block_mbcnt || block_append || block_swizzle ||
                     block_dpp_min_row_shr || block_dpp_add_row_shr ||
-                    block_dpp_min_row_ror8 ||
+                    block_dpp_row_ror8 ||
                     block_dpp_add_row_mask || block_mask_compare ||
                     block_exec_saved_mask_compare || block_saved_mask_pair_compare ||
                     block_vopc_mask_compare ||
@@ -15194,7 +15224,7 @@ bool emit_cfg_state_machine(
             swizzle = block_swizzle;
             dpp_min_row_shr = block_dpp_min_row_shr;
             dpp_add_row_shr = block_dpp_add_row_shr;
-            dpp_min_row_ror8 = block_dpp_min_row_ror8;
+            dpp_row_ror8 = block_dpp_row_ror8;
             dpp_add_row_mask = block_dpp_add_row_mask;
             mask_compare = block_mask_compare;
             exec_saved_mask_compare = block_exec_saved_mask_compare;
@@ -15357,19 +15387,23 @@ bool emit_cfg_state_machine(
                 b.store_function(dpp_add_event_var, b.uconst(event->second));
             }
         }
-        if (dpp_min_row_ror8) {
-            if (!compute_dpp_min_row_ror8(*dpp_min_row_ror8))
-                return reject_cfg(dpp_min_row_ror8->pc, "dpp-min-row-ror8-contract");
-            const auto event = compute_dpp_min_ror8_event_for_pc.find(dpp_min_row_ror8->pc);
-            if (event == compute_dpp_min_ror8_event_for_pc.end())
-                return reject_cfg(dpp_min_row_ror8->pc, "dpp-min-row-ror8-event");
-            const int dst = dpp_min_row_ror8->dst.value;
+        if (dpp_row_ror8) {
+            const DppRowRor8Op operation = dpp_row_ror8_op(*dpp_row_ror8);
+            if (!compute_dpp_row_ror8(*dpp_row_ror8))
+                return reject_cfg(dpp_row_ror8->pc, "dpp-row-ror8-contract");
+            const auto event = compute_dpp_ror8_event_for_pc.find(dpp_row_ror8->pc);
+            if (event == compute_dpp_ror8_event_for_pc.end())
+                return reject_cfg(dpp_row_ror8->pc, "dpp-row-ror8-event");
+            const int dst = dpp_row_ror8->dst.value;
             const auto old = state.vreg.find(dst);
-            const auto src0 = state.vreg.find(dpp_min_row_ror8->src[0].value);
-            const auto src1 = state.vreg.find(dpp_min_row_ror8->src[1].value);
+            const auto src0 = state.vreg.find(dpp_row_ror8->src[0].value);
             const uint32_t old_value = old == state.vreg.end() ? zero : old->second;
             const uint32_t src0_value = src0 == state.vreg.end() ? zero : src0->second;
-            const uint32_t src1_value = src1 == state.vreg.end() ? zero : src1->second;
+            uint32_t src1_value = zero;
+            if (dpp_row_ror8->n_src > 1) {
+                const auto src1 = state.vreg.find(dpp_row_ror8->src[1].value);
+                src1_value = src1 == state.vreg.end() ? zero : src1->second;
+            }
             if (b.native_subgroup_size) {
                 // One exact native subgroup is one guest wave and this case is subgroup-uniform.
                 // FI=0 checks the rotated source's EXEC bit; BC1 substitutes zero when it is clear.
@@ -15377,20 +15411,26 @@ bool emit_cfg_state_machine(
                 const uint32_t rotated = b.subgroup_row_ror8(
                     src0_value, state.exec, &valid_source);
                 const uint32_t bounded = b.sel(valid_source, rotated, zero);
-                const uint32_t result = b.fext2(Glsl_NMin, bounded, src1_value);
+                uint32_t result = bounded;
+                if (operation == DppRowRor8Op::MinF32)
+                    result = b.fext2(Glsl_NMin, bounded, src1_value);
+                else if (operation == DppRowRor8Op::MaxF32)
+                    result = b.fext2(Glsl_NMax, bounded, src1_value);
                 state.vreg[dst] = b.sel(state.exec, result, old_value);
                 for (auto& vg : state.vgpr_lane_slots)
                     if (vg.first == dst) for (auto& slot : vg.second) slot.second = zero;
                 for (auto& vg : state.vgpr_lane_mask_slots)
                     if (vg.first == dst) for (auto& slot : vg.second) slot.second = no;
             } else {
-                b.store_function(dpp_min_ror8_pending_var, yes);
-                b.store_function(dpp_min_ror8_active_var, state.exec);
-                b.store_function(dpp_min_ror8_src0_var, src0_value);
-                b.store_function(dpp_min_ror8_src1_var, src1_value);
-                b.store_function(dpp_min_ror8_dst_var,
+                b.store_function(dpp_ror8_pending_var, yes);
+                b.store_function(dpp_ror8_active_var, state.exec);
+                b.store_function(dpp_ror8_src0_var, src0_value);
+                b.store_function(dpp_ror8_src1_var, src1_value);
+                b.store_function(dpp_ror8_op_var,
+                    b.uconst(static_cast<uint32_t>(operation)));
+                b.store_function(dpp_ror8_dst_var,
                     b.uconst(static_cast<uint32_t>(dst)));
-                b.store_function(dpp_min_ror8_event_var, b.uconst(event->second));
+                b.store_function(dpp_ror8_event_var, b.uconst(event->second));
             }
         }
         if (dpp_add_row_mask) {
@@ -15586,10 +15626,9 @@ bool emit_cfg_state_machine(
             if (!set_next(dpp_add_row_shr->pc + dpp_add_row_shr->len_dwords))
                 return reject_cfg(dpp_add_row_shr->pc,
                                   "dpp-add-row-shr-successor");
-        } else if (dpp_min_row_ror8) {
-            if (!set_next(dpp_min_row_ror8->pc + dpp_min_row_ror8->len_dwords))
-                return reject_cfg(dpp_min_row_ror8->pc,
-                                  "dpp-min-row-ror8-successor");
+        } else if (dpp_row_ror8) {
+            if (!set_next(dpp_row_ror8->pc + dpp_row_ror8->len_dwords))
+                return reject_cfg(dpp_row_ror8->pc, "dpp-row-ror8-successor");
         } else if (dpp_add_row_mask) {
             if (!set_next(dpp_add_row_mask->pc + dpp_add_row_mask->len_dwords))
                 return reject_cfg(dpp_add_row_mask->pc,
@@ -15911,17 +15950,17 @@ bool emit_cfg_state_machine(
     b.barrier();
     }
 
-    // Portable compute DPP V_MIN_F32 ROW_ROR:8 common phase. This is deliberately separate from
-    // the ROW_SHR add phase above: each phase publishes its own pending state, consumes it between
-    // two workgroup barriers, and only then permits the other operation to reuse the scratch planes.
-    // The scan assigned disjoint event IDs across both operation families as a second guard against
-    // a future phase combination accidentally accepting metadata from the other DPP instruction.
-    if (has_portable_compute_dpp_min_ror8) {
-    const uint32_t dpp_pending = b.load_function(b.t_bool, dpp_min_ror8_pending_var);
-    const uint32_t dpp_active = b.load_function(b.t_bool, dpp_min_ror8_active_var);
-    const uint32_t dpp_src0 = b.load_function(b.t_u32, dpp_min_ror8_src0_var);
-    const uint32_t dpp_src1 = b.load_function(b.t_u32, dpp_min_ror8_src1_var);
-    const uint32_t dpp_event = b.load_function(b.t_u32, dpp_min_ror8_event_var);
+    // Portable compute DPP ROW_ROR:8 common phase. This is deliberately separate from the ROW_SHR
+    // add phase above: each phase publishes its own pending state, consumes it between two workgroup
+    // barriers, and only then permits the other operation to reuse the scratch planes. Event IDs
+    // distinguish static sites; the operation tag distinguishes MOV/MIN/MAX semantics per invocation.
+    if (has_portable_compute_dpp_ror8) {
+    const uint32_t dpp_pending = b.load_function(b.t_bool, dpp_ror8_pending_var);
+    const uint32_t dpp_active = b.load_function(b.t_bool, dpp_ror8_active_var);
+    const uint32_t dpp_src0 = b.load_function(b.t_u32, dpp_ror8_src0_var);
+    const uint32_t dpp_src1 = b.load_function(b.t_u32, dpp_ror8_src1_var);
+    const uint32_t dpp_operation = b.load_function(b.t_u32, dpp_ror8_op_var);
+    const uint32_t dpp_event = b.load_function(b.t_u32, dpp_ror8_event_var);
     b.cfg_scratch_store(
         b.ibin(Op_IAdd, b.uconst(dpp_value_base), b.linear_localid), dpp_src0);
     const uint32_t dpp_metadata = b.sel(
@@ -15959,14 +15998,23 @@ bool emit_cfg_state_machine(
         b.land(dpp_source_active,
                b.ucmp(Op_IEqual, dpp_source_event, dpp_event)));
     // FI=0 requires an EXEC-active source. BOUND_CTRL=1 supplies zero when that source is invalid,
-    // but the active destination still writes the resulting NMin with its lane-local SRC1.
+    // but the active destination still writes the operation's result. MOV uses the bounded source;
+    // MIN/MAX combine it with the destination lane's unpermuted SRC1.
     const uint32_t dpp_bounded = b.sel(dpp_valid_source, dpp_rotated, zero);
-    const uint32_t dpp_result = b.fext2(Glsl_NMin, dpp_bounded, dpp_src1);
+    uint32_t dpp_result = dpp_bounded;
+    dpp_result = b.sel(
+        b.ucmp(Op_IEqual, dpp_operation,
+               b.uconst(static_cast<uint32_t>(DppRowRor8Op::MinF32))),
+        b.fext2(Glsl_NMin, dpp_bounded, dpp_src1), dpp_result);
+    dpp_result = b.sel(
+        b.ucmp(Op_IEqual, dpp_operation,
+               b.uconst(static_cast<uint32_t>(DppRowRor8Op::MaxF32))),
+        b.fext2(Glsl_NMax, dpp_bounded, dpp_src1), dpp_result);
     const uint32_t dpp_write = b.land(dpp_pending, dpp_active);
-    const uint32_t dpp_dst = b.load_function(b.t_u32, dpp_min_ror8_dst_var);
-    for (int reg : compute_dpp_min_row_ror8_dsts) {
+    const uint32_t dpp_dst = b.load_function(b.t_u32, dpp_ror8_dst_var);
+    for (int reg : compute_dpp_row_ror8_dsts) {
         const auto kv = vv.find(reg);
-        if (kv == vv.end()) return reject_cfg(0, "missing-dpp-min-row-ror8-dst");
+        if (kv == vv.end()) return reject_cfg(0, "missing-dpp-row-ror8-dst");
         const uint32_t selected = b.land(
             dpp_write, b.ucmp(Op_IEqual, dpp_dst,
                               b.uconst(static_cast<uint32_t>(reg))));
@@ -15976,7 +16024,7 @@ bool emit_cfg_state_machine(
     // A physical destination definition invalidates scalar lane aliases even when EXEC suppresses
     // this invocation's data write, matching predicate_write and the existing DPP add phase.
     for (const auto& kv : lv) {
-        if (!compute_dpp_min_row_ror8_dsts.contains(kv.first.first)) continue;
+        if (!compute_dpp_row_ror8_dsts.contains(kv.first.first)) continue;
         const uint32_t selected = b.land(
             dpp_pending, b.ucmp(Op_IEqual, dpp_dst,
                                 b.uconst(static_cast<uint32_t>(kv.first.first))));
@@ -15984,7 +16032,7 @@ bool emit_cfg_state_machine(
         b.store_function(kv.second, b.sel(selected, zero, old));
     }
     for (const auto& kv : lmv) {
-        if (!compute_dpp_min_row_ror8_dsts.contains(kv.first.first)) continue;
+        if (!compute_dpp_row_ror8_dsts.contains(kv.first.first)) continue;
         const uint32_t selected = b.land(
             dpp_pending, b.ucmp(Op_IEqual, dpp_dst,
                                 b.uconst(static_cast<uint32_t>(kv.first.first))));
@@ -16610,7 +16658,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     ins.begin(), ins.begin() + phased.end_index,
                     [](const Rdna2Inst& in) {
                         return is_inplace_vadd_nc_u32_dpp_row_shr(in) ||
-                            is_vmin_f32_dpp_row_ror8(in);
+                            dpp_row_ror8_op(in) != DppRowRor8Op::None;
                     });
                 const uint32_t scratch_dwords = padded_lanes +
                     (has_portable_dpp ? padded_lanes : 0u) + wave_count + 1;
@@ -17318,12 +17366,12 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                              b.code.size() - checkpoint);
             return -1;
         };
-        const bool portable_compute_dpp_min_ror8 = b.is_compute &&
+        const bool portable_compute_dpp_ror8 = b.is_compute &&
             !b.native_subgroup_size &&
             std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
-                return is_vmin_f32_dpp_row_ror8(in);
+                return dpp_row_ror8_op(in) != DppRowRor8Op::None;
             });
-        if (allow_cfg_dispatcher && portable_compute_dpp_min_ror8) {
+        if (allow_cfg_dispatcher && portable_compute_dpp_ror8) {
             // The generic straight-line/structured emitter can use ROW_ROR only when the backend
             // guarantees one exact native guest wave. Otherwise the complete program must enter the
             // synchronized dispatcher so every invocation reaches both scratch barriers uniformly.
