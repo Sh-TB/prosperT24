@@ -8434,6 +8434,36 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (in.src_neg[0]) d = b.fneg(d);
                     break;
                 }
+                case 0x0C: {                                        // v_cvt_rpi_i32_f32
+                    // AMD RDNA2 ISA: D.i = (int)floor(S0.f + 0.5), i.e. nearest integer with
+                    // halfway cases rounded toward +infinity (not ceil for every fraction).
+                    // The guide does not restate NaN/out-of-range handling for this specialized
+                    // form, so use the adjacent f32->i32 conversion's deterministic convention:
+                    // NaN -> 0 and saturation at INT_MIN/INT_MAX. cvt_f2i also keeps the SPIR-V
+                    // conversion operand representable on every backend.
+                    //
+                    // Only GTA V's exact plain e32 form is established here. SDWA/DPP and source
+                    // or output modifiers remain fail-visible instead of being silently ignored.
+                    // CONFIDENCE: MED (rounding formula HIGH; exceptional-value policy follows the
+                    // established adjacent architectural conversion because this opcode omits it).
+                    if (in.has_sdwa || in.has_dpp || in.src_abs[0] || in.src_neg[0] ||
+                        in.clamp || in.omod) {
+                        ok = false;
+                        break;
+                    }
+                    // Do not literally add 0.5 in f32 before floor: the float immediately below
+                    // 0.5 would double-round to 1.0. Split off the fractional part, then apply the
+                    // >= tie rule; for integral large magnitudes the fraction is already zero.
+                    const uint32_t lower = b.fext1(Glsl_Floor, a);
+                    const uint32_t fraction = b.fbin(Op_FSub, a, lower);
+                    const uint32_t round_up = b.fcmp(
+                        Op_FOrdGreaterThanEqual, fraction, b.uconst(fbits(0.5f)));
+                    const uint32_t rounded = b.fbin(
+                        Op_FAdd, lower,
+                        b.sel(round_up, b.uconst(fbits(1.0f)), b.uconst(fbits(0.0f))));
+                    d = b.cvt_f2i(rounded);
+                    break;
+                }
                 case 0x0D:                                          // v_cvt_flr_i32_f32
                     // AMD RDNA2 ISA: floor the f32 value before converting to signed i32. This is
                     // observably different from v_cvt_i32_f32's truncation for negative fractions.
