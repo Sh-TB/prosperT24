@@ -14016,6 +14016,20 @@ bool emit_cfg_state_machine(
     // live VCC mask from a physical VCC pair that has been recycled as scalar data.
     std::unordered_set<uint32_t> proven_wave64_mask_zero_compare_pcs;
     std::unordered_set<uint32_t> proven_exec_saved_mask_compare_pcs;
+    std::unordered_set<uint32_t> proven_wave64_mask_reduction_pcs;
+    auto wave64_mask_reduction_source = [&](const Rdna2Inst& in) -> int {
+        if (!b.is_compute || b.wave_size != 64 || in.fmt != Rdna2Format::SOP1 ||
+            (in.opcode != 0x10 && in.opcode != 0x14))
+            return -1;
+        if (in.src[0].kind == OperandKind::SGPR &&
+            in.src[0].value >= 0 && in.src[0].value <= 105)
+            return in.src[0].value;
+        if (in.src[0].kind == OperandKind::Special && in.src[0].value == 106)
+            return 106;
+        // Canonical EXEC is already resolved from architectural state by emit_alu.  No other
+        // special register or odd half is a complete B64 mask source.
+        return -1;
+    };
     if ((b.is_compute || b.is_fragment) && b.wave_size == 64 && !starts.empty()) {
         std::vector<std::set<int>> wave64_b64_mask_in(starts.size());
         std::vector<bool> wave64_b64_reachable(starts.size(), false);
@@ -14027,6 +14041,9 @@ bool emit_cfg_state_machine(
 
         auto advance_wave64_b64_masks = [&](std::set<int>& masks, const Rdna2Inst& in,
                                             bool record_compare) {
+            const int reduction_source = wave64_mask_reduction_source(in);
+            if (record_compare && reduction_source >= 0 && masks.contains(reduction_source))
+                proven_wave64_mask_reduction_pcs.insert(in.pc);
             const int zero_compare_source = mask_zero_compare_candidate_source(in);
             if (record_compare && zero_compare_source >= 0 &&
                 masks.contains(zero_compare_source))
@@ -14826,6 +14843,24 @@ bool emit_cfg_state_machine(
                 if (in.fmt == Rdna2Format::EXP) {
                     if (!exp_fn(state, in)) return reject_cfg(in.pc, "export");
                     continue;
+                }
+                if (proven_wave64_mask_reduction_pcs.contains(in.pc)) {
+                    const int source = wave64_mask_reduction_source(in);
+                    const bool mask_available = source == 106
+                        ? state.vcc != 0
+                        : state.sreg_bool.contains(source);
+                    if (source < 0 || !mask_available)
+                        return reject_cfg(in.pc, "proven mask reduction missing mask state");
+                    // The dispatcher persists the physical SGPR file and Bool-domain masks in
+                    // separate function variables.  At this exact MUST-proven consumer, the u32
+                    // pair is only a synthetic placeholder from an earlier scalar lifetime; leave
+                    // the generic S_FF1/S_BCNT ambiguity guard intact and expose the proven mask by
+                    // removing only those two stale data views.
+                    for (int reg = source; reg <= source + 1; ++reg) {
+                        state.sreg.erase(reg);
+                        state.sreg_input.erase(reg);
+                        state.sreg_srt.erase(reg);
+                    }
                 }
                 bool ok = true;
                 const bool handled = emit_alu(b, state, in, ok, allow_exec_update, &safe,
