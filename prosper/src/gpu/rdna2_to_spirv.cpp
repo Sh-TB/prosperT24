@@ -409,6 +409,12 @@ struct SpirvCompute {
     uint32_t ngg_vertex_index_value = 0;
     bool     is_compute=0;                            // true in the compute shell (gates LDS / s_barrier)
     bool     uses_barrier=0;                          // guest or synthesized workgroup barrier emitted
+    // S_CSELECT_B64 normally needs both scalar source dwords. A captured GTA V kernel consumes
+    // only the selected VCC_LO word and leaves VCC_HI dead on every successor path; the whole-stream
+    // liveness proof records that exact exception before emission. Keep it builder-local so recursive
+    // phase/CFG emitters see the proof derived from the original complete instruction stream.
+    bool cselect_b64_low_only_analysis_done = false;
+    std::unordered_set<uint32_t> cselect_b64_low_only_pcs;
     bool     declared_subgroup=0, declared_subgroup_vote=0, declared_subgroup_arithmetic=0;
     // When non-zero, the backend promises to create this compute pipeline with an exact required
     // subgroup size equal to the PS5 wave. Native votes/scans are then architecture-exact.
@@ -3864,6 +3870,28 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
     return true;   // every reachable path hit a redefinition/end without a read
 }
 
+std::unordered_set<uint32_t> proven_cselect_b64_low_only_pcs(
+        const std::vector<Rdna2Inst>& ins) {
+    std::unordered_set<uint32_t> result;
+    for (const Rdna2Inst& in : ins) {
+        if (in.is_end) break;
+        // GTA V 0x413cf9a00 pc60 selects two scalar-data pairs into VCC, then reads only
+        // VCC_LO as one scalar dword. Its second alternative currently has only the low word
+        // available (the zero-record S_BUFFER load at pc16 writes s16, not s17). Admit that
+        // incomplete-source form only for the exact ordinary-SGPR-to-VCC packet shape and only
+        // when the shared CFG liveness walk proves VCC_HI dead from the following instruction.
+        // An implicit VCC consumer counts as a high-half read in that walk, so no per-lane mask
+        // can observe the unavailable selected word.
+        if (in.fmt == Rdna2Format::SOP2 && in.opcode == 0x0bu &&
+            in.dst.kind == OperandKind::SGPR && in.dst.value == 106 &&
+            in.src[0].kind == OperandKind::SGPR &&
+            in.src[1].kind == OperandKind::SGPR &&
+            sgpr_dead_at_merge(ins, in.pc + in.len_dwords, 107))
+            result.insert(in.pc);
+    }
+    return result;
+}
+
 // #2418: does this shader read SCC anywhere? Used to decide whether the fragment stage should pay for
 // an exact wave vote when a mask op writes SCC. Deliberately CONSERVATIVE and whole-shader: it answers
 // "could SCC ever be consumed", not "is this particular write live". A false positive costs one shader a
@@ -7308,9 +7336,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
-            if (in.opcode == 0x0b) {   // s_cselect_b64: 64-bit MASK dst = SCC ? src0 : src1 (mask domain)
+            if (in.opcode == 0x0b) {   // s_cselect_b64: SCC ? src0 : src1 (mask or scalar-pair domain)
                 // Operands/dest are wave masks (EXEC/VCC/saved/inline), NOT uint bits — resolve like the
-                // SOP1 mask ops and select in the bool domain. (s_cselect_b32 0x0a stays in the uint path.)
+                // SOP1 mask ops and select in the bool domain. Keep this path first so established
+                // mask lifetimes retain byte-identical behavior even when Function-backed scalar
+                // placeholders coexist in a CFG dispatcher. (s_cselect_b32 stays in the uint path.)
                 auto is_exec = [](const Operand& o){ return o.value == 126 || o.value == 127; };
                 auto mask = [&](const Operand& o) -> uint32_t {
                     if (o.value == 106 || o.value == 107) return rs.vcc;
@@ -7322,13 +7352,99 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return 0;   // not a recognizable mask
                 };
                 uint32_t m0 = mask(in.src[0]), m1 = mask(in.src[1]);
-                if (!m0 || !m1 || !rs.scc) { ok = false; return true; }   // !rs.scc: SCC poisoned by a mask op
-                uint32_t r = b.bsel(rs.scc, m0, m1);
-                if (is_exec(in.dst)) { rs.exec = r; rs.exec_narrowed = true; }
-                else if (in.dst.value == 106 || in.dst.value == 107) { rs.vcc = r; rs.sreg_bool_narrowed[in.dst.value] = true;
-                                                                       mask_write_clobbers_pair(rs, in.dst.value); }
-                else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true;   // conservative flag
-                       mask_write_clobbers_pair(rs, in.dst.value); }
+                if (m0 && m1) {
+                    if (!rs.scc) { ok = false; return true; }   // SCC poisoned by a mask op
+                    uint32_t r = b.bsel(rs.scc, m0, m1);
+                    if (is_exec(in.dst)) { rs.exec = r; rs.exec_narrowed = true; }
+                    else if (in.dst.value == 106 || in.dst.value == 107) { rs.vcc = r; rs.sreg_bool_narrowed[in.dst.value] = true;
+                                                                           mask_write_clobbers_pair(rs, in.dst.value); }
+                    else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true;   // conservative flag
+                           mask_write_clobbers_pair(rs, in.dst.value); }
+                    return true;
+                }
+
+                // Ordinary scalar-data pairs are selected word-for-word. Unlike EXEC, VCC has a
+                // dual role: its two physical scalar dwords remain readable as data, while vector
+                // instructions consume the bit for this invocation. Materialize both views from
+                // the same selected pair so native and portable compute paths agree exactly.
+                struct ScalarPair {
+                    uint32_t lo = 0, hi = 0;
+                    bool have_lo = false, have_hi = false;
+                };
+                auto scalar_word = [&](int reg, uint32_t& value) {
+                    auto current = rs.sreg.find(reg);
+                    if (current != rs.sreg.end()) { value = current->second; return true; }
+                    auto input = rs.sreg_input.find(reg);
+                    if (input != rs.sreg_input.end()) { value = input->second; return true; }
+                    return false;
+                };
+                auto scalar_pair = [&](const Operand& source) {
+                    ScalarPair pair;
+                    if (source.kind == OperandKind::SGPR ||
+                        (source.kind == OperandKind::Special &&
+                         source.value >= 106 && source.value < 124)) {
+                        pair.have_lo = scalar_word(source.value, pair.lo);
+                        pair.have_hi = scalar_word(source.value + 1, pair.hi);
+                    } else if (source.kind == OperandKind::InlineInt) {
+                        pair.lo = b.uconst(static_cast<uint32_t>(source.value));
+                        pair.hi = b.uconst(source.value < 0 ? UINT32_MAX : 0u);
+                        pair.have_lo = pair.have_hi = true;
+                    } else if (source.kind == OperandKind::Literal) {
+                        pair.lo = b.uconst(in.literal);
+                        pair.hi = b.uconst(0);
+                        pair.have_lo = pair.have_hi = true;
+                    }
+                    return pair;
+                };
+                if (is_exec(in.dst) || !rs.scc) { ok = false; return true; }
+                const ScalarPair p0 = scalar_pair(in.src[0]);
+                const ScalarPair p1 = scalar_pair(in.src[1]);
+                const bool complete = p0.have_lo && p0.have_hi && p1.have_lo && p1.have_hi;
+                const bool low_only = p0.have_lo && p1.have_lo &&
+                    b.is_compute && b.wave_size == 64 &&
+                    b.cselect_b64_low_only_pcs.contains(in.pc);
+                if (!complete && !low_only) { ok = false; return true; }
+
+                const uint32_t selected_lo = b.sel(rs.scc, p0.lo, p1.lo);
+                const uint32_t selected_hi = complete
+                    ? b.sel(rs.scc, p0.hi, p1.hi) : b.uconst(0);
+                rs.sreg[in.dst.value] = selected_lo;
+                if (complete) rs.sreg[in.dst.value + 1] = selected_hi;
+                else rs.sreg.erase(in.dst.value + 1);
+                rs.sreg_srt.erase(in.dst.value);
+                rs.sreg_srt.erase(in.dst.value + 1);
+
+                // A scalar pair write ends every overlapping saved-mask/B32 lifetime. The complete
+                // VCC form immediately installs its newly-derived predicate below; the GTA low-only
+                // form deliberately leaves VCC unavailable because the CFG proof says no implicit
+                // mask consumer can observe it.
+                auto erase_mask_alias = [&](int base) {
+                    rs.sreg_bool.erase(base);
+                    rs.sreg_bool_narrowed.erase(base);
+                    rs.sreg_bool_b32.erase(base);
+                };
+                if (in.dst.value > 0) erase_mask_alias(in.dst.value - 1);
+                erase_mask_alias(in.dst.value);
+                erase_mask_alias(in.dst.value + 1);
+                if (in.dst.value == 106) {
+                    if (complete) {
+                        uint32_t lane = b.ibin(
+                            Op_BitwiseAnd, b.guest_lane_id(), b.uconst(b.wave_size - 1));
+                        const uint32_t high = b.ucmp(
+                            Op_UGreaterThanEqual, lane, b.uconst(32));
+                        const uint32_t word = b.sel(high, selected_hi, selected_lo);
+                        const uint32_t bit = b.ibin(Op_BitwiseAnd, lane, b.uconst(31));
+                        rs.vcc = b.ucmp(
+                            Op_INotEqual,
+                            b.ibin(Op_BitwiseAnd,
+                                   b.ibin(Op_ShiftRightLogical, word, bit), b.uconst(1)),
+                            b.uconst(0));
+                        rs.sreg_bool[106] = rs.vcc;
+                        rs.sreg_bool_narrowed[106] = true;
+                    } else {
+                        rs.vcc = 0;
+                    }
+                }
                 return true;
             }
             if (in.opcode == 0x0f || in.opcode == 0x11 || in.opcode == 0x13 || in.opcode == 0x15 ||
@@ -16622,6 +16738,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                // code/dwords: raw stream for forward-if target checks; inherited_dead_masks keeps
                // whole-shader liveness valid when a barrier-separated body is compiled in phases.
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
+    if (!b.cselect_b64_low_only_analysis_done) {
+        b.cselect_b64_low_only_pcs = proven_cselect_b64_low_only_pcs(ins);
+        b.cselect_b64_low_only_analysis_done = true;
+    }
     if (!rs.smem_x16_descriptor_analysis_done) {
         rs.smem_x16_descriptor_loads = proven_smem_x16_descriptor_loads(ins, rt);
         rs.smem_x16_descriptor_analysis_done = true;
@@ -18218,6 +18338,8 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
 
     // A scratch builder/state so emit_alu can run; its emitted code is discarded — we only want `ok`.
     SpirvCompute b; b.begin(1);
+    b.cselect_b64_low_only_pcs = proven_cselect_b64_low_only_pcs(ins);
+    b.cselect_b64_low_only_analysis_done = true;
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
     auto safe_branches = safe_execz_branches(ins);
