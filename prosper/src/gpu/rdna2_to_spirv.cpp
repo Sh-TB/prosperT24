@@ -6203,17 +6203,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return rs.sreg.contains(reg) || rs.sreg_input.contains(reg);
                 };
                 const int source = in.src[0].value;
-                const bool competing_data = data_word_present(source) ||
-                    data_word_present(source + 1);
                 uint32_t mask = 0;
-                if (!competing_data && source == 126) {
+                // EXEC is architectural mask state, even when structured-loop or dispatcher state
+                // bookkeeping also leaves synthetic scalar placeholders for physical s126/s127.
+                // Unlike VCC and saved SGPR pairs, those words cannot carry competing scalar data.
+                if (in.src[0].kind == OperandKind::Special && source == 126) {
                     mask = rs.exec;
-                } else if (!competing_data && source == 106) {
-                    mask = rs.vcc;
-                } else if (!competing_data && in.src[0].kind == OperandKind::SGPR &&
-                           !rs.sreg_bool_b32.contains(source)) {
-                    const auto saved = rs.sreg_bool.find(source);
-                    if (saved != rs.sreg_bool.end()) mask = saved->second;
+                } else {
+                    const bool competing_data = data_word_present(source) ||
+                        data_word_present(source + 1);
+                    if (!competing_data && source == 106) {
+                        mask = rs.vcc;
+                    } else if (!competing_data && in.src[0].kind == OperandKind::SGPR &&
+                               !rs.sreg_bool_b32.contains(source)) {
+                        const auto saved = rs.sreg_bool.find(source);
+                        if (saved != rs.sreg_bool.end()) mask = saved->second;
+                    }
                 }
                 if (!mask || in.dst.value == 126 || in.dst.value == 127) {
                     ok = false;
@@ -6577,17 +6582,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         return rs.sreg.contains(reg) || rs.sreg_input.contains(reg);
                     };
                     const int source = in.src[0].value;
-                    const bool competing_data = data_word_present(source) ||
-                                                data_word_present(source + 1);
                     uint32_t source_mask = 0;
-                    if (!competing_data && source == 126) {
+                    // Match S_FF1's EXEC rule above: canonical special:126 names architectural
+                    // EXEC, while structured state may also carry synthetic scalar placeholders
+                    // for the same physical words.  VCC and saved SGPR pairs can genuinely be
+                    // recycled as scalar data and therefore retain their ambiguity checks.
+                    if (in.src[0].kind == OperandKind::Special && source == 126) {
                         source_mask = rs.exec;
-                    } else if (!competing_data && source == 106) {
-                        source_mask = rs.vcc;
-                    } else if (!competing_data && in.src[0].kind == OperandKind::SGPR &&
-                               !rs.sreg_bool_b32.contains(source) &&
-                               mask != rs.sreg_bool.end()) {
-                        source_mask = mask->second;
+                    } else {
+                        const bool competing_data = data_word_present(source) ||
+                                                    data_word_present(source + 1);
+                        if (!competing_data && source == 106) {
+                            source_mask = rs.vcc;
+                        } else if (!competing_data && in.src[0].kind == OperandKind::SGPR &&
+                                   !rs.sreg_bool_b32.contains(source) &&
+                                   mask != rs.sreg_bool.end()) {
+                            source_mask = mask->second;
+                        }
                     }
                     if (source_mask) {
                         result = b.native_wave_popcount(source_mask);
