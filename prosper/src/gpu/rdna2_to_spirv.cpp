@@ -15019,15 +15019,34 @@ bool emit_cfg_state_machine(
                                             std::set<int>& scalar_words,
                                             const Rdna2Inst& in,
                                             bool record_compare) {
+            auto source_is_scalar_word = [&](const Operand& source) {
+                switch (source.kind) {
+                    case OperandKind::InlineInt:
+                    case OperandKind::InlineFloat:
+                    case OperandKind::Literal:
+                        return true;
+                    case OperandKind::SGPR:
+                        return scalar_words.contains(source.value);
+                    case OperandKind::Special:
+                        if (source.value == 125 || source.value == 253)
+                            return true; // SGPR_NULL and SCC have exact scalar-bit representations
+                        return source.value >= 106 && source.value <= 124 &&
+                               scalar_words.contains(source.value);
+                    default:
+                        return false;
+                }
+            };
             const bool b32_vcc_scalar_write =
                 is_gtav_wave64_vcc_lo_scalar_cselect(in) ||
                 (in.fmt == Rdna2Format::SOP2 &&
                  (in.dst.value == 106 || in.dst.value == 107) &&
                  in.opcode >= 0x0e && in.opcode <= 0x1c &&
                  (in.opcode & 1u) == 0);
+            const bool b32_vcc_scalar_result = b32_vcc_scalar_write &&
+                source_is_scalar_word(in.src[0]) && source_is_scalar_word(in.src[1]);
             const int b32_vcc_sibling = in.dst.value == 106 ? 107 : 106;
             const bool b32_vcc_complete_scalar_pair =
-                b32_vcc_scalar_write && scalar_words.contains(b32_vcc_sibling);
+                b32_vcc_scalar_result && scalar_words.contains(b32_vcc_sibling);
             if (record_compare && b32_vcc_complete_scalar_pair)
                 b.vcc_b32_scalar_pair_pcs.insert(in.pc);
             // A block-entry join where the same physical pair is a mask on one predecessor and
@@ -15237,6 +15256,12 @@ bool emit_cfg_state_machine(
                     for (uint32_t word = 0; word < width; ++word)
                         scalar_words.insert(base + static_cast<int>(word));
             }
+            // B32 VCC logicals have a separate mask-domain lowering. If either input lacks a MUST
+            // scalar word, the emitter may take that path and erase its uint result. Never publish
+            // a scalar fact merely because the architectural destination is one dword: dispatcher
+            // Function variables contain zero placeholders for absent domains.
+            if (b32_vcc_scalar_write && !b32_vcc_scalar_result)
+                scalar_words.erase(in.dst.value);
             return true;
         };
 
@@ -15322,8 +15347,12 @@ bool emit_cfg_state_machine(
         };
         auto special_half = [](const Operand& source) -> int {
             if (source.kind != OperandKind::Special) return -1;
-            if (source.value == 106 || source.value == 126) return 0;
-            if (source.value == 107 || source.value == 127) return 1;
+            // EXEC is always a live mask in RegState. VCC_LO/HI may instead be scalar scratch, and
+            // their physical encodings do not carry a runtime domain tag; treating those words as
+            // masks here can turn a dispatcher placeholder into a ballot of false. Admit VCC only
+            // after a future proof is explicitly tied to the Wave64 mask-domain MUST analysis.
+            if (source.value == 126) return 0;
+            if (source.value == 127) return 1;
             return -1;
         };
         auto meet = [](MaskHalfState& dst, const MaskHalfState& incoming) {
@@ -15361,19 +15390,10 @@ bool emit_cfg_state_machine(
                 return;
             }
 
-            int moved_half = -1;
-            if (in.fmt == Rdna2Format::SOP1 && in.opcode == 0x03) {
-                moved_half = special_half(in.src[0]);
-                if (moved_half < 0 && in.src[0].kind == OperandKind::SGPR) {
-                    const auto source = state.sreg.find(in.src[0].value);
-                    if (source != state.sreg.end()) moved_half = source->second;
-                }
-            }
             for_each_scalar_write(in, [&](int base, uint32_t width) {
                 for (uint32_t word = 0; word < width; ++word)
                     state.sreg.erase(base + static_cast<int>(word));
             }, /*wave32_one_word_masks*/false);
-            if (moved_half >= 0) state.sreg[in.dst.value] = moved_half;
 
             if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361) {
                 // A dynamic selector may overwrite any lane and therefore kills every known slot
