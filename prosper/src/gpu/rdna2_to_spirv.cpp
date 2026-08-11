@@ -3720,6 +3720,7 @@ inline bool sopk_sets_full_flat_scratch_base(const Rdna2Inst& in) {
 
 namespace {
 uint32_t scalar_write_width(const Rdna2Inst& in);
+uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in);
 }
 
 inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R) {
@@ -3795,11 +3796,13 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
             case Rdna2Format::VOP1: case Rdna2Format::VOP2: case Rdna2Format::VOP3: case Rdna2Format::VOPC:
             case Rdna2Format::DS:    // DS operands are VGPR/M0 only; it cannot read an ordinary SGPR/VCC
             case Rdna2Format::EXP: { // EXP data sources are all VGPRs — it can never read an SGPR
-                // s_bitset{0,1}_b32 reads its destination before replacing that same word; the
-                // decoded source is only the bit index, so the generic operand walk cannot see it.
-                if (in.fmt == Rdna2Format::SOP1 &&
-                    (in.opcode == 0x1c || in.opcode == 0x1d) &&
-                    in.dst.value == R)
+                // Conditional moves, SOPK immediate operations, and SOP1 bitsets may read their
+                // encoded destination before replacing it. Their decoded source list does not
+                // contain that old value, so consult the shared implicit-read inventory first.
+                const uint32_t implicit_read_width =
+                    scalar_implicit_destination_read_width(in);
+                if (implicit_read_width && R >= in.dst.value &&
+                    R < in.dst.value + static_cast<int>(implicit_read_width))
                     return false;
                 for (int k = 0; k < in.n_src; k++) {
                     if (in.src[k].kind != OperandKind::SGPR &&
@@ -5205,6 +5208,32 @@ uint32_t scalar_write_width(const Rdna2Inst& in) {
             }
         case Rdna2Format::VOP1: return in.opcode == 0x02 ? 1u : 0u; // v_readfirstlane
         case Rdna2Format::VOP3: return in.opcode == 0x360 ? 1u : 0u; // v_readlane
+        default: return 0;
+    }
+}
+
+// Scalar instructions whose encoded destination is also an implicit source. These reads must be
+// observed before writer transfer functions invalidate the old lifetime. SOPK has no decoded src
+// operands at all; conditional moves preserve the old destination on one SCC outcome, comparisons
+// consume SDST without writing it, and ADDK/MULK are ordinary read-modify-write operations. SOP1
+// conditional moves and bitset operations have an explicit source too, but it is the replacement
+// value/bit index rather than the old destination.
+uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in) {
+    if (in.dst.kind != OperandKind::SGPR) return 0;
+    if (in.fmt == Rdna2Format::SOPK) {
+        if (in.opcode == 0x02 ||                         // s_cmovk_i32
+            (in.opcode >= 0x03 && in.opcode <= 0x10))   // s_cmpk_*, s_addk, s_mulk
+            return 1;
+        return 0;
+    }
+    if (in.fmt != Rdna2Format::SOP1) return 0;
+    switch (in.opcode) {
+        case 0x05: return 1; // s_cmov_b32
+        case 0x06: return 2; // s_cmov_b64
+        case 0x1b: return 1; // s_bitset0_b32
+        case 0x1c: return 2; // s_bitset0_b64
+        case 0x1d: return 1; // s_bitset1_b32
+        case 0x1e: return 2; // s_bitset1_b64
         default: return 0;
     }
 }
@@ -14439,6 +14468,14 @@ bool emit_cfg_state_machine(
                 (in.fmt == Rdna2Format::VOP2 &&
                  (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2a)));
             reads_ambiguous |= implicit_vcc_read && ambiguous.contains(106);
+            const uint32_t implicit_scalar_words =
+                scalar_implicit_destination_read_width(in);
+            if (implicit_scalar_words) {
+                const int first = in.dst.value;
+                const int last = first + static_cast<int>(implicit_scalar_words);
+                for (int mask_base : ambiguous)
+                    reads_ambiguous |= first < mask_base + 2 && mask_base < last;
+            }
             if (reads_ambiguous)
                 return reject_cfg(in.pc, "wave64-ambiguous-mask-read");
 
@@ -14500,18 +14537,27 @@ bool emit_cfg_state_machine(
             }
 
             auto erase_overlapping = [&](int base, uint32_t width) {
-                auto erase = [&](std::set<int>& values) {
-                    for (auto it = values.begin(); it != values.end();) {
-                        const int mask_base = *it;
-                        if (base < mask_base + 2 &&
-                            mask_base < base + static_cast<int>(width))
-                            it = values.erase(it);
-                        else
-                            ++it;
-                    }
-                };
-                erase(masks);
-                erase(ambiguous);
+                for (auto it = masks.begin(); it != masks.end();) {
+                    const int mask_base = *it;
+                    if (base < mask_base + 2 &&
+                        mask_base < base + static_cast<int>(width))
+                        it = masks.erase(it);
+                    else
+                        ++it;
+                }
+                // A one-word scalar write kills the definite-mask fact for the physical pair, but
+                // it resolves only the addressed half of an ambiguous pair. Keep the ambiguity
+                // until one definite write covers both halves; otherwise the untouched word could
+                // be reloaded from the wrong Function-variable domain. Pair-conservative retention
+                // after two separate B32 writes is intentional and fail-closed.
+                for (auto it = ambiguous.begin(); it != ambiguous.end();) {
+                    const int mask_base = *it;
+                    if (base <= mask_base &&
+                        base + static_cast<int>(width) >= mask_base + 2)
+                        it = ambiguous.erase(it);
+                    else
+                        ++it;
+                }
             };
             for_each_scalar_write(in, erase_overlapping, /*wave32_one_word_masks*/false);
             // An implicit VOPC destination is architectural VCC and is absent from the explicit
