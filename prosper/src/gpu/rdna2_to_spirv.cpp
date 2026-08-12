@@ -4,6 +4,7 @@
 #include "diagnostic_selectors.hpp"
 #include "pm4_registers.hpp"
 #include "rdna2_decode.hpp"
+#include "rdna2_gta5_cf9200_contract.hpp"
 #include "rdna2_gta5_compute_contracts.hpp"
 #include "rdna2_gta5_packed_pointer.hpp"
 #include "rdna2_indirect_buffer_shadow.hpp"
@@ -424,6 +425,7 @@ struct SpirvCompute {
     // emit_alu, prevents a hand-built or stale marker from enabling instruction-local shortcuts.
     bool gta5_selected_sbuffer_dispatch_validated = false;
     uint32_t gta5_selected_sbuffer_soffset = UINT32_MAX;
+    bool gta5_cf9200_no_backing_dispatch_validated = false;
     bool indirect_buffer_dispatch_validated = false;
     uint32_t indirect_buffer_binding = UINT32_MAX;
     uint32_t indirect_buffer_source_bytes = 0;
@@ -12514,6 +12516,26 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     ok = false; return true;   // unresolvable V# -> reject; NEVER default to binding 2
                 }
+                if (is_gta5_cf9200_no_backing_marker_candidate(*res)) {
+                    const GtaCf9200NoBackingAccess access =
+                        rdna2_gta5_cf9200_no_backing_site(in);
+                    if (!b.gta5_cf9200_no_backing_dispatch_validated ||
+                        !is_proven_gta5_cf9200_no_backing(*res) ||
+                        res->fetch_pc != in.pc || is_format || is_atomic ||
+                        access == GtaCf9200NoBackingAccess::None ||
+                        (access == GtaCf9200NoBackingAccess::LoadZero && is_store) ||
+                        (access == GtaCf9200NoBackingAccess::DropStore && !is_store)) {
+                        ok = false;
+                        return true;
+                    }
+                    if (access == GtaCf9200NoBackingAccess::LoadZero) {
+                        const int destination = in.dst.value;
+                        const uint32_t old = vreg_old(b, rs, destination);
+                        rs.vreg[destination] = b.uconst(0u);
+                        predicate_write(b, rs, destination, old);
+                    }
+                    return true;
+                }
                 if (is_proven_null_nullable_raw_buffer(*res)) {
                     // The final compile boundary already re-established the exact production bytes,
                     // s7-sized x256 launch, marker set, and retained +0x20 zero-qword witness. Keep the
@@ -21401,6 +21423,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const bool has_gta5_packed_pointer = rt &&
         std::any_of(rt->resources.begin(), rt->resources.end(),
                     is_gta5_packed_pointer_marker_candidate);
+    const bool has_gta5_cf9200_no_backing = rt &&
+        std::any_of(rt->resources.begin(), rt->resources.end(),
+                    is_gta5_cf9200_no_backing_marker_candidate);
     const ShaderResource* selected_sbuffer_descriptor =
         has_selected_sbuffer_descriptor ? rt->by_fetch_pc(153u) : nullptr;
     // A resource table is externally constructible and can outlive the shader bytes or dispatch
@@ -21418,6 +21443,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
         return {};
     if (has_gta5_packed_pointer &&
         !rdna2_gta5_packed_pointer_dispatch(code, dwords, config, *rt))
+        return {};
+    if (has_gta5_cf9200_no_backing &&
+        !rdna2_gta5_cf9200_no_backing_dispatch(code, dwords, config, *rt))
         return {};
     const uint32_t local_x = std::max(1u, config.local_x);
     const uint32_t local_y = std::max(1u, config.local_y);
@@ -21446,6 +21474,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     b.gta5_selected_sbuffer_dispatch_validated = has_selected_sbuffer_descriptor;
     if (selected_sbuffer_descriptor && has_selected_sbuffer_descriptor)
         b.gta5_selected_sbuffer_soffset = selected_sbuffer_descriptor->selected_sbuffer_soffset;
+    b.gta5_cf9200_no_backing_dispatch_validated = has_gta5_cf9200_no_backing;
     b.indirect_buffer_dispatch_validated = has_gta5_packed_pointer;
     if (has_gta5_packed_pointer) {
         const ShaderResource* packed = rt->by_fetch_pc(kGta5PackedPointerSourcePc);
