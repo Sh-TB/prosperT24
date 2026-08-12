@@ -7882,6 +7882,60 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         return false;
                 }
             };
+            auto scalar_data_operand = [&](const Operand& source) {
+                switch (source.kind) {
+                    case OperandKind::InlineInt:
+                    case OperandKind::InlineFloat:
+                    case OperandKind::Literal:
+                        return true;
+                    case OperandKind::SGPR:
+                        return rs.sreg.contains(source.value) ||
+                            rs.sreg_input.contains(source.value);
+                    case OperandKind::Special:
+                        if (source.value == 125) return true; // SGPR_NULL
+                        if (source.value == 253) return rs.scc != 0;
+                        return source.value >= 106 && source.value <= 124 &&
+                            rs.sreg.contains(source.value);
+                    default:
+                        return false;
+                }
+            };
+            auto logical_u32 = [&](uint32_t a, uint32_t c) {
+                return in.opcode == kSop2OpcodeAndB32 ? b.ibin(Op_BitwiseAnd, a, c)
+                     : in.opcode == kSop2OpcodeOrB32 ? b.ibin(Op_BitwiseOr, a, c)
+                     : in.opcode == kSop2OpcodeXorB32 ? b.ibin(Op_BitwiseXor, a, c)
+                     : in.opcode == kSop2OpcodeAndn2B32
+                           ? b.ibin(Op_BitwiseAnd, a, b.iun(Op_Not, c))
+                     : in.opcode == kSop2OpcodeOrn2B32
+                           ? b.ibin(Op_BitwiseOr, a, b.iun(Op_Not, c))
+                     : in.opcode == kSop2OpcodeNandB32
+                           ? b.iun(Op_Not, b.ibin(Op_BitwiseAnd, a, c))
+                     : in.opcode == kSop2OpcodeNorB32
+                           ? b.iun(Op_Not, b.ibin(Op_BitwiseOr, a, c))
+                           : b.iun(Op_Not, b.ibin(Op_BitwiseXor, a, c));
+            };
+            if (b.is_compute && b.wave_size == 32 && in.dst.value == 126 &&
+                sop2_is_b32_logical(in.opcode) &&
+                scalar_data_operand(in.src[0]) && scalar_data_operand(in.src[1])) {
+                // A physical EXEC_LO write always changes the wave mask, even when both inputs are
+                // ordinary scalar DATA rather than Bool-domain masks. GTA V writes 0x80 into
+                // VCC_LO as scalar scratch, then ORs it with literal 0x100 to select lanes 7 and 8.
+                // Both complete dwords are available uniformly, so compute the architectural u32,
+                // publish exact SCC, and select this invocation's Wave32 bit without a subgroup op.
+                const uint32_t result = logical_u32(val(in.src[0]), val(in.src[1]));
+                if (!ok) return true;
+                rs.scc = b.ucmp(Op_INotEqual, result, b.uconst(0));
+                const uint32_t lane = b.ibin(
+                    Op_BitwiseAnd, b.guest_lane_id(), b.uconst(31));
+                const uint32_t bit = b.ibin(
+                    Op_BitwiseAnd,
+                    b.ibin(Op_ShiftRightLogical, result, lane), b.uconst(1));
+                rs.exec = b.ucmp(Op_INotEqual, bit, b.uconst(0));
+                rs.exec_narrowed = true;
+                rs.sreg.erase(126);
+                rs.sreg_srt.erase(126);
+                return true;
+            }
             const bool mixed_wave32_mask_scalar_data =
                 b.is_compute && b.wave_size == 32 && b.native_subgroup_size == 32 &&
                 in.dst.kind == OperandKind::SGPR && in.dst.value <= 105 &&
@@ -8352,16 +8406,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // a v_cndmask. We cannot materialize the complete VCC dword in a per-invocation
                 // module, but its bit for this guest lane is exact. Preserve the untouched VCC half;
                 // unlike a B64 mask write, a B32 write changes only LO or HI.
-                auto logical_u32 = [&](uint32_t a, uint32_t c) {
-                    return in.opcode == 0x0e ? b.ibin(Op_BitwiseAnd, a, c)
-                         : in.opcode == 0x10 ? b.ibin(Op_BitwiseOr, a, c)
-                         : in.opcode == 0x12 ? b.ibin(Op_BitwiseXor, a, c)
-                         : in.opcode == 0x14 ? b.ibin(Op_BitwiseAnd, a, b.iun(Op_Not, c))
-                         : in.opcode == 0x16 ? b.ibin(Op_BitwiseOr, a, b.iun(Op_Not, c))
-                         : in.opcode == 0x18 ? b.iun(Op_Not, b.ibin(Op_BitwiseAnd, a, c))
-                         : in.opcode == 0x1a ? b.iun(Op_Not, b.ibin(Op_BitwiseOr, a, c))
-                         : b.iun(Op_Not, b.ibin(Op_BitwiseXor, a, c));
-                };
                 auto has_scalar_data = [&](const Operand& source) {
                     switch (source.kind) {
                         case OperandKind::SGPR:
