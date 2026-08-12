@@ -5,6 +5,7 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
+#include <algorithm>
 
 /**
  * @file thread_activity_plugin.hpp
@@ -101,7 +102,7 @@ struct DeadlockDetectionResult {
         oss << "\"detected_at_ms\":" << timestamp_to_ms(detected_at) << ",";
         oss << "\"description\":\"" << ThreadInfo::escape_json(description) << "\",";
         
-        oss << \"involved_threads\":[";
+        oss << ""involved_threads":[";
         for (size_t i = 0; i < involved_threads.size(); ++i) {
             if (i > 0) oss << ",";
             oss << involved_threads[i];

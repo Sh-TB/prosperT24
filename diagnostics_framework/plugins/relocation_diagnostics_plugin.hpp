@@ -73,6 +73,12 @@ namespace prosper {
 namespace diagnostics {
 
 //=============================================================================
+// Forward Declarations
+//=============================================================================
+
+inline const char* relocation_type_name(RelocationType type);
+
+//=============================================================================
 // Relocation Configuration Constants
 //=============================================================================
 
@@ -205,12 +211,13 @@ struct RelocationSummary {
     } detections;
     
     /// Per-module breakdown
-    std::map<std::string, struct ModuleStats {
+    struct ModuleStats {
         size_t total{0};
         size_t success{0};
         size_t failed{0};
         uint64_t base_address{0};
-    }> per_module;
+    };
+    std::map<std::string, ModuleStats> per_module;
     
     /// Serialize to JSON
     std::string to_json() const {

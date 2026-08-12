@@ -6,6 +6,8 @@
 #include <iomanip>
 #include <csignal>
 #include <cstring>
+#include <unordered_set>
+#include <algorithm>
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <execinfo.h>

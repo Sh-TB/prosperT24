@@ -70,6 +70,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <set>
+#include <map>
 #include <array>
 
 namespace prosper {

@@ -5,6 +5,7 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
+#include <algorithm>
 
 namespace prosper {
 namespace diagnostics {
@@ -467,7 +468,7 @@ private:
         
         // Emit diagnostic event
         DiagnosticEvent event;
-        event.source_plugin = name();
+        event.source_plugin = DiagnosticPlugin::name();
         event.event_type = "module_tracked";
         event.severity = Severity::INFO;
         event.message = "Module loaded: " + name;
@@ -495,7 +496,7 @@ private:
         
         // Emit diagnostic event
         DiagnosticEvent event;
-        event.source_plugin = name();
+        event.source_plugin = DiagnosticPlugin::name();
         event.event_type = "module_unload_tracked";
         event.severity = Severity::INFO;
         event.message = "Module unloaded: " + name;

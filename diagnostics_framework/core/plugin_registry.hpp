@@ -47,7 +47,7 @@ public:
     std::vector<PluginInfo> get_all_plugin_info() const;
     
     // Statistics
-    size_t total_plugins() const { return plugins_.size(); }
+    size_t total_plugins() const { return registered_plugins_.size(); }
     size_t enabled_plugins_count() const;
     PluginStatistics get_statistics(const std::string& name) const;
     std::vector<PluginStatistics> get_all_statistics() const;

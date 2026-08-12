@@ -540,7 +540,7 @@ private:
         
         // Emit diagnostic event
         DiagnosticEvent event;
-        event.source_plugin = name();
+        event.source_plugin = DiagnosticPlugin::name();
         event.event_type = "import_tracked";
         event.severity = Severity::INFO;
         event.message = "Import resolved: " + nid + " -> " + name;
@@ -593,7 +593,7 @@ private:
         
         // Emit diagnostic event
         DiagnosticEvent event;
-        event.source_plugin = name();
+        event.source_plugin = DiagnosticPlugin::name();
         event.event_type = "import_missing";
         event.severity = Severity::WARNING;
         event.message = "Import not found: " + nid + " (" + name + ")";

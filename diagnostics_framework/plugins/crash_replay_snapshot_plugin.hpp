@@ -99,9 +99,33 @@
 #include <map>
 #include <filesystem>
 #include <random>
+#include <csignal>
 
 namespace prosper {
 namespace diagnostics {
+
+//=============================================================================
+// Helper Functions
+//=============================================================================
+
+inline const char* boot_state_name(BootState state) {
+    switch (state) {
+        case BootState::POWER_ON: return "POWER_ON";
+        case BootState::ELF_LOADED: return "ELF_LOADED";
+        case BootState::PRX_LOADED: return "PRX_LOADED";
+        case BootState::SEGMENTS_MAPPED: return "SEGMENTS_MAPPED";
+        case BootState::RELOCATIONS_APPLIED: return "RELOCATIONS_APPLIED";
+        case BootState::IMPORTS_RESOLVED: return "IMPORTS_RESOLVED";
+        case BootState::RUNTIME_INITIALIZED: return "RUNTIME_INITIALIZED";
+        case BootState::THREAD_STARTED: return "THREAD_STARTED";
+        case BootState::MAIN_ENTRY: return "MAIN_ENTRY";
+        case BootState::FIRST_RENDER: return "FIRST_RENDER";
+        case BootState::BOOT_COMPLETE: return "BOOT_COMPLETE";
+        case BootState::CRASHED: return "CRASHED";
+        case BootState::UNKNOWN: return "UNKNOWN";
+        default: return "INVALID";
+    }
+}
 
 //=============================================================================
 // Snapshot Configuration Constants
@@ -1168,7 +1192,7 @@ private:
         // Gather thread list via callback
         if (thread_list_provider_) {
             try {
-                snapshot.threads = thread_list_provider_;
+                snapshot.threads = thread_list_provider_();
             } catch (...) {}
         }
         

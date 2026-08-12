@@ -5,6 +5,8 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
+#include <algorithm>
+#include <cmath>
 
 /**
  * @file hle_call_stats_plugin.hpp

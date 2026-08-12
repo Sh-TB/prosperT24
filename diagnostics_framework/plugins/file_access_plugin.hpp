@@ -5,6 +5,7 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
+#include <algorithm>
 
 /**
  * @file file_access_plugin.hpp

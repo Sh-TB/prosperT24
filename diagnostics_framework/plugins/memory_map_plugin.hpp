@@ -687,7 +687,7 @@ private:
             
             if (new_region.overlaps(region)) {
                 uint64_t overlap_start = std::max(new_region.base, region.base);
-                uint64_t overlap_end = std::min(new_region.end(), region.end);
+                uint64_t overlap_end = std::min(new_region.end(), region.end());
                 
                 DiagnosticEvent event;
                 event.source_plugin = name();

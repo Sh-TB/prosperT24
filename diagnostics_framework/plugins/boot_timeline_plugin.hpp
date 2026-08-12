@@ -122,7 +122,7 @@ public:
         phases_.clear();
         boot_start_time_ = now();
         current_boot_state_ = BootState::POWER_ON;
-        total_boot_duration_ = 0;
+        total_boot_duration_ = Duration{0};
         
         // Record initial power-on event
         record_boot_phase_internal("POWER_ON", boot_start_time_);
@@ -167,7 +167,7 @@ public:
         phases_.clear();
         boot_start_time_ = Timestamp::min();
         current_boot_state_ = BootState::UNKNOWN;
-        total_boot_duration_ = 0;
+        total_boot_duration_ = Duration{0};
         event_count_ = 0;
         stall_history_.clear();
     }
