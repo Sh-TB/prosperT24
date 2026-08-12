@@ -5,6 +5,8 @@
 #include "pm4_registers.hpp"
 #include "rdna2_decode.hpp"
 #include "rdna2_gta5_compute_contracts.hpp"
+#include "rdna2_gta5_packed_pointer.hpp"
+#include "rdna2_indirect_buffer_shadow.hpp"
 #include "shader_resources.hpp"
 #include <algorithm>
 #include <bit>
@@ -422,6 +424,15 @@ struct SpirvCompute {
     // emit_alu, prevents a hand-built or stale marker from enabling instruction-local shortcuts.
     bool gta5_selected_sbuffer_dispatch_validated = false;
     uint32_t gta5_selected_sbuffer_soffset = UINT32_MAX;
+    bool indirect_buffer_dispatch_validated = false;
+    uint32_t indirect_buffer_binding = UINT32_MAX;
+    uint32_t indirect_buffer_source_bytes = 0;
+    uint32_t indirect_buffer_slot_count = 0;
+    uint32_t indirect_buffer_contract_tag = 0;
+    uint32_t indirect_buffer_header_bytes = 0;
+    uint32_t indirect_buffer_slot_bytes = 0;
+    uint32_t indirect_buffer_atomic_binding = UINT32_MAX;
+    uint32_t indirect_buffer_atomic_byte_offset = 0;
     // S_CSELECT_B64 normally needs both scalar source dwords. A captured GTA V kernel consumes
     // only the selected VCC_LO word and leaves VCC_HI dead on every successor path; the whole-stream
     // liveness proof records that exact exception before emission. Keep it builder-local so recursive
@@ -12046,6 +12057,57 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         }
         case Rdna2Format::FLAT: {
             const FlatAccessInfo access = flat_access_info(in.opcode);
+            IndirectBufferShadowAccess packed_access{};
+            if (b.indirect_buffer_dispatch_validated &&
+                rdna2_gta5_packed_pointer_access(in, packed_access)) {
+                if (!access.valid || access.store || access.bits != 32u || in.flat_lds ||
+                    in.src[0].kind != OperandKind::VGPR || in.src[0].value != 0 ||
+                    in.src[1].kind != OperandKind::Special || in.src[1].value != 125 ||
+                    access.components != packed_access.components ||
+                    b.indirect_buffer_binding == UINT32_MAX ||
+                    b.indirect_buffer_slot_count == 0u ||
+                    !b.indirect_buffer_contract_tag || !b.indirect_buffer_header_bytes ||
+                    !b.indirect_buffer_slot_bytes) {
+                    ok = false;
+                    return true;
+                }
+                const uint32_t address_lo = vreg_old(b, rs, 0);
+                const uint32_t address_hi = vreg_old(b, rs, 1);
+                const uint32_t relative = b.ibin(
+                    Op_ISub, address_lo,
+                    b.uconst(b.indirect_buffer_source_bytes +
+                             b.indirect_buffer_header_bytes));
+                const uint32_t aligned = b.ucmp(
+                    Op_IEqual,
+                    b.ibin(Op_UMod, relative, b.uconst(b.indirect_buffer_slot_bytes)),
+                    b.uconst(0));
+                const uint32_t slot = b.ibin(
+                    Op_UDiv, relative, b.uconst(b.indirect_buffer_slot_bytes));
+                uint32_t valid = b.ucmp(
+                    Op_IEqual, address_hi, b.uconst(b.indirect_buffer_contract_tag));
+                valid = b.land(valid, aligned);
+                valid = b.land(valid,
+                               b.ucmp(Op_ULessThan, slot,
+                                      b.uconst(b.indirect_buffer_slot_count)));
+                for (uint32_t component = 0; component < packed_access.components; ++component) {
+                    const uint32_t byte_address = b.ibin(
+                        Op_IAdd, address_lo,
+                        b.uconst(packed_access.byte_offset + component * sizeof(uint32_t)));
+                    // OpSelect is not short-circuiting: select a safe address before OpLoad, then
+                    // separately force architectural zero for a malformed runtime tag.
+                    const uint32_t safe_byte = b.sel(valid, byte_address, b.uconst(0));
+                    const uint32_t index = b.ibin(
+                        Op_ShiftRightLogical, safe_byte, b.uconst(2));
+                    const uint32_t loaded = b.cbuf_load(
+                        index, b.indirect_buffer_binding);
+                    const uint32_t value = b.sel(valid, loaded, b.uconst(0));
+                    const int reg = in.dst.value + static_cast<int>(component);
+                    const uint32_t old_value = vreg_old(b, rs, reg);
+                    rs.vreg[reg] = value;
+                    predicate_write(b, rs, reg, old_value);
+                }
+                return true;
+            }
             // General (non-scratch) FLAT LOAD from a raw 64-bit guest address (#1171). If the executor
             // resolved this load's base pointer to user SGPRs s[flat_base_sgpr : +1] and bound the
             // containing guest allocation as an SSBO (a ConstantBuffer-class resource keyed by this
@@ -12233,6 +12295,33 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool coherent_load = !is_store && !is_atomic &&
                                        (in.mubuf_glc || in.mubuf_dlc);
             const bool coherent_store = is_store && in.mubuf_glc;
+            if (b.indirect_buffer_dispatch_validated &&
+                rdna2_gta5_packed_pointer_atomic_site(in)) {
+                // The exact producer at pc347 forces V# stride 256 and pc349..351 set
+                // NUM_RECORDS=1, so pc355's qword at byte 24 is in bounds. Its scalar raw-pointer
+                // resource was separately proven readable+writable through byte 31 and expanded to
+                // that exact binding range. Emit one true qword OR; GLC=0 preserves v0:v1.
+                if (!is_atomic_x2 || atomic_op != Op_AtomicOr || is_store || in.mubuf_glc ||
+                    !b.storage_buffer_int64_atomics ||
+                    b.indirect_buffer_atomic_binding == UINT32_MAX ||
+                    b.indirect_buffer_atomic_byte_offset != offset ||
+                    (offset & 7u) != 0u) {
+                    ok = false;
+                    return true;
+                }
+                const auto lo = rs.vreg.find(in.dst.value);
+                const auto hi = rs.vreg.find(in.dst.value + 1);
+                if (lo == rs.vreg.end() || hi == rs.vreg.end()) {
+                    ok = false;
+                    return true;
+                }
+                const uint32_t value = b.u64_from_lohi(lo->second, hi->second);
+                const uint32_t access = rs.exec_narrowed ? rs.exec : b.btrue();
+                (void)b.cbuf_atomic_x2_rtn(
+                    Op_AtomicOr, b.uconst(offset / 8u), value,
+                    b.indirect_buffer_atomic_binding, access, b.uconst64(0u));
+                return true;
+            }
             // PC-relative EMBEDDED TABLE (#273): this load's V# was built from s_getpc_b64 and the
             // table bytes live inside the shader blob — detect_pcrel_tables already copied them out.
             // Fold to a compile-time constant lookup: dword index = (inst offset + offen VADDR) >> 2;
@@ -21309,6 +21398,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const bool has_selected_sbuffer_descriptor = rt &&
         std::any_of(rt->resources.begin(), rt->resources.end(),
                     is_gta5_selected_sbuffer_marker_candidate);
+    const bool has_gta5_packed_pointer = rt &&
+        std::any_of(rt->resources.begin(), rt->resources.end(),
+                    is_gta5_packed_pointer_marker_candidate);
     const ShaderResource* selected_sbuffer_descriptor =
         has_selected_sbuffer_descriptor ? rt->by_fetch_pc(153u) : nullptr;
     // A resource table is externally constructible and can outlive the shader bytes or dispatch
@@ -21323,6 +21415,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
         return {};
     if (has_selected_sbuffer_descriptor &&
         !rdna2_gta5_selected_sbuffer_dispatch(code, dwords, config, *rt))
+        return {};
+    if (has_gta5_packed_pointer &&
+        !rdna2_gta5_packed_pointer_dispatch(code, dwords, config, *rt))
         return {};
     const uint32_t local_x = std::max(1u, config.local_x);
     const uint32_t local_y = std::max(1u, config.local_y);
@@ -21351,6 +21446,23 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     b.gta5_selected_sbuffer_dispatch_validated = has_selected_sbuffer_descriptor;
     if (selected_sbuffer_descriptor && has_selected_sbuffer_descriptor)
         b.gta5_selected_sbuffer_soffset = selected_sbuffer_descriptor->selected_sbuffer_soffset;
+    b.indirect_buffer_dispatch_validated = has_gta5_packed_pointer;
+    if (has_gta5_packed_pointer) {
+        const ShaderResource* packed = rt->by_fetch_pc(kGta5PackedPointerSourcePc);
+        if (!packed || !is_gta5_packed_pointer_resource(*packed)) return {};
+        b.indirect_buffer_binding = packed->binding;
+        b.indirect_buffer_source_bytes = static_cast<uint32_t>(packed->size);
+        b.indirect_buffer_slot_count = packed->indirect_buffer_slot_count;
+        b.indirect_buffer_contract_tag = packed->indirect_buffer_contract_tag;
+        b.indirect_buffer_header_bytes = packed->indirect_buffer_header_bytes;
+        b.indirect_buffer_slot_bytes = packed->indirect_buffer_slot_bytes;
+        const ShaderResource* atomic = rt->by_fetch_pc(kGta5PackedPointerAtomicSourcePc);
+        if (!atomic || atomic->size != kGta5PackedPointerAtomicBindingBytes ||
+            (atomic->gpu_addr & 7u) != 0u)
+            return {};
+        b.indirect_buffer_atomic_binding = atomic->binding;
+        b.indirect_buffer_atomic_byte_offset = kGta5PackedPointerAtomicByteOffset;
+    }
     if (config.lds_bytes) {
         uint32_t dw = (config.lds_bytes + 3) / 4;
         b.lds_dwords = std::min(16384u, std::max(1u, dw));
@@ -21361,13 +21473,14 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const BarrierPhasedCompute barrier_phases = analyze_barrier_phased_compute(ins);
     const bool partial_barrier_phases = config.exact_thread_extent && has_partial_workgroup &&
         barrier_phases.found && !barrier_phases.guarded;
-    const bool gta5_selected_partial_dispatcher = config.exact_thread_extent &&
-        has_partial_workgroup && b.gta5_selected_sbuffer_dispatch_validated;
+    const bool gta5_exact_partial_dispatcher = config.exact_thread_extent &&
+        has_partial_workgroup && (b.gta5_selected_sbuffer_dispatch_validated ||
+                                  b.indirect_buffer_dispatch_validated);
     b.native_subgroup_size = config.native_subgroup_size == wave_size &&
         local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
     // A partial guest wave needs the portable dispatcher's per-lane ACTIVE bit. Native subgroup
     // operations cannot be entered by only the real prefix of the final host subgroup.
-    if (partial_barrier_phases || gta5_selected_partial_dispatcher)
+    if (partial_barrier_phases || gta5_exact_partial_dispatcher)
         b.native_subgroup_size = 0;
     // PROSPER_DBG: report the inputs to that decision, not just its outcome (#2429).
     //
@@ -21450,7 +21563,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     b.allow_b32_masks = wave_size == 32;
     b.declare_guest_scratch(scratch);
     uint32_t initial_dispatch_active = 0;
-    if (partial_barrier_phases || gta5_selected_partial_dispatcher)
+    if (partial_barrier_phases || gta5_exact_partial_dispatcher)
         initial_dispatch_active = b.invocation_within_extent(
             config.threads_x, config.threads_y, config.threads_z);
     else if (config.exact_thread_extent && has_partial_workgroup)
@@ -21499,7 +21612,11 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                    code, dwords, nullptr, true, initial_dispatch_active, false,
                    synchronize_lds_fminmax))
         return {};
-    if (gta5_selected_partial_dispatcher && b.uses_barrier)
+    // Both exact GTA contracts execute their partial final wave through the CFG dispatcher's ACTIVE
+    // bit. Padded Vulkan lanes stay in the dispatcher and its synthesized workgroup barriers, but
+    // cannot execute guest memory effects. The full program, launch, and resource proof above is the
+    // authority boundary for extending the selected-SBUFFER path to the packed-pointer program.
+    if (gta5_exact_partial_dispatcher && b.uses_barrier)
         b.partial_barrier_phases_emitted = true;
     // The entry guard is intentionally divergent only in the final partial workgroup. Vulkan requires
     // every workgroup invocation to participate uniformly in OpControlBarrier, including barriers the
