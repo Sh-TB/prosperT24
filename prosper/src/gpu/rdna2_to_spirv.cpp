@@ -7914,6 +7914,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                            ? b.iun(Op_Not, b.ibin(Op_BitwiseOr, a, c))
                            : b.iun(Op_Not, b.ibin(Op_BitwiseXor, a, c));
             };
+            auto bitfield_mask_u32 = [&](uint32_t width, uint32_t offset) {
+                width = b.ibin(Op_BitwiseAnd, width, b.uconst(31));
+                offset = b.ibin(Op_BitwiseAnd, offset, b.uconst(31));
+                const uint32_t ones = b.ibin(
+                    Op_ISub,
+                    b.ibin(Op_ShiftLeftLogical, b.uconst(1), width), b.uconst(1));
+                return b.ibin(Op_ShiftLeftLogical, ones, offset);
+            };
             if (b.is_compute && b.wave_size == 32 && in.dst.value == 126 &&
                 sop2_is_b32_logical(in.opcode) &&
                 scalar_data_operand(in.src[0]) && scalar_data_operand(in.src[1])) {
@@ -7925,6 +7933,27 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t result = logical_u32(val(in.src[0]), val(in.src[1]));
                 if (!ok) return true;
                 rs.scc = b.ucmp(Op_INotEqual, result, b.uconst(0));
+                const uint32_t lane = b.ibin(
+                    Op_BitwiseAnd, b.guest_lane_id(), b.uconst(31));
+                const uint32_t bit = b.ibin(
+                    Op_BitwiseAnd,
+                    b.ibin(Op_ShiftRightLogical, result, lane), b.uconst(1));
+                rs.exec = b.ucmp(Op_INotEqual, bit, b.uconst(0));
+                rs.exec_narrowed = true;
+                rs.sreg.erase(126);
+                rs.sreg_srt.erase(126);
+                return true;
+            }
+            if (b.is_compute && b.wave_size == 32 && in.dst.value == 126 &&
+                in.opcode == kSop2OpcodeBfmB32 &&
+                scalar_data_operand(in.src[0]) && scalar_data_operand(in.src[1])) {
+                // BFM writes an ordinary 32-bit result, but physical EXEC_LO still consumes that
+                // dword as the complete Wave32 mask. GTA V uses width=16, offset=16 to enable the
+                // upper half of a traversal wave. Both operands are uniform scalar DATA, so select
+                // the resulting architectural bit for this invocation; S_BFM_B32 leaves SCC alone.
+                const uint32_t result = bitfield_mask_u32(
+                    val(in.src[0]), val(in.src[1]));
+                if (!ok) return true;
                 const uint32_t lane = b.ibin(
                     Op_BitwiseAnd, b.guest_lane_id(), b.uconst(31));
                 const uint32_t bit = b.ibin(
@@ -8601,10 +8630,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                            scc_nz(d); break;
                 case 0x1E: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_lshl_b32
                              d = b.ibin(Op_ShiftLeftLogical, a, sh); scc_nz(d); break; }  // dst = src0 << (src1 & 31)
-                case 0x24: { uint32_t w  = b.ibin(Op_BitwiseAnd, a, b.uconst(0x1f));   // s_bfm_b32: bitfield mask
-                             uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(0x1f));   // dst = ((1<<(src0&31))-1)<<(src1&31)
-                             uint32_t mask = b.ibin(Op_ISub, b.ibin(Op_ShiftLeftLogical, b.uconst(1), w), b.uconst(1));
-                             d = b.ibin(Op_ShiftLeftLogical, mask, sh); break; }       // no SCC write
+                case kSop2OpcodeBfmB32:
+                    d = bitfield_mask_u32(a, c); break; // no SCC write
                 case 0x20: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_lshr_b32
                              d = b.ibin(Op_ShiftRightLogical, a, sh); scc_nz(d); break; }  // dst = src0 >> (src1 & 31)
                 case 0x22: { uint32_t sh = b.ibin(Op_BitwiseAnd, c, b.uconst(31));   // s_ashr_i32
