@@ -416,6 +416,12 @@ struct SpirvCompute {
     uint32_t ngg_vertex_index_value = 0;
     bool     is_compute=0;                            // true in the compute shell (gates LDS / s_barrier)
     bool     uses_barrier=0;                          // guest or synthesized workgroup barrier emitted
+    // GTA V 0x413ce6000's exact pc153 scalar descriptor-table read is admitted only after the
+    // complete dispatch/source/table proof has been repeated at the final compiler boundary.
+    // Keeping that authority on the builder, rather than inferring it from a resource field inside
+    // emit_alu, prevents a hand-built or stale marker from enabling instruction-local shortcuts.
+    bool gta5_selected_sbuffer_dispatch_validated = false;
+    uint32_t gta5_selected_sbuffer_soffset = UINT32_MAX;
     // S_CSELECT_B64 normally needs both scalar source dwords. A captured GTA V kernel consumes
     // only the selected VCC_LO word and leaves VCC_HI dead on every successor path; the whole-stream
     // liveness proof records that exact exception before emission. Keep it builder-local so recursive
@@ -11818,6 +11824,58 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             in.pc, in.opcode);
                 ok = false; return true;
             }
+            // GTA V 0x413ce6000 partitions the active wave by a read-first-lane selector, multiplies
+            // that selector by the outer V# stride, then reads one four-dword inner V# at pc153.
+            // The front half has proved, for this exact dispatch, that every post-MUL SOFFSET is
+            // either the sole reachable in-bounds record (480 bytes, record 4) or wholly outside the
+            // 600-byte scalar-buffer range. Materialize the architectural per-dword SMEM result here:
+            // selected record words for 480, zero otherwise. The complete-dispatch authority bit is
+            // deliberately required in addition to the serialized marker shape.
+            const ShaderResource* selected_sbuffer =
+                rt && in.opcode == kSmemOpcodeBufferLoadDwordX4
+                    ? rt->by_fetch_pc(in.pc) : nullptr;
+            const bool exact_gta5_selected_sbuffer_site =
+                in.pc == 153u && in.fmt == Rdna2Format::SMEM && in.len_dwords == 2u &&
+                in.dst.kind == OperandKind::SGPR && in.dst.value == 8 &&
+                in.src[0].kind == OperandKind::SGPR && in.src[0].value == 4 &&
+                in.src[1].kind == OperandKind::Special && in.src[1].value == 106 &&
+                in.literal == 8u && in.words[0] == 0xf4280202u &&
+                in.words[1] == 0xd4000008u;
+            if (selected_sbuffer &&
+                is_gta5_selected_sbuffer_marker_candidate(*selected_sbuffer)) {
+                if (!b.gta5_selected_sbuffer_dispatch_validated ||
+                    !is_gta5_selected_sbuffer_descriptor(*selected_sbuffer) ||
+                    !exact_gta5_selected_sbuffer_site || n != 4u) {
+                    ok = false;
+                    return true;
+                }
+                if (selected_sbuffer->selected_sbuffer_soffset ==
+                        kGtaSelectedSbufferZeroChainSoffset ||
+                    selected_sbuffer->selected_sbuffer_soffset ==
+                        kGtaSelectedSbufferAllOobSoffset) {
+                    for (uint32_t k = 0; k < n; ++k) {
+                        rs.sreg[in.dst.value + static_cast<int>(k)] = b.uconst(0u);
+                        rs.sreg_srt.erase(in.dst.value + static_cast<int>(k));
+                    }
+                    return true;
+                }
+                const auto soff = rs.sreg.find(in.src[1].value);
+                if (soff == rs.sreg.end()) {
+                    ok = false;
+                    return true;
+                }
+                const uint32_t selected = b.ucmp(
+                    Op_IEqual, soff->second,
+                    b.uconst(selected_sbuffer->selected_sbuffer_soffset));
+                for (uint32_t k = 0; k < n; ++k) {
+                    rs.sreg[in.dst.value + static_cast<int>(k)] = b.sel(
+                        selected,
+                        b.uconst(selected_sbuffer->selected_sbuffer_words[k]),
+                        b.uconst(0u));
+                    rs.sreg_srt.erase(in.dst.value + static_cast<int>(k));
+                }
+                return true;
+            }
             // The front half proved all four live SBASE words at this exact scalar-buffer load and
             // proved that its minimum unsigned offset begins beyond the effective scalar bound. The
             // result is therefore exact zero without declaring or touching a dummy storage binding.
@@ -12110,11 +12168,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x9: n = 1; raw_subword = true; raw_signed = true; raw_bits = 8; break; // sbyte
                 case 0xA: n = 1; raw_subword = true; raw_bits = 16; break;  // buffer_load_ushort
                 case 0xB: n = 1; raw_subword = true; raw_signed = true; raw_bits = 16; break; // sshort
-                case 0xC: n = 1; break;                     // buffer_load_dword
-                case 0xD: n = 2; break;                     // buffer_load_dwordx2
-                case 0xE: n = 4; break;                     // buffer_load_dwordx4
-                case 0xF: n = 3; break;                     // buffer_load_dwordx3 (round-trip llvm-mc gfx1010:
-                                                            // 0xe03c… op 0x0F — x3 sorts AFTER x4 in this ISA)
+                case kMubufOpcodeLoadDword:   n = 1; break;
+                case kMubufOpcodeLoadDwordX2: n = 2; break;
+                case kMubufOpcodeLoadDwordX4: n = 4; break;
+                case kMubufOpcodeLoadDwordX3: n = 3; break; // x3 sorts after x4 (llvm-mc gfx1010)
                 case 0x0: n = 1; is_format = true; break;   // buffer_load_format_x  (vertex fetch)
                 case 0x1: n = 2; is_format = true; break;   // buffer_load_format_xy
                 case 0x2: n = 3; is_format = true; break;   // buffer_load_format_xyz
@@ -12218,6 +12275,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             bool instance_vfetch = false;
             bool folded_vfetch = false; // by-fetch V# base already includes OFFSET/SOFFSET
             const ShaderResource* resolved_buffer = nullptr;
+            bool gta5_selected_sbuffer_consumer = false;
             if (is_format) {
                 // A format load reads a vertex/buffer attribute — it needs the V# descriptor for the
                 // binding, stride, and data format. Resolve SRSRC (src[1]) via provenance: an s_load
@@ -12448,6 +12506,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     return true;
                 }
+                const bool exact_consumer =
+                    (in.pc == 156u && in.opcode == kMubufOpcodeLoadDwordX4 && n == 4u &&
+                     in.words[0] == 0xe0382000u && in.words[1] == 0x80020006u) ||
+                    (in.pc == 158u && in.opcode == kMubufOpcodeLoadDwordX2 && n == 2u &&
+                     in.words[0] == 0xe0342010u && in.words[1] == 0x80020406u);
+                if (b.gta5_selected_sbuffer_dispatch_validated && exact_consumer) {
+                    const bool exact_operands = in.fmt == Rdna2Format::MUBUF && !is_format &&
+                        !is_store && !is_atomic && !raw_subword && in.len_dwords == 2u &&
+                        in.dst.kind == OperandKind::VGPR &&
+                        in.dst.value == (in.pc == 156u ? 0 : 4) &&
+                        in.src[0].kind == OperandKind::VGPR && in.src[0].value == 6 &&
+                        in.src[1].kind == OperandKind::SGPR && in.src[1].value == 8 &&
+                        in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0;
+                    if (!exact_operands) {
+                        ok = false;
+                        return true;
+                    }
+                    gta5_selected_sbuffer_consumer = true;
+                }
                 resolved_buffer = res;
                 binding = res->binding;
                 stride  = res->stride;
@@ -12641,6 +12718,23 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // typed, packed, and dynamically addressed component below consumes dwords through this
             // wrapper, so adding another format shape cannot accidentally drop GLC/DLC semantics.
             auto load_dword = [&](uint32_t dword_idx) {
+                if (gta5_selected_sbuffer_consumer) {
+                    const auto soff = rs.sreg.find(106);
+                    if (soff == rs.sreg.end()) {
+                        ok = false;
+                        return b.uconst(0u);
+                    }
+                    const uint32_t selected = b.ucmp(
+                        Op_IEqual, soff->second,
+                        b.uconst(b.gta5_selected_sbuffer_soffset));
+                    // A SPIR-V select does not short-circuit its operands. Redirect rejected
+                    // partitions to the proven non-empty binding's dword zero before loading, then
+                    // select the architectural OOB zero, so an arbitrary guest v6 cannot create an
+                    // out-of-range host access on a path whose V# was actually the zero descriptor.
+                    const uint32_t safe_idx = b.sel(selected, dword_idx, b.uconst(0u));
+                    const uint32_t value = b.cbuf_load(safe_idx, binding, coherent_load);
+                    return b.sel(selected, value, b.uconst(0u));
+                }
                 return b.cbuf_load(dword_idx, binding, coherent_load);
             };
             if (is_atomic_x2) {
@@ -20666,7 +20760,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 return false;
             }
             if (!emit_cfg_state_machine(b, rs, ins, safe, rt,
-                                        allow_exec_update, allow_smem, exp_fn, code, dwords))
+                                        allow_exec_update, allow_smem, exp_fn, code, dwords,
+                                        initial_dispatch_active))
                 return false;
             return true;
         }
@@ -20684,7 +20779,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         auto try_cfg_dispatcher = [&]() -> int {           // 1 = emitted, 0 = clean reject, -1 = partial
             const size_t checkpoint = b.code.size();
             if (emit_cfg_state_machine(b, rs, ins, safe, rt,
-                                       allow_exec_update, allow_smem, exp_fn, code, dwords))
+                                       allow_exec_update, allow_smem, exp_fn, code, dwords,
+                                       initial_dispatch_active))
                 return 1;
             if (b.code.size() == checkpoint) return 0;
             if (getenv("PROSPER_DBG"))
@@ -21210,6 +21306,11 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const bool has_nullable_output_raw_buffer = rt &&
         std::any_of(rt->resources.begin(), rt->resources.end(),
                     is_nullable_raw_buffer_marker_candidate);
+    const bool has_selected_sbuffer_descriptor = rt &&
+        std::any_of(rt->resources.begin(), rt->resources.end(),
+                    is_gta5_selected_sbuffer_marker_candidate);
+    const ShaderResource* selected_sbuffer_descriptor =
+        has_selected_sbuffer_descriptor ? rt->by_fetch_pc(153u) : nullptr;
     // A resource table is externally constructible and can outlive the shader bytes or dispatch
     // that produced it. Re-establish the complete static guard and dynamic null-entry contract at
     // the final translation boundary before any marker is permitted to erase a real store.
@@ -21219,6 +21320,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
         return {};
     if (has_nullable_output_raw_buffer &&
         !rdna2_gta5_nullable_output_dispatch(code, dwords, config, *rt))
+        return {};
+    if (has_selected_sbuffer_descriptor &&
+        !rdna2_gta5_selected_sbuffer_dispatch(code, dwords, config, *rt))
         return {};
     const uint32_t local_x = std::max(1u, config.local_x);
     const uint32_t local_y = std::max(1u, config.local_y);
@@ -21244,6 +21348,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
     SpirvCompute b;
     b.diagnostic = diagnostic;
+    b.gta5_selected_sbuffer_dispatch_validated = has_selected_sbuffer_descriptor;
+    if (selected_sbuffer_descriptor && has_selected_sbuffer_descriptor)
+        b.gta5_selected_sbuffer_soffset = selected_sbuffer_descriptor->selected_sbuffer_soffset;
     if (config.lds_bytes) {
         uint32_t dw = (config.lds_bytes + 3) / 4;
         b.lds_dwords = std::min(16384u, std::max(1u, dw));
@@ -21254,11 +21361,14 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const BarrierPhasedCompute barrier_phases = analyze_barrier_phased_compute(ins);
     const bool partial_barrier_phases = config.exact_thread_extent && has_partial_workgroup &&
         barrier_phases.found && !barrier_phases.guarded;
+    const bool gta5_selected_partial_dispatcher = config.exact_thread_extent &&
+        has_partial_workgroup && b.gta5_selected_sbuffer_dispatch_validated;
     b.native_subgroup_size = config.native_subgroup_size == wave_size &&
         local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
     // A partial guest wave needs the portable dispatcher's per-lane ACTIVE bit. Native subgroup
     // operations cannot be entered by only the real prefix of the final host subgroup.
-    if (partial_barrier_phases) b.native_subgroup_size = 0;
+    if (partial_barrier_phases || gta5_selected_partial_dispatcher)
+        b.native_subgroup_size = 0;
     // PROSPER_DBG: report the inputs to that decision, not just its outcome (#2429).
     //
     // Every wave-width-dependent lowering in this file gates on `b.native_subgroup_size` -- the
@@ -21340,7 +21450,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     b.allow_b32_masks = wave_size == 32;
     b.declare_guest_scratch(scratch);
     uint32_t initial_dispatch_active = 0;
-    if (partial_barrier_phases)
+    if (partial_barrier_phases || gta5_selected_partial_dispatcher)
         initial_dispatch_active = b.invocation_within_extent(
             config.threads_x, config.threads_y, config.threads_z);
     else if (config.exact_thread_extent && has_partial_workgroup)
@@ -21389,6 +21499,8 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                    code, dwords, nullptr, true, initial_dispatch_active, false,
                    synchronize_lds_fminmax))
         return {};
+    if (gta5_selected_partial_dispatcher && b.uses_barrier)
+        b.partial_barrier_phases_emitted = true;
     // The entry guard is intentionally divergent only in the final partial workgroup. Vulkan requires
     // every workgroup invocation to participate uniformly in OpControlBarrier, including barriers the
     // recompiler synthesizes for wave operations. Reject this uncommon combination instead of emitting
