@@ -13461,7 +13461,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
             if (b.ngg_private_lds && (in.opcode == 0x00 || in.opcode == 0x07 || in.opcode == 0x08 ||
-                                     in.opcode == 0x12 || in.opcode == 0x13 ||
+                                     in.opcode == kDsOpcodeMinF32 ||
+                                     in.opcode == kDsOpcodeMaxF32 ||
                                      in.opcode == 0x20 || in.opcode == 0x2d)) {
                 // Cross-lane/atomic NGG LDS effects do not have a proven single-lane reduction yet.
                 ok = false; return true;
@@ -13469,13 +13470,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (in.opcode == 0x00) {                     // ds_add_u32: LDS += DATA0, no VGPR return
                 b.lds_atomic(Op_AtomicIAdd, idx, vread(in.src[1].value),
                              rs.exec_narrowed, rs.exec);
-            } else if (in.opcode == 0x12 || in.opcode == 0x13) {
+            } else if (in.opcode == kDsOpcodeMinF32 || in.opcode == kDsOpcodeMaxF32) {
                 // Exact ordinary GFX10 encoding: ADDR + DATA0 only. DATA1 and VDST are reserved for
                 // these non-returning forms (llvm-mc gfx1030 emits both as zero); reject a packet
                 // carrying either field instead of interpreting an unmodeled SRC2/return variant.
                 if ((in.words[1] & 0xffff0000u) != 0u ||
                     b.compute_pgm_rsrc1 == UINT32_MAX) { ok = false; return true; }
-                b.lds_atomic_fminmax(idx, vread(in.src[1].value), in.opcode == 0x12,
+                b.lds_atomic_fminmax(idx, vread(in.src[1].value),
+                                     in.opcode == kDsOpcodeMinF32,
                                      rs.exec_narrowed, rs.exec);
             } else if (in.opcode >= 0x05 && in.opcode <= 0x0b) {
                 // Non-returning 32-bit LDS atomics map directly to SPIR-V atomics. DS_OR_B32
@@ -14512,7 +14514,8 @@ bool emit_cfg_state_machine(
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,
     bool allow_exec_update, bool allow_smem,
     const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
-    const uint32_t* code, size_t dwords, uint32_t initial_active = 0) {
+    const uint32_t* code, size_t dwords, uint32_t initial_active = 0,
+    bool synchronize_lds_fminmax = false) {
     const bool graphics = b.is_fragment || b.is_vertex;
     auto reject_cfg = [&](uint32_t pc, const char* reason) {
         log_recompile_diagnostic(b.diagnostic,
@@ -14556,7 +14559,17 @@ bool emit_cfg_state_machine(
     if (b.is_compute &&
         ((b.wave_size != 32 && b.wave_size != 64) || !b.local_count || b.local_count > 1024))
         return false;
-    const bool direct_dispatch = graphics || b.native_subgroup_size;
+    const bool has_synchronized_lds_fminmax = synchronize_lds_fminmax &&
+        std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+            return in.fmt == Rdna2Format::DS && !in.ds_gds &&
+                (in.opcode == kDsOpcodeMinF32 || in.opcode == kDsOpcodeMaxF32);
+        });
+    // The float-atomic event is bracketed by Workgroup barriers. Keep even an exact native subgroup
+    // on the common dispatcher path so lane zero's ordinary initializer stores are published before
+    // the first CAS and the final CAS completes before the later gather. Admission below limits this
+    // synthesized ordering to one guest wave, so ended/trapped lanes can safely remain participants.
+    const bool direct_dispatch = (graphics || b.native_subgroup_size) &&
+        !has_synchronized_lds_fminmax;
     const bool proven_wave32_masks = b.allow_b32_masks &&
         (b.is_fragment || (b.is_compute && b.wave_size == 32));
     const bool compute_scalar_vcc_bridge = allows_compute_scalar_vcc_bridge(b);
@@ -14856,6 +14869,7 @@ bool emit_cfg_state_machine(
     std::unordered_set<uint32_t> compute_dpp_add_row_mask_pcs;
     std::unordered_map<uint32_t, uint32_t> portable_mask_ffbh_event_for_pc;
     std::set<int> portable_mask_ffbh_dsts;
+    std::unordered_set<uint32_t> lds_fminmax_pcs;
     for (size_t i = 0; i < ins.size(); ++i) {
         const auto& in = ins[i];
         if (in.is_end) break;
@@ -14933,6 +14947,17 @@ bool emit_cfg_state_machine(
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
         }
+        if (synchronize_lds_fminmax && in.fmt == Rdna2Format::DS &&
+            (in.opcode == kDsOpcodeMinF32 || in.opcode == kDsOpcodeMaxF32)) {
+            if (!b.is_compute || in.ds_gds || b.local_count > b.wave_size ||
+                (in.words[1] & 0xffff0000u) != 0u ||
+                b.compute_pgm_rsrc1 == UINT32_MAX)
+                return reject_cfg(in.pc, "lds-fminmax-common-phase-contract");
+            lds_fminmax_pcs.insert(in.pc);
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
         if (mask_zero_compare_candidate_source(in) >= 0) {
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
@@ -14985,7 +15010,7 @@ bool emit_cfg_state_machine(
     const uint32_t wave_result_base = padded_lanes +
         (has_portable_compute_dpp ? padded_lanes : 0u);
     const uint32_t group_active_slot = wave_result_base + wave_count;
-    if (b.is_compute && !b.native_subgroup_size &&
+    if (b.is_compute && !direct_dispatch &&
         !b.declare_cfg_scratch(group_active_slot + 1))
         return reject_cfg(ins.front().pc, "cfg-scratch-too-small");
     start_set.insert(end_pc);
@@ -16086,6 +16111,7 @@ bool emit_cfg_state_machine(
                 compute_dpp_add_row_shr_pcs.contains(in.pc) ||
                 compute_dpp_row_ror8_pcs.contains(in.pc) ||
                 compute_dpp_add_row_mask_pcs.contains(in.pc) ||
+                lds_fminmax_pcs.contains(in.pc) ||
                 mask_zero_compare_candidate_source(in) >= 0 ||
                 exec_saved_mask_compare_source(in) >= 0 ||
                 saved_mask_pair_compare_sources(in)[0] >= 0 ||
@@ -16252,6 +16278,17 @@ bool emit_cfg_state_machine(
     const uint32_t append_idx_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t append_dst_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t append_count_var = b.function_var(b.t_u32, ptr_u32);
+    const bool has_lds_fminmax_event = !lds_fminmax_pcs.empty();
+    const uint32_t lds_fminmax_pending_var = has_lds_fminmax_event
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t lds_fminmax_active_var = has_lds_fminmax_event
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t lds_fminmax_min_var = has_lds_fminmax_event
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t lds_fminmax_idx_var = has_lds_fminmax_event
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t lds_fminmax_value_var = has_lds_fminmax_event
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
     const uint32_t swizzle_pending_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t swizzle_active_var = b.function_var(b.t_bool, ptr_bool);
     const uint32_t swizzle_source_var = b.function_var(b.t_u32, ptr_u32);
@@ -16374,6 +16411,11 @@ bool emit_cfg_state_machine(
     b.store_function(exec_var, initial.exec);
     b.store_function(pc_var, b.uconst(0));
     b.store_function(active_var, initial_active ? initial_active : yes);
+    if (has_lds_fminmax_event) {
+        b.store_function(lds_fminmax_min_var, no);
+        b.store_function(lds_fminmax_idx_var, zero);
+        b.store_function(lds_fminmax_value_var, zero);
+    }
     b.store_function(swizzle_source_var, zero);
     b.store_function(swizzle_source_lane_var, zero);
     b.store_function(swizzle_dst_var, zero);
@@ -16629,6 +16671,10 @@ bool emit_cfg_state_machine(
         b.store_function(append_idx_var, zero);
         b.store_function(append_dst_var, zero);
     }
+    if (has_lds_fminmax_event) {
+        b.store_function(lds_fminmax_pending_var, no);
+        b.store_function(lds_fminmax_active_var, no);
+    }
     b.store_function(swizzle_pending_var, no);
     b.store_function(swizzle_active_var, no);
     if (has_bpermute) {
@@ -16710,6 +16756,7 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* terminator = nullptr;
         const Rdna2Inst* mbcnt = nullptr;
         const Rdna2Inst* append = nullptr;
+        const Rdna2Inst* lds_fminmax = nullptr;
         const Rdna2Inst* swizzle = nullptr;
         const Rdna2Inst* bpermute = nullptr;
         const Rdna2Inst* dpp_min_row_shr = nullptr;
@@ -16732,6 +16779,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_terminator = nullptr;
             const Rdna2Inst* block_mbcnt = nullptr;
             const Rdna2Inst* block_append = nullptr;
+            const Rdna2Inst* block_lds_fminmax = nullptr;
             const Rdna2Inst* block_swizzle = nullptr;
             const Rdna2Inst* block_bpermute = nullptr;
             const Rdna2Inst* block_dpp_min_row_shr = nullptr;
@@ -16757,6 +16805,10 @@ bool emit_cfg_state_machine(
                 }
                 if (in.fmt == Rdna2Format::DS && (in.opcode == 0x3d || in.opcode == 0x3e)) {
                     block_append = &in;
+                    break;
+                }
+                if (lds_fminmax_pcs.contains(in.pc)) {
+                    block_lds_fminmax = &in;
                     break;
                 }
                 if (in.fmt == Rdna2Format::DS && in.opcode == 0x35) {
@@ -16953,7 +17005,8 @@ bool emit_cfg_state_machine(
             const bool last = member + 1 == dispatch_blocks[dispatch].size();
             if (!last) {
                 // Group construction admits only one-successor plain blocks before the tail.
-                if (block_mbcnt || block_append || block_swizzle || block_bpermute ||
+                if (block_mbcnt || block_append || block_lds_fminmax ||
+                    block_swizzle || block_bpermute ||
                     block_dpp_min_row_shr || block_dpp_add_row_shr ||
                     block_dpp_row_ror8 ||
                     block_dpp_add_row_mask || block_mask_ffbh || block_mask_compare ||
@@ -16968,6 +17021,7 @@ bool emit_cfg_state_machine(
             terminator = block_terminator;
             mbcnt = block_mbcnt;
             append = block_append;
+            lds_fminmax = block_lds_fminmax;
             swizzle = block_swizzle;
             bpermute = block_bpermute;
             dpp_min_row_shr = block_dpp_min_row_shr;
@@ -17092,6 +17146,28 @@ bool emit_cfg_state_machine(
                 b.store_function(append_dst_var,
                     b.uconst(static_cast<uint32_t>(append->dst.value)));
             }
+        }
+        if (lds_fminmax) {
+            if (!lds_fminmax_pcs.contains(lds_fminmax->pc) || lds_fminmax->ds_gds ||
+                (lds_fminmax->words[1] & 0xffff0000u) != 0u ||
+                (lds_fminmax->opcode != kDsOpcodeMinF32 &&
+                 lds_fminmax->opcode != kDsOpcodeMaxF32))
+                return reject_cfg(lds_fminmax->pc, "lds-fminmax-common-phase-contract");
+            b.declare_lds();
+            if (!b.lds_var) return reject_cfg(lds_fminmax->pc, "lds-fminmax-lds");
+            const auto address = state.vreg.find(lds_fminmax->src[0].value);
+            const auto value = state.vreg.find(lds_fminmax->src[1].value);
+            const uint32_t byte_address = b.ibin(
+                Op_IAdd, address == state.vreg.end() ? zero : address->second,
+                b.uconst(lds_fminmax->literal));
+            b.store_function(lds_fminmax_pending_var, yes);
+            b.store_function(lds_fminmax_active_var, state.exec);
+            b.store_function(lds_fminmax_min_var,
+                lds_fminmax->opcode == kDsOpcodeMinF32 ? yes : no);
+            b.store_function(lds_fminmax_idx_var,
+                b.ibin(Op_ShiftRightLogical, byte_address, b.uconst(2)));
+            b.store_function(lds_fminmax_value_var,
+                value == state.vreg.end() ? zero : value->second);
         }
         if (swizzle) {
             if (!swizzle_pcs.contains(swizzle->pc)) return false;
@@ -17412,6 +17488,9 @@ bool emit_cfg_state_machine(
         } else if (append) {
             if (!set_next(append->pc + append->len_dwords))
                 return reject_cfg(append->pc, "append-successor");
+        } else if (lds_fminmax) {
+            if (!set_next(lds_fminmax->pc + lds_fminmax->len_dwords))
+                return reject_cfg(lds_fminmax->pc, "lds-fminmax-successor");
         } else if (swizzle) {
             if (!set_next(swizzle->pc + swizzle->len_dwords))
                 return reject_cfg(swizzle->pc, "swizzle-successor");
@@ -17708,6 +17787,41 @@ bool emit_cfg_state_machine(
         b.emit_condbranch(b.load_function(b.t_bool, active_var),
                           loop_header, loop_merge);
     } else {
+    // DS_MIN/MAX_F32 common phase. Dispatcher cases publish one lane-local atomic request without
+    // touching LDS. Every invocation, including lanes whose guest wave trapped or ended, reaches the
+    // publication barrier here. The trailing barrier completes this event before the next dispatcher
+    // iteration can execute another atomic or the lane-zero gather. Admission requires a single guest
+    // wave whenever ordinary initializer stores precede the atomics, so this does not invent ownership
+    // between independently executing guest waves.
+    if (has_lds_fminmax_event) {
+        b.barrier();
+        const uint32_t perform = b.land(
+            b.load_function(b.t_bool, lds_fminmax_pending_var),
+            b.load_function(b.t_bool, lds_fminmax_active_var));
+        const uint32_t atomic_block = b.id(), atomic_merge = b.id();
+        b.emit_selmerge(atomic_merge);
+        b.emit_condbranch(perform, atomic_block, atomic_merge);
+        b.emit_label(atomic_block);
+        const uint32_t min_block = b.id(), max_block = b.id(), operation_merge = b.id();
+        const uint32_t is_min = b.load_function(b.t_bool, lds_fminmax_min_var);
+        b.emit_selmerge(operation_merge);
+        b.emit_condbranch(is_min, min_block, max_block);
+        b.emit_label(min_block);
+        b.lds_atomic_fminmax(
+            b.load_function(b.t_u32, lds_fminmax_idx_var),
+            b.load_function(b.t_u32, lds_fminmax_value_var), true, false, yes);
+        b.emit_branch(operation_merge);
+        b.emit_label(max_block);
+        b.lds_atomic_fminmax(
+            b.load_function(b.t_u32, lds_fminmax_idx_var),
+            b.load_function(b.t_u32, lds_fminmax_value_var), false, false, yes);
+        b.emit_branch(operation_merge);
+        b.emit_label(operation_merge);
+        b.emit_branch(atomic_merge);
+        b.emit_label(atomic_merge);
+        b.barrier();
+    }
+
     // Portable compute DPP V_ADD_NC_U32 common phase. Host subgroup shuffles cannot model a
     // Wave64 guest on a subgroup32 device, and different guest waves can reach different static
     // DPP sites in one dispatcher iteration. Publish a full source value plus an event/EXEC word
@@ -18540,19 +18654,20 @@ BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdna2Inst>
 // idiom: select EXEC=1, initialize six adjacent dwords with one B64 and one B128 write, restore
 // EXEC=-1, set vaddr=0, then issue three DS_MIN_F32 and three DS_MAX_F32 operations.
 //
-// Recognize only that byte-exact sequence, including its lane-zero B128+B64 gather, and insert
-// emitter-only S_BARRIERs before and after the six atomics. The first publishes lane zero's plain
-// stores before every lane enters the CAS group; the second makes every lane finish all six CAS
-// loops before lane zero reads the result. AcquireRelease on an individual atomic orders memory but
-// is not an arrival barrier, so neither edge can be omitted. A straight-line shader emits both
-// directly. With scalar control flow, a no-crossing-edge proof keeps each boundary top-level in the
-// compact structurizer or lets the existing phase route lift it outside a complex dispatcher, so
-// every workgroup invocation reaches the same dynamic barrier. Any other float atomic following an
-// unsynchronized ordinary LDS store rejects visibly; a real guest barrier, or an atomic with no
-// preceding ordinary store in its phase, remains architectural and needs no synthesized edge.
+// Preserve the original byte-exact adjacent packet as a fast path: insert emitter-only S_BARRIERs
+// before and after its six atomics. For a separated packet, admit only a proved lane-zero initializer
+// in a single guest wave and ask emit_body to route every float atomic through the dispatcher's
+// synchronized common phase. The first common-phase barrier publishes the ordinary stores; each
+// trailing barrier completes that atomic before the next dispatcher iteration or later gather.
+// AcquireRelease on an individual atomic orders memory but is not an arrival barrier, so neither edge
+// can be omitted. Every unproved initializer and every multi-wave separated shape rejects visibly. A
+// real guest barrier, or an atomic with no preceding ordinary store in its phase, remains architectural
+// and needs no synthesized edge.
 bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
                                          RecompileDiagnosticContext diagnostic,
-                                         bool at_most_one_guest_wave) {
+                                         bool at_most_one_guest_wave,
+                                         bool* needs_dispatcher = nullptr) {
+    if (needs_dispatcher) *needs_dispatcher = false;
     auto ordinary_lds_store = [](const Rdna2Inst& in) {
         if (in.fmt != Rdna2Format::DS || in.ds_gds) return false;
         return in.opcode == 0x0d || in.opcode == 0x0e || in.opcode == 0x4d ||
@@ -18561,7 +18676,7 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
     };
     auto float_lds_atomic = [](const Rdna2Inst& in) {
         return in.fmt == Rdna2Format::DS && !in.ds_gds &&
-               (in.opcode == 0x12 || in.opcode == 0x13);
+               (in.opcode == kDsOpcodeMinF32 || in.opcode == kDsOpcodeMaxF32);
     };
     auto words_are = [](const Rdna2Inst& in, uint32_t word0, uint32_t word1) {
         return in.words[0] == word0 && in.words[1] == word1;
@@ -18577,15 +18692,44 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
     };
 
     std::vector<size_t> phase_stores;
+    bool phase_stores_are_single_lane = true;
+    bool exec_is_single_lane = false;
+    bool dispatcher_initializer_exec = false;
+    uint32_t dispatcher_initializer_pc = UINT32_MAX;
+    uint32_t phase_dispatcher_initializer_pc = UINT32_MAX;
     std::vector<size_t> synth_before;
     for (size_t i = 0; i < ins.size(); ++i) {
         const Rdna2Inst& in = ins[i];
         if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a) {
             phase_stores.clear();
+            phase_stores_are_single_lane = true;
+            phase_dispatcher_initializer_pc = UINT32_MAX;
             continue;
+        }
+        // These byte-exact scalar mask operations are the two lane-zero forms used by the known
+        // initializers. A control-flow edge or any other EXEC writer ends the straight-line proof;
+        // the dispatcher supplies ordering, not ownership of racing ordinary stores.
+        if (in.words[0] == 0xbeea2481u || in.words[0] == 0xbefe0481u) {
+            exec_is_single_lane = true; // s_and_saveexec_b64 vcc,1 / s_mov_b64 exec,1
+            dispatcher_initializer_exec = in.words[0] == 0xbeea2481u;
+            dispatcher_initializer_pc = dispatcher_initializer_exec ? in.pc : UINT32_MAX;
+        } else if (rdna2_instruction_may_change_exec(in) ||
+                   (in.fmt == Rdna2Format::SOPP &&
+                    (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09) ||
+                     in.opcode == 0x12))) {
+            exec_is_single_lane = false;
+            dispatcher_initializer_exec = false;
+            dispatcher_initializer_pc = UINT32_MAX;
         }
         if (ordinary_lds_store(in)) {
             phase_stores.push_back(i);
+            phase_stores_are_single_lane &= exec_is_single_lane;
+            if (!dispatcher_initializer_exec ||
+                (phase_dispatcher_initializer_pc != UINT32_MAX &&
+                 phase_dispatcher_initializer_pc != dispatcher_initializer_pc))
+                phase_stores_are_single_lane = false;
+            else
+                phase_dispatcher_initializer_pc = dispatcher_initializer_pc;
             continue;
         }
         if (!float_lds_atomic(in) || phase_stores.empty()) continue;
@@ -18645,6 +18789,36 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
             }
         }
         if (!exact || !found_lane0) {
+            bool dispatcher_initializer_dominates =
+                phase_dispatcher_initializer_pc != UINT32_MAX;
+            if (dispatcher_initializer_dominates) {
+                const uint32_t last_store_pc = ins[phase_stores.back()].pc;
+                for (const Rdna2Inst& edge : ins) {
+                    if (edge.pc >= phase_dispatcher_initializer_pc ||
+                        edge.fmt != Rdna2Format::SOPP || edge.opcode < 0x02 ||
+                        edge.opcode > 0x09 || edge.opcode == 0x03)
+                        continue;
+                    const uint32_t target = branch_target(edge);
+                    if (target > phase_dispatcher_initializer_pc && target <= last_store_pc) {
+                        dispatcher_initializer_dominates = false;
+                        break;
+                    }
+                }
+            }
+            if (needs_dispatcher && phase_stores_are_single_lane &&
+                dispatcher_initializer_dominates) {
+                if (!at_most_one_guest_wave) {
+                    log_recompile_diagnostic(
+                        diagnostic, "compute-recompile-reject", "terminal",
+                        "pc=%u reason=multiwave-lds-fminmax-dispatcher", in.pc);
+                    return false;
+                }
+                *needs_dispatcher = true;
+                phase_stores.clear();
+                phase_stores_are_single_lane = true;
+                phase_dispatcher_initializer_pc = UINT32_MAX;
+                continue;
+            }
             log_recompile_diagnostic(
                 diagnostic, "compute-recompile-reject", "terminal",
                 "pc=%u reason=unsynchronized-lds-store-before-ds-fminmax", in.pc);
@@ -18664,6 +18838,8 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
         synth_before.push_back(i);
         synth_before.push_back(i + 6);
         phase_stores.clear();
+        phase_stores_are_single_lane = true;
+        phase_dispatcher_initializer_pc = UINT32_MAX;
         i += 9; // both synthesized boundaries belong to this complete live atomic/gather group
     }
 
@@ -18725,7 +18901,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                const std::unordered_set<uint32_t>* inherited_dead_masks = nullptr,
                bool allow_cfg_dispatcher = true,
                uint32_t initial_dispatch_active = 0,
-               bool force_barrier_phases = false) {
+               bool force_barrier_phases = false,
+               bool force_lds_fminmax_dispatcher = false) {
                // code/dwords: raw stream for forward-if target checks; inherited_dead_masks keeps
                // whole-shader liveness valid when a barrier-separated body is compiled in phases.
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
@@ -18811,9 +18988,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (!phased.guarded || initial_dispatch_active)
                     return emit_cfg_state_machine(
                         b, rs, phase, safe, rt, allow_exec_update, allow_smem,
-                        exp_fn, code, dwords, initial_dispatch_active);
+                        exp_fn, code, dwords, initial_dispatch_active,
+                        force_lds_fminmax_dispatcher);
                 return emit_body(b, rs, phase, safe, rt, allow_exec_update, allow_smem,
-                                 exp_fn, code, dwords, &dead_masks);
+                                 exp_fn, code, dwords, &dead_masks, true, 0, false,
+                                 force_lds_fminmax_dispatcher);
             };
 
             size_t phase_begin = phased.guarded ? phased.guard_index + 1 : 0;
@@ -18869,6 +19048,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             return true;
         }
     }
+    if (force_lds_fminmax_dispatcher)
+        return emit_cfg_state_machine(
+            b, rs, ins, safe, rt, allow_exec_update, allow_smem,
+            exp_fn, code, dwords, initial_dispatch_active, true);
     std::unordered_set<uint32_t> effective_safe = safe;
     const CountedLoop L = detect_counted_loop(ins);
     size_t idx = 0;
@@ -20010,7 +20193,10 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     // separate side-effect bookkeeping and remain on the conservative reject path for this shape.
     (void)extend_terminating_if_else(code, dwords, ins);
     // The synthetic test shell is one Wave64 workgroup, matching the live GTA dispatch.
-    if (!prepare_lds_fminmax_synchronization(ins, {}, true)) return {};
+    bool synchronize_lds_fminmax = false;
+    if (!prepare_lds_fminmax_synchronization(
+            ins, {}, true, &synchronize_lds_fminmax))
+        return {};
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
     SpirvCompute b;
     b.compute_pgm_rsrc1 = compute_pgm_rsrc1;
@@ -20028,7 +20214,8 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     for (uint32_t k = 0; k < num_inputs; k++) rs.vreg[(int)k] = b.load_input(k);
     // Compute kernels have no EXP output; reject if one appears.
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/true,
-                   [](RegState&, const Rdna2Inst&){ return false; }, code, dwords)) return {};
+                   [](RegState&, const Rdna2Inst&){ return false; }, code, dwords,
+                   nullptr, true, 0, false, synchronize_lds_fminmax)) return {};
     auto it = rs.vreg.find((int)out_vgpr);
     uint32_t outbits = it == rs.vreg.end() ? b.uconst(0) : it->second;
     // If EXEC is still narrowed (a v_cmpx with no restore), masked-off lanes keep the output slot's prior
@@ -20058,8 +20245,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // See recompile_valu: compute has no branch-external EXP state, so the common host-shell merge is
     // only a place to finish the invocation after either guest arm has terminated.
     (void)extend_terminating_if_else(code, dwords, ins);
+    bool synchronize_lds_fminmax = false;
     if (!prepare_lds_fminmax_synchronization(
-            ins, diagnostic, local_count <= wave_size))
+            ins, diagnostic, local_count <= wave_size, &synchronize_lds_fminmax))
         return {};
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
     SpirvCompute b;
@@ -20206,7 +20394,8 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true,
                    /*allow_smem*/true, [](RegState&, const Rdna2Inst&) { return false; },
-                   code, dwords, nullptr, true, initial_dispatch_active))
+                   code, dwords, nullptr, true, initial_dispatch_active, false,
+                   synchronize_lds_fminmax))
         return {};
     // The entry guard is intentionally divergent only in the final partial workgroup. Vulkan requires
     // every workgroup invocation to participate uniformly in OpControlBarrier, including barriers the
