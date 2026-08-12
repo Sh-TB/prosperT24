@@ -7669,6 +7669,43 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_bool_b32.erase(in.dst.value);
                 return true;
             }
+            if (b.is_compute && b.wave_size == 32 && in.dst.value == 126 &&
+                in.opcode == kSop1OpcodeBrevB32) {
+                const auto scalar_data_operand = [&](const Operand& source) {
+                    switch (source.kind) {
+                        case OperandKind::InlineInt:
+                        case OperandKind::InlineFloat:
+                        case OperandKind::Literal:
+                            return true;
+                        case OperandKind::SGPR:
+                            return rs.sreg.contains(source.value) ||
+                                rs.sreg_input.contains(source.value);
+                        case OperandKind::Special:
+                            if (source.value == 125) return true; // SGPR_NULL
+                            if (source.value == 253) return rs.scc != 0;
+                            return source.value >= 106 && source.value <= 124 &&
+                                rs.sreg.contains(source.value);
+                        default:
+                            return false;
+                    }
+                };
+                if (!scalar_data_operand(in.src[0])) { ok = false; return true; }
+                // A scalar BREV result written to physical EXEC_LO is still the complete Wave32
+                // execution mask. GTA V reverses inline -16 (0xfffffff0) into 0x0fffffff, enabling
+                // lanes 0..27. Select the exact result bit per invocation; S_BREV_B32 leaves SCC.
+                const uint32_t result = b.iun(Op_BitReverse, val(in.src[0]));
+                if (!ok) return true;
+                const uint32_t lane = b.ibin(
+                    Op_BitwiseAnd, b.guest_lane_id(), b.uconst(31));
+                const uint32_t bit = b.ibin(
+                    Op_BitwiseAnd,
+                    b.ibin(Op_ShiftRightLogical, result, lane), b.uconst(1));
+                rs.exec = b.ucmp(Op_INotEqual, bit, b.uconst(0));
+                rs.exec_narrowed = true;
+                rs.sreg.erase(126);
+                rs.sreg_srt.erase(126);
+                return true;
+            }
             // A 32-bit scalar DATA write into an EXEC half would leave the live per-lane mask
             // (rs.exec) stale — hardware updates EXEC (and EXECZ) immediately. No exercised title
             // writes EXEC halves via b32 scalar ops (wave64 compilers use the b64 forms), so
@@ -7702,7 +7739,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // ISA op 7: "D = ~S0; SCC = (D != 0)". (s_brev_b32 below has NO SCC write.)
                     d = b.iun(Op_Not, a); rs.sreg_srt.erase(in.dst.value);
                     rs.scc = b.ucmp(Op_INotEqual, d, b.uconst(0)); break;
-                case 0x0b:                                  // s_brev_b32
+                case kSop1OpcodeBrevB32:                     // s_brev_b32
                     d = b.iun(Op_BitReverse, a); rs.sreg_srt.erase(in.dst.value); break;
                 case 0x34: {                                // s_abs_i32
                     // Two's-complement absolute value.  OpISub deliberately preserves the ISA's
