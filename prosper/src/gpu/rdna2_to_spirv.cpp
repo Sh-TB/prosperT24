@@ -14774,6 +14774,28 @@ ShaderConstantValue shader_constant_operand(
             case 0x02: return {true, lhs.value + rhs.value}; // s_add_i32
             case 0x03: return {true, lhs.value - rhs.value}; // s_sub_i32
             case 0x0e: return {true, lhs.value & rhs.value}; // s_and_b32
+            case 0x10: return {true, lhs.value | rhs.value}; // s_or_b32
+            case 0x12: return {true, lhs.value ^ rhs.value}; // s_xor_b32
+            // Shifts take the amount from S1[4:0] -- RDNA2 ISA -- so the `& 31` is required.
+            //
+            // It is deliberately UNTESTED, because on this host it is untestable: x86 `shl` already
+            // masks its count to 5 bits, so an unmasked `lhs.value << rhs.value` yields the SAME
+            // answer here (measured: naive `5u << 32` prints 5). The mask is therefore not fixing a
+            // wrong result on x86; it is removing undefined behaviour that a compiler is entitled to
+            // exploit, and that would diverge on a host whose shift does not wrap. Do not add a
+            // regression arm claiming to prove it -- such an arm passes with the mask removed, which
+            // makes it a control that cannot fail. The arms below cover only what is observable:
+            // that these opcodes fold at all.
+            //
+            // Opcodes verified against llvm-mc (gfx1030), not against this file's own tables: the
+            // decoder that produces the listing you would otherwise check them with is upstream of
+            // them, so it cannot check them. #2481 records a mnemonic error that survived three
+            // internally consistent anchors and inverted a frontier conclusion.
+            case 0x1e: return {true, lhs.value << (rhs.value & 31u)};  // s_lshl_b32
+            case 0x20: return {true, lhs.value >> (rhs.value & 31u)};  // s_lshr_b32
+            case 0x22: return {true, static_cast<uint32_t>(            // s_ashr_i32
+                std::bit_cast<int32_t>(lhs.value) >> (rhs.value & 31u))};
+            case 0x26: return {true, lhs.value * rhs.value}; // s_mul_i32
             default: return {};
         }
     }
