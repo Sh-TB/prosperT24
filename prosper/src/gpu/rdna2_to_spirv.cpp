@@ -522,6 +522,15 @@ struct SpirvCompute {
     // mirror it exactly and bitcast back. The result is UNDEFINED when the operand is zero —
     // every caller must exclude that input rather than relying on a -1 that is not specified.
     uint32_t find_umsb(uint32_t a) { uint32_t ri = id(); putv(code, Op_ExtInst, {t_i32, ri, glsl, Glsl_FindUMsb, a}); return i2u(ri); }
+    // RDNA V_FFBH_U32 counts zeroes before the highest set bit and returns all ones for zero.
+    // FindUMsb returns the bit index instead and is undefined at zero, so keep the conversion and
+    // sentinel in one helper shared by ordinary ALU emission and portable dispatcher wave phases.
+    uint32_t ffbh_u32(uint32_t a) {
+        const uint32_t safe = ibin(Op_BitwiseOr, a, uconst(1));
+        const uint32_t leading_zeroes = ibin(Op_ISub, uconst(31), find_umsb(safe));
+        return sel(ucmp(Op_INotEqual, a, uconst(0)),
+                   leading_zeroes, uconst(0xffffffffu));
+    }
     // IEEE-754 binary32 ldexp on raw bits, with round-to-nearest-even for a subnormal result.
     // GLSL.std.450 Ldexp is NOT sufficient here: its contract leaves an overflowing product and
     // exp>128 undefined, while a guest exponent is an arbitrary i32. Keep the whole operation in
@@ -6428,8 +6437,23 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
                 return rs.sreg_bool.contains(base) &&
                        !rs.sreg_bool_b32.contains(base);
             };
-            if (is_b64_mask_base(o.value) ||
-                (o.value > 0 && is_b64_mask_base(o.value - 1))) {
+            int mask_base = -1;
+            if (is_b64_mask_base(o.value)) mask_base = o.value;
+            else if (o.value > 0 && is_b64_mask_base(o.value - 1))
+                mask_base = o.value - 1;
+            if (mask_base >= 0) {
+                // The Wave64 MUST analysis in the CFG dispatcher is the lifetime tag that proves
+                // this physical word still names the saved B64 predicate rather than recycled
+                // scalar scratch. An exact native subgroup can materialize that word directly;
+                // portable dispatchers handle the same FFBH shape in their synchronized common
+                // phase below.
+                if (b.is_compute && b.wave_size == 64 &&
+                    b.native_subgroup_size == 64) {
+                    const uint32_t half = b.native_wave_ballot_half(
+                        rs.sreg_bool.at(mask_base),
+                        static_cast<uint32_t>(o.value - mask_base));
+                    if (half) return half;
+                }
                 if (ok) *ok = false;
             }
             return b.uconst(0);
@@ -9227,7 +9251,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 case 0x36: d = b.fext1(Glsl_Cos, b.fbin(Op_FMul, a, b.uconst(fbits(6.28318530717958647692f)))); break;
                 case 0x37: d = b.iun(Op_Not, a); break;               // v_not_b32
                 case 0x38: d = b.iun(Op_BitReverse, a); break;        // v_bfrev_b32
-                case 0x39: {                                         // v_ffbh_u32 (plain e32)
+                case kVop1OpcodeFfbhU32: {                            // v_ffbh_u32 (plain e32)
                     // AMD RDNA2 ISA: count the zeroes preceding the first set bit from the MSB;
                     // return -1 when no bit is set. GLSL.std.450 FindUMsb instead returns the SET
                     // BIT INDEX (and all bits set at zero). OR bit zero in before calling it (which
@@ -9240,11 +9264,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // is not an integer source modifier and would silently change FFBH's operand.
                     // DPP reaches and rejects in the stage-specific source-transform block above.
                     if (in.has_sdwa || in.has_dpp) { ok = false; break; }
-                    const uint32_t safe = b.ibin(Op_BitwiseOr, a, b.uconst(1));
-                    const uint32_t leading_zeroes = b.ibin(
-                        Op_ISub, b.uconst(31), b.find_umsb(safe));
-                    d = b.sel(b.ucmp(Op_INotEqual, a, b.uconst(0)),
-                              leading_zeroes, b.uconst(0xffffffffu));
+                    d = b.ffbh_u32(a);
                     break;
                 }
                 case 0x43: {   // v_movrels_b32: dst = VGPR[src0# + M0] (relative-indexed VGPR read)
@@ -14514,6 +14534,17 @@ bool emit_cfg_state_machine(
         }
     }
 
+    // GTA V scans one physical dword of a saved Wave64 predicate with V_FFBH_U32. In the portable
+    // dispatcher the predicate exists only as one Bool per guest lane; no host subgroup-width
+    // contract exists from which operand_bits could form the complete SGPR word. Split every plain
+    // SGPR-fed candidate syntactically, then use the path-filtered B64 mask state at emission time to
+    // select the synchronized scratch phase below. Ordinary scalar-data inputs still use emit_alu.
+    auto portable_mask_ffbh_candidate = [&](const Rdna2Inst& in) {
+        return b.is_compute && b.wave_size == 64 && !b.native_subgroup_size &&
+            in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeFfbhU32 &&
+            in.src[0].kind == OperandKind::SGPR && !in.has_sdwa && !in.has_dpp;
+    };
+
     // Split at every branch target/fallthrough and around every cross-lane operation. Case values are
     // dense block indices, not guest PCs. A cross-lane op must end its block so the common synchronized
     // phase can publish its result before any invocation advances to the following guest instruction.
@@ -14534,6 +14565,8 @@ bool emit_cfg_state_machine(
     std::set<int> compute_dpp_row_ror8_dsts;
     uint32_t next_compute_dpp_event = 1;
     std::unordered_set<uint32_t> compute_dpp_add_row_mask_pcs;
+    std::unordered_map<uint32_t, uint32_t> portable_mask_ffbh_event_for_pc;
+    std::set<int> portable_mask_ffbh_dsts;
     for (size_t i = 0; i < ins.size(); ++i) {
         const auto& in = ins[i];
         if (in.is_end) break;
@@ -14589,6 +14622,14 @@ bool emit_cfg_state_machine(
         }
         if (compute_dpp_add_row_mask(in)) {
             compute_dpp_add_row_mask_pcs.insert(in.pc);
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
+        if (portable_mask_ffbh_candidate(in)) {
+            portable_mask_ffbh_event_for_pc.emplace(
+                in.pc, static_cast<uint32_t>(portable_mask_ffbh_event_for_pc.size() + 1));
+            portable_mask_ffbh_dsts.insert(in.dst.value);
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
@@ -16007,6 +16048,19 @@ bool emit_cfg_state_machine(
         ? b.function_var(b.t_u32, ptr_u32) : 0;
     const uint32_t dpp_ror8_event_var = has_portable_compute_dpp_ror8
         ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const bool has_portable_mask_ffbh = !portable_mask_ffbh_event_for_pc.empty();
+    const uint32_t mask_ffbh_pending_var = has_portable_mask_ffbh
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t mask_ffbh_mask_var = has_portable_mask_ffbh
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t mask_ffbh_write_var = has_portable_mask_ffbh
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t mask_ffbh_event_var = has_portable_mask_ffbh
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t mask_ffbh_half_var = has_portable_mask_ffbh
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t mask_ffbh_dst_var = has_portable_mask_ffbh
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
 
     const uint32_t zero = b.uconst(0), no = b.bfalse(), yes = b.btrue();
     for (const auto& kv : vv) {
@@ -16075,6 +16129,11 @@ bool emit_cfg_state_machine(
         b.store_function(dpp_ror8_op_var, zero);
         b.store_function(dpp_ror8_dst_var, zero);
         b.store_function(dpp_ror8_event_var, zero);
+    }
+    if (has_portable_mask_ffbh) {
+        b.store_function(mask_ffbh_event_var, zero);
+        b.store_function(mask_ffbh_half_var, zero);
+        b.store_function(mask_ffbh_dst_var, zero);
     }
 
     auto load_state = [&](uint32_t dispatch = UINT32_MAX) {
@@ -16315,6 +16374,12 @@ bool emit_cfg_state_machine(
         b.store_function(dpp_ror8_active_var, no);
         b.store_function(dpp_ror8_event_var, zero);
     }
+    if (has_portable_mask_ffbh) {
+        b.store_function(mask_ffbh_pending_var, no);
+        b.store_function(mask_ffbh_mask_var, no);
+        b.store_function(mask_ffbh_write_var, no);
+        b.store_function(mask_ffbh_event_var, zero);
+    }
     b.emit_loopmerge(loop_merge, loop_continue);
     b.emit_branch(switch_header);
     b.emit_label(switch_header);
@@ -16369,6 +16434,7 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* dpp_add_row_shr = nullptr;
         const Rdna2Inst* dpp_row_ror8 = nullptr;
         const Rdna2Inst* dpp_add_row_mask = nullptr;
+        const Rdna2Inst* mask_ffbh = nullptr;
         const Rdna2Inst* mask_compare = nullptr;
         const Rdna2Inst* exec_saved_mask_compare = nullptr;
         const Rdna2Inst* saved_mask_pair_compare = nullptr;
@@ -16389,6 +16455,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_dpp_add_row_shr = nullptr;
             const Rdna2Inst* block_dpp_row_ror8 = nullptr;
             const Rdna2Inst* block_dpp_add_row_mask = nullptr;
+            const Rdna2Inst* block_mask_ffbh = nullptr;
             const Rdna2Inst* block_mask_compare = nullptr;
             const Rdna2Inst* block_exec_saved_mask_compare = nullptr;
             const Rdna2Inst* block_saved_mask_pair_compare = nullptr;
@@ -16453,6 +16520,25 @@ bool emit_cfg_state_machine(
                                      in.dpp_row_mask);
                     block_dpp_add_row_mask = &in;
                     break;
+                }
+                if (portable_mask_ffbh_candidate(in) &&
+                    !state.sreg.contains(in.src[0].value) &&
+                    !state.sreg_input.contains(in.src[0].value)) {
+                    const int source = in.src[0].value;
+                    const bool source_is_b64_base = state.sreg_bool.contains(source) &&
+                        !state.sreg_bool_b32.contains(source);
+                    const bool previous_is_b64_base = source > 0 &&
+                        state.sreg_bool.contains(source - 1) &&
+                        !state.sreg_bool_b32.contains(source - 1);
+                    if (source_is_b64_base || previous_is_b64_base) {
+                        if (getenv("PROSPER_DBG"))
+                            std::fprintf(stderr,
+                                         "[compute-cfg-mask-ffbh] pc=%u source=s%d half=%u\n",
+                                         in.pc, source,
+                                         source_is_b64_base ? 0u : 1u);
+                        block_mask_ffbh = &in;
+                        break;
+                    }
                 }
                 const int mask_compare_source =
                     mask_zero_compare_candidate_source(in);
@@ -16583,7 +16669,7 @@ bool emit_cfg_state_machine(
                 if (block_mbcnt || block_append || block_swizzle ||
                     block_dpp_min_row_shr || block_dpp_add_row_shr ||
                     block_dpp_row_ror8 ||
-                    block_dpp_add_row_mask || block_mask_compare ||
+                    block_dpp_add_row_mask || block_mask_ffbh || block_mask_compare ||
                     block_exec_saved_mask_compare || block_saved_mask_pair_compare ||
                     block_vopc_mask_compare ||
                     block_b64_mask_scc_vote ||
@@ -16600,11 +16686,35 @@ bool emit_cfg_state_machine(
             dpp_add_row_shr = block_dpp_add_row_shr;
             dpp_row_ror8 = block_dpp_row_ror8;
             dpp_add_row_mask = block_dpp_add_row_mask;
+            mask_ffbh = block_mask_ffbh;
             mask_compare = block_mask_compare;
             exec_saved_mask_compare = block_exec_saved_mask_compare;
             saved_mask_pair_compare = block_saved_mask_pair_compare;
             vopc_mask_compare = block_vopc_mask_compare;
             b64_mask_scc_vote = block_b64_mask_scc_vote;
+        }
+        if (mask_ffbh) {
+            const int source = mask_ffbh->src[0].value;
+            int mask_base = source;
+            auto mask = state.sreg_bool.find(mask_base);
+            if (mask == state.sreg_bool.end() || state.sreg_bool_b32.contains(mask_base)) {
+                mask_base = source - 1;
+                mask = state.sreg_bool.find(mask_base);
+            }
+            const auto event = portable_mask_ffbh_event_for_pc.find(mask_ffbh->pc);
+            if (source < 0 || mask_base < 0 || source - mask_base < 0 ||
+                source - mask_base > 1 || mask == state.sreg_bool.end() ||
+                state.sreg_bool_b32.contains(mask_base) ||
+                event == portable_mask_ffbh_event_for_pc.end())
+                return reject_cfg(mask_ffbh->pc, "mask-ffbh-source");
+            b.store_function(mask_ffbh_pending_var, yes);
+            b.store_function(mask_ffbh_mask_var, mask->second);
+            b.store_function(mask_ffbh_write_var, state.exec);
+            b.store_function(mask_ffbh_event_var, b.uconst(event->second));
+            b.store_function(mask_ffbh_half_var,
+                b.uconst(static_cast<uint32_t>(source - mask_base)));
+            b.store_function(mask_ffbh_dst_var,
+                b.uconst(static_cast<uint32_t>(mask_ffbh->dst.value)));
         }
         if (mbcnt) {
             if (graphics) {
@@ -16984,7 +17094,10 @@ bool emit_cfg_state_machine(
             }
         }
         save_state(state, dispatch);
-        if (mbcnt) {
+        if (mask_ffbh) {
+            if (!set_next(mask_ffbh->pc + mask_ffbh->len_dwords))
+                return reject_cfg(mask_ffbh->pc, "mask-ffbh-successor");
+        } else if (mbcnt) {
             if (!set_next(mbcnt->pc + mbcnt->len_dwords))
                 return reject_cfg(mbcnt->pc, "mbcnt-successor");
         } else if (append) {
@@ -17427,6 +17540,96 @@ bool emit_cfg_state_machine(
         b.uconst(b.wave_size == 32 ? 5u : 6u));
     const uint32_t mbcnt_lane = b.ibin(
         Op_BitwiseAnd, b.linear_localid, b.uconst(b.wave_size - 1));
+
+    if (has_portable_mask_ffbh) {
+    // Portable Wave64 saved-mask FFBH phase. Each publishing lane contributes its one predicate bit
+    // with a static-event tag. Lane zero assembles the selected architectural 32-bit half in LDS,
+    // after which every lane applies the ordinary V_FFBH_U32 semantics and predicates the VGPR
+    // write by its own EXEC. This deliberately does not use a host subgroup ballot: the portable
+    // route has no exact-width contract, and a narrower ballot would silently lose guest lanes.
+    const uint32_t mask_ffbh_pending =
+        b.load_function(b.t_bool, mask_ffbh_pending_var);
+    const uint32_t mask_ffbh_mask = b.load_function(b.t_bool, mask_ffbh_mask_var);
+    const uint32_t mask_ffbh_tag = b.load_function(b.t_u32, mask_ffbh_event_var);
+    const uint32_t mask_ffbh_encoded = b.sel(
+        mask_ffbh_pending,
+        b.ibin(Op_BitwiseOr,
+               b.ibin(Op_ShiftLeftLogical, mask_ffbh_tag, b.uconst(1)),
+               b.sel(mask_ffbh_mask, b.uconst(1), zero)),
+        zero);
+    b.cfg_scratch_store(b.linear_localid, mask_ffbh_encoded);
+    b.barrier();
+
+    const uint32_t mask_ffbh_leader = b.id(), mask_ffbh_assembled = b.id();
+    const uint32_t mask_ffbh_is_leader = b.land(
+        mask_ffbh_pending, b.ucmp(Op_IEqual, mbcnt_lane, zero));
+    b.emit_selmerge(mask_ffbh_assembled);
+    b.emit_condbranch(mask_ffbh_is_leader, mask_ffbh_leader, mask_ffbh_assembled);
+    b.emit_label(mask_ffbh_leader);
+    const uint32_t mask_ffbh_wave_base = b.ibin(
+        Op_ShiftLeftLogical, mbcnt_wave_index, b.uconst(6));
+    const uint32_t mask_ffbh_half = b.load_function(b.t_u32, mask_ffbh_half_var);
+    uint32_t mask_ffbh_word = zero;
+    for (uint32_t bit = 0; bit < 32; ++bit) {
+        const uint32_t candidate_lane = b.ibin(
+            Op_IAdd, b.uconst(bit),
+            b.ibin(Op_ShiftLeftLogical, mask_ffbh_half, b.uconst(5)));
+        const uint32_t candidate_index = b.ibin(
+            Op_IAdd, mask_ffbh_wave_base, candidate_lane);
+        const uint32_t candidate = b.cfg_scratch_load(candidate_index);
+        const uint32_t candidate_tag = b.ibin(
+            Op_ShiftRightLogical, candidate, b.uconst(1));
+        uint32_t include = b.ucmp(Op_IEqual, candidate_tag, mask_ffbh_tag);
+        include = b.land(
+            include, b.ucmp(Op_ULessThan, candidate_index, b.uconst(b.local_count)));
+        const uint32_t candidate_bit = b.ibin(
+            Op_BitwiseAnd, candidate, b.uconst(1));
+        const uint32_t positioned = b.ibin(
+            Op_ShiftLeftLogical, candidate_bit, b.uconst(bit));
+        mask_ffbh_word = b.ibin(
+            Op_BitwiseOr, mask_ffbh_word, b.sel(include, positioned, zero));
+    }
+    b.cfg_scratch_store(
+        b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index),
+        mask_ffbh_word);
+    b.emit_branch(mask_ffbh_assembled);
+    b.emit_label(mask_ffbh_assembled);
+    b.barrier();
+
+    const uint32_t mask_ffbh_result = b.ffbh_u32(b.cfg_scratch_load(
+        b.ibin(Op_IAdd, b.uconst(wave_result_base), mbcnt_wave_index)));
+    const uint32_t mask_ffbh_dst = b.load_function(b.t_u32, mask_ffbh_dst_var);
+    const uint32_t mask_ffbh_write = b.land(
+        mask_ffbh_pending, b.load_function(b.t_bool, mask_ffbh_write_var));
+    for (int reg : portable_mask_ffbh_dsts) {
+        const auto destination = vv.find(reg);
+        if (destination == vv.end()) return reject_cfg(0, "missing-mask-ffbh-dst");
+        const uint32_t selected = b.land(
+            mask_ffbh_write,
+            b.ucmp(Op_IEqual, mask_ffbh_dst, b.uconst(static_cast<uint32_t>(reg))));
+        const uint32_t old = b.load_function(b.t_u32, destination->second);
+        b.store_function(destination->second, b.sel(selected, mask_ffbh_result, old));
+    }
+    // As for every ordinary VALU destination, the physical write ends scalar-spill aliases even
+    // where EXEC suppresses this lane's data update.
+    for (const auto& kv : lv) {
+        const uint32_t selected = b.land(
+            mask_ffbh_pending,
+            b.ucmp(Op_IEqual, mask_ffbh_dst,
+                   b.uconst(static_cast<uint32_t>(kv.first.first))));
+        const uint32_t old = b.load_function(b.t_u32, kv.second);
+        b.store_function(kv.second, b.sel(selected, zero, old));
+    }
+    for (const auto& kv : lmv) {
+        const uint32_t selected = b.land(
+            mask_ffbh_pending,
+            b.ucmp(Op_IEqual, mask_ffbh_dst,
+                   b.uconst(static_cast<uint32_t>(kv.first.first))));
+        const uint32_t old = b.load_function(b.t_bool, kv.second);
+        b.store_function(kv.second, b.bsel(selected, no, old));
+    }
+    b.barrier();
+    }
 
     if (!mbcnt_event_for_pc.empty()) {
     const uint32_t mbcnt_pending = b.load_function(b.t_bool, mbcnt_pending_var);
