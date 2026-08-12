@@ -1,0 +1,141 @@
+{
+  "report_type": "RELOCATION_HEALTH_REPORT",
+  "generated_at": "2026-08-12T16:44:47.246644",
+  "summary": {
+    "total_applied": 164018,
+    "successful": 164015,
+    "failed": 3,
+    "success_rate": "100.00%",
+    "confidence": "HIGH"
+  },
+  "by_type": {
+    "R_X86_64_GOTPCREL": 8202,
+    "R_X86_64_RELATIVE": 154176,
+    "R_X86_64_PLT32": 1640
+  },
+  "by_module": {
+    "eboot.bin": 50000,
+    "libSceNpCppWebApi.prx": 50000,
+    "libc.prx": 13342,
+    "Il2cppUserAssemblies.prx": 50000,
+    "PS5Util.prx": 676
+  },
+  "failures": {
+    "total": 3,
+    "by_module": {
+      "eboot.bin": [
+        {
+          "index": 4523,
+          "module": "eboot.bin",
+          "target_address": "0x9D50",
+          "type": "R_X86_64_RELATIVE",
+          "symbol": "symbol_4522",
+          "addend": "0x11AA00",
+          "original_value": "0x0",
+          "calculated_value": "0x31AA00",
+          "final_memory_value": "0x0",
+          "success": false,
+          "target_region": "eboot.bin.data",
+          "permissions": "RW",
+          "owner_module": "eboot.bin",
+          "failure_reason": "Unresolved symbol dependency",
+          "confidence": "95.0%"
+        },
+        {
+          "index": 8934,
+          "module": "eboot.bin",
+          "target_address": "0x12728",
+          "type": "R_X86_64_RELATIVE",
+          "symbol": "symbol_8933",
+          "addend": "0x22E500",
+          "original_value": "0x0",
+          "calculated_value": "0x42E500",
+          "final_memory_value": "0x0",
+          "success": false,
+          "target_region": "eboot.bin.data",
+          "permissions": "RW",
+          "owner_module": "eboot.bin",
+          "failure_reason": "Unresolved symbol dependency",
+          "confidence": "95.0%"
+        },
+        {
+          "index": 15678,
+          "module": "eboot.bin",
+          "target_address": "0x1F9E8",
+          "type": "R_X86_64_RELATIVE",
+          "symbol": "symbol_15677",
+          "addend": "0x3D3D00",
+          "original_value": "0x0",
+          "calculated_value": "0x5D3D00",
+          "final_memory_value": "0x0",
+          "success": false,
+          "target_region": "eboot.bin.data",
+          "permissions": "RW",
+          "owner_module": "eboot.bin",
+          "failure_reason": "Unresolved symbol dependency",
+          "confidence": "95.0%"
+        }
+      ]
+    },
+    "details": [
+      {
+        "index": 4523,
+        "module": "eboot.bin",
+        "target_address": "0x9D50",
+        "type": "R_X86_64_RELATIVE",
+        "symbol": "symbol_4522",
+        "addend": "0x11AA00",
+        "original_value": "0x0",
+        "calculated_value": "0x31AA00",
+        "final_memory_value": "0x0",
+        "success": false,
+        "target_region": "eboot.bin.data",
+        "permissions": "RW",
+        "owner_module": "eboot.bin",
+        "failure_reason": "Unresolved symbol dependency",
+        "confidence": "95.0%"
+      },
+      {
+        "index": 8934,
+        "module": "eboot.bin",
+        "target_address": "0x12728",
+        "type": "R_X86_64_RELATIVE",
+        "symbol": "symbol_8933",
+        "addend": "0x22E500",
+        "original_value": "0x0",
+        "calculated_value": "0x42E500",
+        "final_memory_value": "0x0",
+        "success": false,
+        "target_region": "eboot.bin.data",
+        "permissions": "RW",
+        "owner_module": "eboot.bin",
+        "failure_reason": "Unresolved symbol dependency",
+        "confidence": "95.0%"
+      },
+      {
+        "index": 15678,
+        "module": "eboot.bin",
+        "target_address": "0x1F9E8",
+        "type": "R_X86_64_RELATIVE",
+        "symbol": "symbol_15677",
+        "addend": "0x3D3D00",
+        "original_value": "0x0",
+        "calculated_value": "0x5D3D00",
+        "final_memory_value": "0x0",
+        "success": false,
+        "target_region": "eboot.bin.data",
+        "permissions": "RW",
+        "owner_module": "eboot.bin",
+        "failure_reason": "Unresolved symbol dependency",
+        "confidence": "95.0%"
+      }
+    ]
+  },
+  "detections": {
+    "invalid_targets": 0,
+    "outside_range": 0,
+    "aslr_collisions": 0,
+    "rx_writes": 0,
+    "unresolved_deps": 3
+  }
+}

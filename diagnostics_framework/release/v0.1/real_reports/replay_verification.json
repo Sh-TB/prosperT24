@@ -1,0 +1,33 @@
+{
+  "report_type": "REPLAY_VERIFICATION",
+  "generated_at": "2026-08-12T16:44:47.278061",
+  "replay_deterministic": true,
+  "methodology": {
+    "step_1": "Run emulator until crash point",
+    "step_2": "Capture complete diagnostic state to replay package",
+    "step_3": "Reset emulator state",
+    "step_4": "Load and execute replay package",
+    "step_5": "Compare diagnostic outputs byte-for-byte"
+  },
+  "verification_results": {
+    "events_match": true,
+    "different_event_count": 0,
+    "first_divergence": null,
+    "timing_variance_us": 0,
+    "state_machine_matches": true,
+    "crash_reproduced": true,
+    "registers_identical": true
+  },
+  "replay_package": {
+    "includes": [
+      "event_sequence.json",
+      "state_transitions.json",
+      "timing_data.json",
+      "module_load_order.json",
+      "relocation_log.json",
+      "import_calls.json"
+    ],
+    "integrity_check": "SHA256 checksum verified",
+    "size_kb": 145
+  }
+}

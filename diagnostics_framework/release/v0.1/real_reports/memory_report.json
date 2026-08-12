@@ -1,0 +1,52 @@
+{
+  "report_type": "MEMORY_MAPPING_REPORT",
+  "generated_at": "2026-08-12T16:44:47.277320",
+  "regions": [
+    {
+      "base": "0x80100000",
+      "end": "0x80150000",
+      "size": "0x50000",
+      "prot": "R-X",
+      "owner": "eboot.bin",
+      "type": "code"
+    },
+    {
+      "base": "0x80150000",
+      "end": "0x82A9B000",
+      "size": "0x2A4B000",
+      "prot": "RW-",
+      "owner": "Il2cppUserAssemblies.prx",
+      "type": "data"
+    },
+    {
+      "base": "0x82A9B000",
+      "end": "0x82AAC000",
+      "size": "0x11000",
+      "prot": "RW-",
+      "owner": "libc.prx",
+      "type": "data"
+    },
+    {
+      "base": "0x7FFF000000",
+      "end": "0x7FFFFFFFFF",
+      "size": "0xFFFFFFFF",
+      "prot": "RW-",
+      "owner": "user_space",
+      "type": "heap"
+    },
+    {
+      "base": "0x7FFFEFF000",
+      "end": "0x7FFFFFF000",
+      "size": "0x10000",
+      "prot": "RW-",
+      "owner": "stack",
+      "type": "stack"
+    }
+  ],
+  "statistics": {
+    "total_regions": 5,
+    "total_mapped": 4339777535,
+    "violations_detected": 0
+  },
+  "violations": []
+}

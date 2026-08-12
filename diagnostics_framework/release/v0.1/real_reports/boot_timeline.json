@@ -1,0 +1,63 @@
+{
+  "report_type": "BOOT_TIMELINE",
+  "generated_at": "2026-08-12T16:44:47.182400",
+  "total_duration_ms": 358.39404296875,
+  "states": [
+    {
+      "state": "LOADER_INIT",
+      "timestamp": "2026-08-12T16:44:46.804031",
+      "duration_from_previous_ms": 0,
+      "success": true
+    },
+    {
+      "state": "MODULE_LOAD",
+      "timestamp": "2026-08-12T16:44:46.804103",
+      "duration_from_previous_ms": 0.072021484375,
+      "success": true
+    },
+    {
+      "state": "SEGMENTS_MAPPED",
+      "timestamp": "2026-08-12T16:44:46.804164",
+      "duration_from_previous_ms": 0.061279296875,
+      "success": true
+    },
+    {
+      "state": "RELOCATION",
+      "timestamp": "2026-08-12T16:44:46.804174",
+      "duration_from_previous_ms": 0.010009765625,
+      "success": true
+    },
+    {
+      "state": "IMPORT_RESOLUTION",
+      "timestamp": "2026-08-12T16:44:47.152100",
+      "duration_from_previous_ms": 347.925537109375,
+      "success": true
+    },
+    {
+      "state": "INIT",
+      "timestamp": "2026-08-12T16:44:47.152259",
+      "duration_from_previous_ms": 0.158935546875,
+      "success": true
+    },
+    {
+      "state": "RUNNING",
+      "timestamp": "2026-08-12T16:44:47.152272",
+      "duration_from_previous_ms": 0.01318359375,
+      "success": true
+    },
+    {
+      "state": "FIRST_RENDER",
+      "timestamp": "2026-08-12T16:44:47.162368",
+      "duration_from_previous_ms": 10.096435546875,
+      "success": true
+    },
+    {
+      "state": "BOOT_COMPLETE",
+      "timestamp": "2026-08-12T16:44:47.162425",
+      "duration_from_previous_ms": 0.056640625,
+      "success": true
+    }
+  ],
+  "final_state": "CRASHED",
+  "success": false
+}

@@ -1,0 +1,87 @@
+{
+  "report_type": "CRASH_SNAPSHOT",
+  "snapshot_id": "snap_1786553087162_755aae5d",
+  "timestamp": "2026-08-12T16:44:47.162446",
+  "signal": 11,
+  "fault_address": "0x801E518C8",
+  "registers": {
+    "RIP": "0x801E518C0",
+    "RSP": "0x7FFFEFF800",
+    "RBP": "0x7FFFEFF830",
+    "RAX": "0x0",
+    "RBX": "0x80100000",
+    "RCX": "0x801E518C8",
+    "RDX": "0x100",
+    "RSI": "0x0",
+    "RDI": "0x0",
+    "R8": "0x0",
+    "R15": "0xBADD2E0"
+  },
+  "code_bytes_around_rip": [
+    "0x48",
+    "0x8B",
+    "0x00"
+  ],
+  "loaded_modules": [
+    {
+      "name": "eboot.bin",
+      "base": "0x0",
+      "size": 32697964
+    },
+    {
+      "name": "libSceNpCppWebApi.prx",
+      "base": "0x0",
+      "size": 7954839
+    },
+    {
+      "name": "libc.prx",
+      "base": "0x0",
+      "size": 1334282
+    },
+    {
+      "name": "Il2cppUserAssemblies.prx",
+      "base": "0x0",
+      "size": 74726132
+    },
+    {
+      "name": "PS5Util.prx",
+      "base": "0x0",
+      "size": 67668
+    }
+  ],
+  "memory_regions": [
+    {
+      "base": "0x80100000",
+      "size": "0x50000",
+      "prot": "R-X",
+      "owner": "eboot.bin"
+    },
+    {
+      "base": "0x80150000",
+      "size": "0x2A4B000",
+      "prot": "RW-",
+      "owner": "Il2cppUserAssemblies.prx"
+    },
+    {
+      "base": "0x7FFFEFF000",
+      "size": "0x1000",
+      "prot": "RW-",
+      "owner": "stack"
+    }
+  ],
+  "recent_events_count": 14,
+  "boot_state_at_crash": "BOOT_COMPLETE",
+  "auto_analysis": {
+    "likely_cause": "Unknown cause - insufficient evidence",
+    "confidence": "25%",
+    "hypotheses_count": 2,
+    "rejected_hypotheses_count": 1,
+    "summary": "Crash analysis generated 2 hypotheses. Most likely cause: Unknown cause - insufficient evidence (confidence: 25%). NOTE: This is an automated assessment requiring human verification.",
+    "recommended_actions": [
+      "Review relocation failures in detail",
+      "Check for unresolved symbols in dependent modules",
+      "Verify ASLR base addresses match expected values",
+      "Examine caller of any missing imports"
+    ]
+  }
+}
