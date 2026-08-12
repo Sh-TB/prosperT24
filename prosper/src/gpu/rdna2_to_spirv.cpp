@@ -431,6 +431,15 @@ struct SpirvCompute {
     // that exact PC.  The proof is separate from Function-variable presence: dispatcher variables
     // have zero placeholders on paths where no scalar definition reaches the block.
     std::unordered_set<uint32_t> vcc_b32_scalar_pair_pcs;
+    // The same dispatcher analysis separately proves that both encoded inputs to a B32 VCC write
+    // are scalar words on every path reaching that exact PC. Dispatcher Function variables exist
+    // for mask-only lifetimes too, so map membership alone must never select the scalar lowering.
+    std::unordered_set<uint32_t> vcc_b32_scalar_result_pcs;
+    // Exact structured-CFG consumers whose source pair is a saved Wave64 VCC mask on every
+    // incoming path. S_MOV_B64 also materializes ballot words, so emit_alu needs this separate
+    // lifetime fact to select the Bool-domain value at the consumer without guessing from maps.
+    bool structured_wave64_mask_reduction_analysis_done = false;
+    std::unordered_set<uint32_t> structured_wave64_mask_reduction_pcs;
     // Exact Wave64 mask spills retain a Bool view in vgpr_lane_mask_slots. When a CFG MUST proof
     // also identifies which physical ballot half the slot represents, V_READLANE can publish the
     // corresponding scalar dword without guessing from the SGPR number or spill lane.
@@ -4260,11 +4269,14 @@ bool is_wave64_vcc_lo_scalar_b32_candidate(const Rdna2Inst& in) {
 }
 
 std::unordered_set<uint32_t> proven_wave64_vcc_b32_low_only_pcs(
-        const std::vector<Rdna2Inst>& ins) {
+        const std::vector<Rdna2Inst>& ins, bool include_logical = true) {
     std::unordered_set<uint32_t> result;
     for (const Rdna2Inst& in : ins) {
         if (in.is_end) break;
-        if (is_wave64_vcc_lo_scalar_b32_candidate(in) &&
+        const bool candidate = include_logical
+            ? is_wave64_vcc_lo_scalar_b32_candidate(in)
+            : is_gtav_wave64_vcc_lo_scalar_cselect(in);
+        if (candidate &&
             sgpr_dead_at_merge(ins, in.pc + in.len_dwords, 107))
             result.insert(in.pc);
     }
@@ -5594,7 +5606,7 @@ uint32_t scalar_write_width(const Rdna2Inst& in) {
         case Rdna2Format::SOP1:
             if (in.opcode == 0x20) return 0; // s_setpc_b64 reads its decoded "dst" field.
             switch (in.opcode) {
-                case 0x04: case 0x08: case 0x0a: case 0x1f:
+                case 0x04: case 0x08: case 0x0a: case 0x1f: case 0x2d:
                 case 0x24: case 0x25: case 0x26: case 0x27:
                 case 0x28: case 0x29: case 0x2a: case 0x2b:
                 case 0x37: case 0x38:
@@ -5631,16 +5643,18 @@ uint32_t scalar_write_width(const Rdna2Inst& in) {
 uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
     switch (in.fmt) {
         case Rdna2Format::SOP1:
-            if (in.opcode == 0x1f) return UINT32_MAX; // s_getpc has no source
-            if (in.opcode == 0x10 || in.opcode == 0x14 || in.opcode == 0x16 ||
-                in.opcode == 0x18 || in.opcode == 0x2d)
+            if (in.opcode == kSop1OpcodeGetpcB64) return UINT32_MAX; // s_getpc has no source
+            if (in.opcode == kSop1OpcodeBcnt1I32B64 ||
+                in.opcode == kSop1OpcodeFf1I32B64 ||
+                in.opcode == kSop1OpcodeFlbitI32B64 ||
+                in.opcode == 0x18 || in.opcode == kSop1OpcodeQuadmaskB64)
                 return 2;                    // bcnt/ff1/flbit consume a B64 pair
             return scalar_write_width(in) == 1 ? 1u : 2u;
         case Rdna2Format::SOP2:
             if (in.opcode == 0x1f || in.opcode == 0x21)
                 return source == 1 ? 1u : 2u; // B64 shifts use a B32 shift count
-            if (in.opcode == 0x25) return 1;  // BFM width and offset are B32
-            if (in.opcode == 0x29)
+            if (in.opcode == kSop2OpcodeBfmB64) return 1;  // BFM width and offset are B32
+            if (in.opcode == kSop2OpcodeBfeU64)
                 return source == 1 ? 1u : 2u;
             return scalar_write_width(in) == 1 ? 1u : 2u;
         case Rdna2Format::SOPC:
@@ -5687,11 +5701,11 @@ uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in) {
     }
     if (in.fmt != Rdna2Format::SOP1) return 0;
     switch (in.opcode) {
-        case 0x05: return 1; // s_cmov_b32
-        case 0x06: return 2; // s_cmov_b64
-        case 0x1b: return 1; // s_bitset0_b32
+        case kSop1OpcodeCmovB32: return 1;
+        case kSop1OpcodeCmovB64: return 2;
+        case kSop1OpcodeBitset0B32: return 1;
         case 0x1c: return 2; // s_bitset0_b64
-        case 0x1d: return 1; // s_bitset1_b32
+        case kSop1OpcodeBitset1B32: return 1;
         case 0x1e: return 2; // s_bitset1_b64
         default: return 0;
     }
@@ -5712,7 +5726,110 @@ void for_each_scalar_write(const Rdna2Inst& in, Visitor&& visit,
     if (vop3_writes_mask_sdst(in))
         visit(in.sdst.value, wave32_one_word_masks &&
                               ((in.opcode >= 0x128 && in.opcode <= 0x12a) ||
-                               vop3b_fresh_carry_output(in)) ? 1u : 2u);
+                              vop3b_fresh_carry_output(in)) ? 1u : 2u);
+}
+
+// S_MOV_B64 from VCC publishes both an exact Bool-domain saved mask and its two ballot words under
+// native Wave64. The compact structured emitter preserves both views through its SSA/PHI machinery,
+// but unlike the dispatcher it previously had no lifetime tag telling S_FF1/S_BCNT which view owns
+// the pair at an exact consumer. Compute a small forward MUST analysis over the decoded scalar CFG:
+// a saved-mask fact is generated only by an exact VCC copy reached from a proved mask-domain VCC,
+// every overlapping scalar write kills it, and joins retain it only when every reachable predecessor
+// agrees. Indirect PC updates have no successor, so they cannot manufacture a dominance fact beyond
+// an unknown transfer.
+std::unordered_set<uint32_t> proven_structured_wave64_mask_reduction_pcs(
+        const std::vector<Rdna2Inst>& ins) {
+    size_t count = 0;
+    while (count < ins.size() && !ins[count].is_end) ++count;
+    if (!count) return {};
+
+    std::unordered_map<uint32_t, size_t> index_for_pc;
+    for (size_t i = 0; i < count; ++i) index_for_pc.emplace(ins[i].pc, i);
+
+    std::vector<std::set<int>> incoming(count);
+    std::vector<bool> reachable(count, false);
+    std::vector<size_t> pending{0};
+    reachable[0] = true;
+    while (!pending.empty()) {
+        const size_t index = pending.back();
+        pending.pop_back();
+        std::set<int> saved = incoming[index];
+        const Rdna2Inst& in = ins[index];
+
+        for_each_scalar_write(in, [&](int base, uint32_t width) {
+            for (auto it = saved.begin(); it != saved.end();) {
+                const int root = *it;
+                if (base < root + 2 && root < base + static_cast<int>(width))
+                    it = saved.erase(it);
+                else
+                    ++it;
+            }
+        }, /*wave32_one_word_masks=*/false);
+        if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
+            in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 && in.dst.value <= 105 &&
+            in.src[0].kind == OperandKind::Special && in.src[0].value == 106 &&
+            saved.contains(106))
+            saved.insert(in.dst.value);
+        // A non-CMPX vector compare writes a fresh architectural VCC predicate. This deliberately
+        // stays narrower than the dispatcher's general mask transfer: the structured override only
+        // needs to certify the captured VOPC -> S_MOV_B64 -> reduction chain, and an ordinary scalar
+        // VCC write above kills the fact before it can seed a saved pair.
+        if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) {
+            const int mask_destination =
+                in.dst.kind == OperandKind::SGPR && in.dst.value <= 105
+                    ? in.dst.value : 106;
+            saved.insert(mask_destination);
+        }
+
+        std::vector<size_t> successors;
+        auto add_successor = [&](uint32_t pc) {
+            const auto found = index_for_pc.find(pc);
+            if (found != index_for_pc.end() &&
+                std::find(successors.begin(), successors.end(), found->second) == successors.end())
+                successors.push_back(found->second);
+        };
+        const bool indirect_pc = in.fmt == Rdna2Format::SOP1 &&
+            in.opcode >= kSop1OpcodeSetpcB64 && in.opcode <= kSop1OpcodeRfeB64;
+        if (!indirect_pc && in.fmt == Rdna2Format::SOPP &&
+            sopp_opcode_is_direct_branch(in.opcode)) {
+            add_successor(branch_target(in));
+            if (in.opcode != kSoppOpcodeBranch && index + 1 < count)
+                successors.push_back(index + 1);
+        } else if (!indirect_pc && in.fmt == Rdna2Format::SOPP && in.opcode == 0x12u) {
+            // S_TRAP transfers control outside the decoded shader stream.
+        } else if (!indirect_pc && index + 1 < count) {
+            successors.push_back(index + 1);
+        }
+
+        for (size_t successor : successors) {
+            if (!reachable[successor]) {
+                reachable[successor] = true;
+                incoming[successor] = saved;
+                pending.push_back(successor);
+                continue;
+            }
+            std::set<int> joined;
+            std::set_intersection(
+                incoming[successor].begin(), incoming[successor].end(),
+                saved.begin(), saved.end(), std::inserter(joined, joined.end()));
+            if (joined != incoming[successor]) {
+                incoming[successor] = std::move(joined);
+                pending.push_back(successor);
+            }
+        }
+    }
+
+    std::unordered_set<uint32_t> proven;
+    for (size_t i = 0; i < count; ++i) {
+        const Rdna2Inst& in = ins[i];
+        if (!reachable[i] || in.fmt != Rdna2Format::SOP1 ||
+            (in.opcode != kSop1OpcodeBcnt1I32B64 &&
+             in.opcode != kSop1OpcodeFf1I32B64) ||
+            in.src[0].kind != OperandKind::SGPR)
+            continue;
+        if (incoming[i].contains(in.src[0].value)) proven.insert(in.pc);
+    }
+    return proven;
 }
 
 // Prove GTA V's S_LOAD_DWORDX2 descriptor-fragment shapes: the general register-offset table fetch
@@ -7081,7 +7198,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
             }
             if (b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64 &&
-                in.opcode == 0x14) { // s_ff1_i32_b64
+                in.opcode == kSop1OpcodeFf1I32B64) { // s_ff1_i32_b64
                 // RDNA2 scans the complete 64-bit source from its least-significant bit and
                 // returns the first set index, or 0xffffffff for an empty mask.  The captured GTA
                 // compute sites feed EXEC, VCC, or a VOPC-saved mask pair into this scalar result.
@@ -7098,8 +7215,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (in.src[0].kind == OperandKind::Special && source == 126) {
                     mask = rs.exec;
                 } else {
-                    const bool competing_data = data_word_present(source) ||
-                        data_word_present(source + 1);
+                    const bool proven_saved_mask =
+                        b.structured_wave64_mask_reduction_pcs.contains(in.pc);
+                    const bool competing_data = !proven_saved_mask &&
+                        (data_word_present(source) || data_word_present(source + 1));
                     if (!competing_data && source == 106) {
                         mask = rs.vcc;
                     } else if (!competing_data && in.src[0].kind == OperandKind::SGPR &&
@@ -7449,7 +7568,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
             }
-            if (in.opcode == 0x10) {   // s_bcnt1_i32_b64: popcount the complete scalar pair
+            if (in.opcode == kSop1OpcodeBcnt1I32B64) {
+                // s_bcnt1_i32_b64: popcount the complete scalar pair
                 // A VOPC may write an arbitrary SGPR pair as a wave mask.  In the portable vertex
                 // shell that pair contains the one represented guest lane, so its exact population
                 // count is 0/1.  Ordinary data pairs retain full uint semantics and use two native
@@ -7479,8 +7599,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (in.src[0].kind == OperandKind::Special && source == 126) {
                         source_mask = rs.exec;
                     } else {
-                        const bool competing_data = data_word_present(source) ||
-                                                    data_word_present(source + 1);
+                        const bool proven_saved_mask =
+                            b.structured_wave64_mask_reduction_pcs.contains(in.pc);
+                        const bool competing_data = !proven_saved_mask &&
+                            (data_word_present(source) || data_word_present(source + 1));
                         if (!competing_data && source == 106) {
                             source_mask = rs.vcc;
                         } else if (!competing_data && in.src[0].kind == OperandKind::SGPR &&
@@ -8355,7 +8477,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
-            if (in.opcode == 0x25) {   // s_bfm_b64: D=((1ULL<<(S0&63))-1)<<(S1&63)
+            if (in.opcode == kSop2OpcodeBfmB64) { // s_bfm_b64
                 if (b.is_vertex && !b.ngg_one_lane) { ok = false; return true; }
                 // Wave masks are represented as one bool per SPIR-V invocation.  Constructing the
                 // architectural 64-bit integer and then splitting it would lose that domain, so test
@@ -8663,7 +8785,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_srt.erase(in.dst.value + 1);
                 return true;
             }
-            if (in.opcode == 0x29) {   // s_bfe_u64
+            if (in.opcode == kSop2OpcodeBfeU64) { // s_bfe_u64
                 // BFE's sources are scalar DATA even when its destination is the architectural
                 // EXEC/VCC mask pair. Keep the complete uniform source pair long enough to extract
                 // the bit belonging to this emulated lane; treating the destination as ordinary
@@ -8750,8 +8872,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             return false;
                     }
                 };
+                const bool has_proven_scalar_sources =
+                    has_scalar_data(in.src[0]) && has_scalar_data(in.src[1]) &&
+                    (!b.is_compute || b.wave_size != 64 ||
+                     rs.scalar_presence_has_no_placeholders ||
+                     b.vcc_b32_scalar_result_pcs.contains(in.pc));
                 if ((!b.is_fragment && !b.is_compute) || gtav_wave32_vcchi_scalar_packet ||
-                    (has_scalar_data(in.src[0]) && has_scalar_data(in.src[1]))) {
+                    has_proven_scalar_sources) {
                     // The vertex shell is a complete one-lane virtual wave, so its scalar VCC
                     // dwords are representable: LO starts as {bit0=vcc}, HI as zero, and later B32
                     // operations may use either as ordinary scratch. In Wave32 compute, VCC_HI is
@@ -8780,6 +8907,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         b.ibin(Op_BitwiseAnd,
                                b.ibin(Op_ShiftRightLogical, result, bit), b.uconst(1)),
                         b.uconst(0));
+                    const bool scalar_low_only = b.is_compute &&
+                        b.vcc_b32_low_only_pcs.contains(in.pc);
                     if (b.wave_size == 32) {
                         // A complete scalar write covers every architectural bit of VCC_LO in
                         // Wave32, so it establishes a fresh predicate without needing the old VCC
@@ -8809,7 +8938,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                    b.uconst(1)),
                             b.uconst(0));
                         rs.vcc = b.bsel(in_written_half, result_bit, other_bit);
-                    } else if (b.vcc_b32_low_only_pcs.contains(in.pc)) {
+                    } else if (scalar_low_only) {
                         // The whole-CFG proof established that the untouched high word cannot be
                         // observed before a complete pair replacement. This instruction therefore
                         // starts a scalar-only VCC_LO lifetime; retaining the old Bool predicate
@@ -8822,7 +8951,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         if (!rs.vcc) { ok = false; return true; }
                         rs.vcc = b.bsel(in_written_half, result_bit, rs.vcc);
                     }
-                    if (rs.vcc) {
+                    if (!scalar_low_only) {
                         rs.sreg_bool[in.dst.value] = rs.vcc;
                         rs.sreg_bool_narrowed[in.dst.value] = true;
                     }
@@ -8985,7 +9114,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // retaining it can bind an unrelated later SRSRC to the old buffer.
             if (ok) {
                 rs.sreg_srt.erase(in.dst.value);
-                if (in.opcode == 0x29) rs.sreg_srt.erase(in.dst.value + 1);
+                if (in.opcode == kSop2OpcodeBfeU64)
+                    rs.sreg_srt.erase(in.dst.value + 1);
             }
             return true;
         }
@@ -15791,6 +15921,11 @@ bool emit_cfg_state_machine(
     // This matters for GTA V's scalar scratch in VCC/ordinary mask pairs, where readfirstlane,
     // SMEM, or a B32 scalar ALU defines one half before a one-dword VALU/SALU consumer.
     std::vector<std::set<int>> wave64_scalar_word_in(starts.size());
+    // Dispatcher Function variables persist SCC's Boolean value but not whether that value is an
+    // architectural SCC or the false placeholder stored for an unrepresentable wave-mask result.
+    // Carry a separate CFG MUST-validity bit and use it both for scalar-word provenance and when
+    // reconstructing RegState at each dispatcher case.
+    std::vector<bool> wave64_scalar_scc_valid_in(starts.size(), false);
     std::vector<bool> wave64_b64_reachable(starts.size(), false);
     auto wave64_mask_reduction_source = [&](const Rdna2Inst& in) -> int {
         if (!b.is_compute || b.wave_size != 64 || in.fmt != Rdna2Format::SOP1 ||
@@ -15825,6 +15960,12 @@ bool emit_cfg_state_machine(
             if (value.first <= 107) wave64_scalar_word_in.front().insert(value.first);
         for (const auto& value : initial.sreg_input)
             if (value.first <= 107) wave64_scalar_word_in.front().insert(value.first);
+        // Direct descriptors intentionally live outside RegState's ordinary scalar map, but their
+        // entry words are real scalar data until shader code overwrites them. Seed the MUST facts
+        // from the same resource-table ranges used by the emitter's direct-descriptor fallback.
+        for (int reg : direct_descriptor_sregs)
+            if (reg <= 107) wave64_scalar_word_in.front().insert(reg);
+        wave64_scalar_scc_valid_in.front() = initial.scc != 0;
         wave64_b64_reachable.front() = true;
 
         enum class ScalarSourceRead : uint8_t {
@@ -15871,6 +16012,7 @@ bool emit_cfg_state_machine(
         auto advance_wave64_b64_masks = [&](std::set<int>& masks,
                                             std::set<int>& ambiguous,
                                             std::set<int>& scalar_words,
+                                            bool& scalar_scc,
                                             const Rdna2Inst& in,
                                             bool record_compare) {
             auto source_is_scalar_word = [&](const Operand& source) {
@@ -15882,14 +16024,26 @@ bool emit_cfg_state_machine(
                     case OperandKind::SGPR:
                         return scalar_words.contains(source.value);
                     case OperandKind::Special:
-                        if (source.value == 125 || source.value == 253)
-                            return true; // SGPR_NULL and SCC have exact scalar-bit representations
+                        if (source.value == 125) return true; // SGPR_NULL
+                        if (source.value == 253) return scalar_scc;
                         return source.value >= 106 && source.value <= 124 &&
                                scalar_words.contains(source.value);
                     default:
                         return false;
                 }
             };
+            auto reads_scc = [](const Rdna2Inst& candidate) {
+                return (candidate.fmt == Rdna2Format::SOP2 &&
+                        (candidate.opcode == 0x04u || candidate.opcode == 0x05u ||
+                         candidate.opcode == kSop2OpcodeCselectB32 ||
+                         candidate.opcode == 0x0bu)) ||
+                       (candidate.fmt == Rdna2Format::SOP1 &&
+                        (candidate.opcode == kSop1OpcodeCmovB32 ||
+                         candidate.opcode == kSop1OpcodeCmovB64)) ||
+                       (candidate.fmt == Rdna2Format::SOPK &&
+                        candidate.opcode == kSopkOpcodeCmovkI32);
+            };
+            const bool valid_scc_read = !reads_scc(in) || scalar_scc;
             const bool b32_vcc_scalar_write =
                 is_gtav_wave64_vcc_lo_scalar_cselect(in) ||
                 (in.fmt == Rdna2Format::SOP2 &&
@@ -15901,8 +16055,16 @@ bool emit_cfg_state_machine(
             const int b32_vcc_sibling = in.dst.value == 106 ? 107 : 106;
             const bool b32_vcc_complete_scalar_pair =
                 b32_vcc_scalar_result && scalar_words.contains(b32_vcc_sibling);
-            if (record_compare && b32_vcc_complete_scalar_pair)
-                b.vcc_b32_scalar_pair_pcs.insert(in.pc);
+            if (record_compare && b32_vcc_scalar_write) {
+                if (b32_vcc_scalar_result)
+                    b.vcc_b32_scalar_result_pcs.insert(in.pc);
+                else
+                    b.vcc_b32_scalar_result_pcs.erase(in.pc);
+                if (b32_vcc_complete_scalar_pair)
+                    b.vcc_b32_scalar_pair_pcs.insert(in.pc);
+                else
+                    b.vcc_b32_scalar_pair_pcs.erase(in.pc);
+            }
             // A block-entry join where the same physical pair is a mask on one predecessor and
             // scalar data on another has no runtime type tag. Reject the first observable read;
             // loading either the Bool's false placeholder or the scalar variable's zero placeholder
@@ -15969,6 +16131,8 @@ bool emit_cfg_state_machine(
                 return reject_cfg(in.pc, "wave64-ambiguous-mask-read");
 
             const int reduction_source = wave64_mask_reduction_source(in);
+            const bool exact_mask_reduction =
+                reduction_source >= 0 && masks.contains(reduction_source);
             if (record_compare && reduction_source >= 0 && masks.contains(reduction_source))
                 proven_wave64_mask_reduction_pcs.insert(in.pc);
             const int mbcnt_root = wave64_mbcnt_mask_root(in);
@@ -15985,22 +16149,81 @@ bool emit_cfg_state_machine(
             if (record_compare && pair_compare[0] >= 0 &&
                 masks.contains(pair_compare[0]) && masks.contains(pair_compare[1]))
                 proven_saved_mask_pair_compare_pcs.insert(in.pc);
+            const bool writes_exact_wave_scc =
+                (zero_compare_source >= 0 && masks.contains(zero_compare_source)) ||
+                (compare_source >= 0 && masks.contains(compare_source)) ||
+                (pair_compare[0] >= 0 && masks.contains(pair_compare[0]) &&
+                 masks.contains(pair_compare[1]));
+
+            // Scalar-data presence and SCC validity share the same provenance contract. SOPK
+            // exposes its old SDST only as an implicit source; accepting ADDK, CMPK, or CMOVK after
+            // a dispatcher reload therefore requires that exact word to be a MUST scalar value.
+            // Check every dword of B64 inputs before the destination transfer ends the old lifetime.
+            auto source_is_scalar_range = [&](const Operand& source, uint32_t width) {
+                if (source.kind == OperandKind::InlineInt ||
+                    source.kind == OperandKind::InlineFloat ||
+                    source.kind == OperandKind::Literal)
+                    return true;
+                if (source.kind != OperandKind::SGPR &&
+                    source.kind != OperandKind::Special)
+                    return false;
+                if (source.kind == OperandKind::Special && source.value == 125)
+                    return true; // SGPR_NULL
+                if (source.kind == OperandKind::Special && source.value == 253)
+                    return width == 1 && scalar_scc;
+                if (source.kind == OperandKind::Special &&
+                    (source.value == 126 || source.value == 127))
+                    return width == 1 && b.is_compute && b.wave_size == 64 &&
+                        b.native_subgroup_size == 64;
+                for (uint32_t word = 0; word < std::max(width, 1u); ++word)
+                    if (!scalar_words.contains(source.value + static_cast<int>(word)))
+                        return false;
+                return true;
+            };
+            bool scalar_sources = true;
+            for (uint32_t source = 0; source < in.n_src; ++source) {
+                const uint32_t width = scalar_alu_source_words(in, source);
+                if (width != UINT32_MAX)
+                    scalar_sources &= source_is_scalar_range(in.src[source], width);
+            }
+            bool implicit_scalar_source = true;
+            if (implicit_scalar_words) {
+                implicit_scalar_source = in.dst.kind == OperandKind::SGPR;
+                for (uint32_t word = 0; word < implicit_scalar_words; ++word)
+                    implicit_scalar_source &=
+                        scalar_words.contains(in.dst.value + static_cast<int>(word));
+            }
+            const bool scalar_alu_result = scalar_sources && implicit_scalar_source;
+
+            const bool wave64_vcc_b32_mask_not =
+                in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeNotB32 &&
+                (in.dst.value == 106 || in.dst.value == 107) &&
+                in.src[0].value == in.dst.value && masks.contains(106) &&
+                !scalar_words.contains(in.src[0].value);
+            const bool exact_quadmask =
+                in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeQuadmaskB64 &&
+                b.wave_size == 64 && source_is_mask(in.src[0]) &&
+                (b.is_fragment || (b.is_compute && b.native_subgroup_size == 64));
 
             int mask_write = -1;
             if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) {
                 mask_write = in.dst.kind == OperandKind::SGPR && in.dst.value <= 105
                     ? in.dst.value : 106;
             } else if (in.fmt == Rdna2Format::SOP1 && in.dst.value <= 107) {
-                if ((in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a) &&
+                if (wave64_vcc_b32_mask_not)
+                    mask_write = 106;
+                else if ((in.opcode == 0x04 || in.opcode == 0x08 || in.opcode == 0x0a) &&
                     source_is_mask(in.src[0]))
                     mask_write = in.dst.value;
-                else if ((in.opcode >= 0x24 && in.opcode <= 0x2b) ||
-                         in.opcode == 0x37 || in.opcode == 0x38)
+                else if ((in.opcode >= kSop1OpcodeAndSaveexecB64 &&
+                          in.opcode <= kSop1OpcodeXnorSaveexecB64) ||
+                         in.opcode == kSop1OpcodeAndn1SaveexecB64 ||
+                         in.opcode == kSop1OpcodeOrn1SaveexecB64 || exact_quadmask)
                     mask_write = in.dst.value;
             } else if (in.fmt == Rdna2Format::SOP2 && in.dst.value <= 107) {
                 if (b32_vcc_complete_scalar_pair)
                     mask_write = 106;
-                else if (in.opcode == 0x25)
+                else if (in.opcode == kSop2OpcodeBfmB64)
                     mask_write = in.dst.value;
                 else if (in.opcode >= 0x0f && in.opcode <= 0x1d &&
                          (in.opcode & 1u) == 1)
@@ -16008,13 +16231,13 @@ bool emit_cfg_state_machine(
                     // materializes that result's ballot words below, but its mask lifetime remains
                     // the primary classification here.
                     mask_write = in.dst.value;
-                else if (in.opcode == 0x0b && in.dst.value == 106 &&
+                else if (valid_scc_read && in.opcode == 0x0b && in.dst.value == 106 &&
                          !b.cselect_b64_low_only_pcs.contains(in.pc))
                     // A complete scalar-data pair selected into VCC has a dual lifetime: emit_alu
                     // derives its per-lane predicate even though neither input is a mask. The one
                     // incomplete GTA form deliberately has no predicate and is excluded here.
                     mask_write = 106;
-                else if (in.opcode == 0x0b &&
+                else if (valid_scc_read && in.opcode == 0x0b &&
                          source_is_mask(in.src[0]) && source_is_mask(in.src[1]))
                     mask_write = in.dst.value;
             } else if (vop3_writes_mask_sdst(in) && in.sdst.value <= 107) {
@@ -16054,7 +16277,8 @@ bool emit_cfg_state_machine(
             // guarantees the untouched high half cannot be observed before a complete replacement.
             // It is therefore safe to clear the pair-domain ambiguity for this path; a later join
             // with a mask path will recreate the ambiguity in the ordinary MUST merge below.
-            if (b.vcc_b32_low_only_pcs.contains(in.pc))
+            if (b.is_compute && b.vcc_b32_low_only_pcs.contains(in.pc) &&
+                b32_vcc_scalar_result)
                 ambiguous.erase(106);
             // An implicit VOPC destination is architectural VCC and is absent from the explicit
             // scalar-writer inventory.
@@ -16069,46 +16293,47 @@ bool emit_cfg_state_machine(
                 // pattern. GTA joins `s_mov_b64 s[16:17], 0` against an SMEM load, then consumes the
                 // pair as scalar data. Preserve that dual definition; other mask writes still erase
                 // scalar facts because their Boolean value cannot be materialized as two SGPR words.
-                auto complete_scalar_pair = [&](const Operand& source) {
-                    if (source.kind == OperandKind::InlineInt ||
-                        source.kind == OperandKind::Literal)
-                        return true;
-                    if (source.kind != OperandKind::SGPR &&
-                        source.kind != OperandKind::Special)
-                        return false;
-                    return scalar_words.contains(source.value) &&
-                           scalar_words.contains(source.value + 1);
-                };
                 const bool mov_dual_domain = in.fmt == Rdna2Format::SOP1 &&
                     in.opcode == 0x04 &&
                     (in.src[0].kind == OperandKind::InlineInt ||
-                     complete_scalar_pair(in.src[0]) ||
+                     scalar_alu_result ||
                      (b.is_compute && b.wave_size == 64 &&
                       b.native_subgroup_size == 64 && source_is_mask(in.src[0])));
-                const bool cselect_scalar_branch = in.fmt == Rdna2Format::SOP2 &&
+                const bool cselect_scalar_branch = valid_scc_read &&
+                    in.fmt == Rdna2Format::SOP2 &&
                     in.opcode == 0x0b && in.dst.value == 106 &&
                     !b.cselect_b64_low_only_pcs.contains(in.pc) &&
                     !(source_is_mask(in.src[0]) && source_is_mask(in.src[1])) &&
-                    complete_scalar_pair(in.src[0]) && complete_scalar_pair(in.src[1]);
+                    scalar_alu_result;
                 const bool logical_native_ballot = in.fmt == Rdna2Format::SOP2 &&
                     in.opcode >= 0x0f && in.opcode <= 0x1d &&
                     (in.opcode & 1u) == 1 && b.is_compute && b.wave_size == 64 &&
                     b.native_subgroup_size == 64;
+                const bool quadmask_native_ballot = exact_quadmask;
                 const bool dual_domain_scalar_write =
                     mov_dual_domain || cselect_scalar_branch || logical_native_ballot ||
-                    b32_vcc_complete_scalar_pair;
-                if (!dual_domain_scalar_write) {
-                    scalar_words.erase(mask_write);
-                    scalar_words.erase(mask_write + 1);
-                } else {
+                    quadmask_native_ballot || b32_vcc_complete_scalar_pair;
+                if (dual_domain_scalar_write && valid_scc_read) {
                     for (const auto& [base, width] : scalar_writes)
                         for (uint32_t word = 0; word < width; ++word)
                             scalar_words.insert(base + static_cast<int>(word));
+                } else {
+                    for (const auto& [base, width] : scalar_writes)
+                        for (uint32_t word = 0; word < width; ++word)
+                            scalar_words.erase(base + static_cast<int>(word));
                 }
-            } else {
+            } else if (valid_scc_read &&
+                       ((in.fmt != Rdna2Format::SOP1 &&
+                         in.fmt != Rdna2Format::SOP2 &&
+                         in.fmt != Rdna2Format::SOPK) || scalar_alu_result ||
+                        exact_mask_reduction)) {
                 for (const auto& [base, width] : scalar_writes)
                     for (uint32_t word = 0; word < width; ++word)
                         scalar_words.insert(base + static_cast<int>(word));
+            } else {
+                for (const auto& [base, width] : scalar_writes)
+                    for (uint32_t word = 0; word < width; ++word)
+                        scalar_words.erase(base + static_cast<int>(word));
             }
             // B32 VCC logicals have a separate mask-domain lowering. If either input lacks a MUST
             // scalar word, the emitter may take that path and erase its uint result. Never publish
@@ -16116,6 +16341,78 @@ bool emit_cfg_state_machine(
             // Function variables contain zero placeholders for absent domains.
             if (b32_vcc_scalar_write && !b32_vcc_scalar_result)
                 scalar_words.erase(in.dst.value);
+
+            // SCC is persisted through a dispatcher Function variable without a runtime validity
+            // tag. A scalar SOPC establishes a real Boolean, while the three exact whole-wave mask
+            // comparisons above establish one through their synchronized vote phase. Other scalar
+            // ALU writers need fully scalar sources or kill the fact. The resulting validity is a
+            // CFG MUST property, so a placeholder from any incoming edge still poisons the join.
+            if (in.fmt == Rdna2Format::SOPC) {
+                scalar_scc = scalar_sources;
+            } else if (in.fmt == Rdna2Format::SOP2) {
+                const bool preserves_scc =
+                    in.opcode == kSop2OpcodeCselectB32 || in.opcode == 0x0bu ||
+                    in.opcode == kSop2OpcodeBfmB32 ||
+                    in.opcode == kSop2OpcodeBfmB64 || in.opcode == 0x26u ||
+                    (in.opcode >= 0x32u && in.opcode <= 0x36u);
+                if (in.opcode == 0x04u || in.opcode == 0x05u)
+                    scalar_scc = scalar_scc && scalar_sources;
+                else if (in.opcode == kSop2OpcodeBfeU64)
+                    scalar_scc = scalar_sources &&
+                        in.dst.value != 106 && in.dst.value != 107 &&
+                        in.dst.value != 126 && in.dst.value != 127;
+                else if (!preserves_scc)
+                    scalar_scc = scalar_sources && mask_write < 0;
+            } else if (in.fmt == Rdna2Format::SOP1) {
+                const bool preserves_scc =
+                    in.opcode == kSop1OpcodeMovB32 ||
+                    in.opcode == kSop1OpcodeMovB64 ||
+                    in.opcode == kSop1OpcodeCmovB32 ||
+                    in.opcode == kSop1OpcodeCmovB64 ||
+                    in.opcode == kSop1OpcodeBrevB32 ||
+                    in.opcode == kSop1OpcodeBcnt1I32B64 ||
+                    in.opcode == kSop1OpcodeFf1I32B64 ||
+                    in.opcode == kSop1OpcodeFlbitI32B32 ||
+                    in.opcode == kSop1OpcodeFlbitI32B64 ||
+                    in.opcode == kSop1OpcodeBitset0B32 ||
+                    in.opcode == kSop1OpcodeBitset1B32 ||
+                    in.opcode == kSop1OpcodeGetpcB64;
+                const bool saveexec =
+                    (in.opcode >= kSop1OpcodeAndSaveexecB64 &&
+                     in.opcode <= kSop1OpcodeXnorSaveexecB64) ||
+                    in.opcode == kSop1OpcodeAndn1SaveexecB64 ||
+                    in.opcode == kSop1OpcodeOrn1SaveexecB64;
+                if (in.opcode == kSop1OpcodeNotB32 ||
+                    in.opcode == kSop1OpcodeAbsI32)
+                    scalar_scc = scalar_alu_result && !wave64_vcc_b32_mask_not;
+                else if (saveexec)
+                    scalar_scc = b.is_fragment && initial.reads_scc &&
+                        source_is_mask(in.src[0]);
+                else if (in.opcode == kSop1OpcodeQuadmaskB64)
+                    scalar_scc = exact_quadmask;
+                else if (!preserves_scc)
+                    scalar_scc = false;
+            } else if (in.fmt == Rdna2Format::SOPK) {
+                const bool writes_scc =
+                    (in.opcode >= kSopkOpcodeCmpkFirst &&
+                     in.opcode <= kSopkOpcodeCmpkLast) ||
+                    in.opcode == kSopkOpcodeAddkI32;
+                const bool preserves_scc =
+                    in.opcode == kSopkOpcodeMovkI32 ||
+                    in.opcode == kSopkOpcodeCmovkI32 ||
+                    in.opcode == kSopkOpcodeMulkI32 ||
+                    in.opcode == kSopkOpcodeSetregB32 ||
+                    (in.opcode >= kSopkOpcodeWaitcntVscnt &&
+                     in.opcode <= kSopkOpcodeWaitcntLgkmcnt);
+                if (writes_scc)
+                    scalar_scc = implicit_scalar_source;
+                else if (!preserves_scc)
+                    scalar_scc = false;
+            }
+            if (b64_mask_scc_vote_pcs.contains(in.pc) ||
+                native_b32_mask_scc_vote_pcs.contains(in.pc) ||
+                writes_exact_wave_scc)
+                scalar_scc = true;
             return true;
         };
 
@@ -16126,12 +16423,14 @@ bool emit_cfg_state_machine(
             std::set<int> masks = wave64_b64_mask_in[block];
             std::set<int> ambiguous = wave64_b64_ambiguous_in[block];
             std::set<int> scalar_words = wave64_scalar_word_in[block];
+            bool scalar_scc = wave64_scalar_scc_valid_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
                 if (!advance_wave64_b64_masks(
-                        masks, ambiguous, scalar_words, in, /*record_compare*/false))
+                        masks, ambiguous, scalar_words, scalar_scc, in,
+                        /*record_compare*/false))
                     return false;
             }
             for (uint32_t successor : successors[block]) {
@@ -16140,6 +16439,7 @@ bool emit_cfg_state_machine(
                     wave64_b64_mask_in[successor] = masks;
                     wave64_b64_ambiguous_in[successor] = ambiguous;
                     wave64_scalar_word_in[successor] = scalar_words;
+                    wave64_scalar_scc_valid_in[successor] = scalar_scc;
                     pending.push_back(successor);
                     continue;
                 }
@@ -16163,12 +16463,16 @@ bool emit_cfg_state_machine(
                     wave64_scalar_word_in[successor].end(),
                     scalar_words.begin(), scalar_words.end(),
                     std::inserter(joined_scalar_words, joined_scalar_words.end()));
+                const bool joined_scalar_scc =
+                    wave64_scalar_scc_valid_in[successor] && scalar_scc;
                 if (joined != wave64_b64_mask_in[successor] ||
                     joined_ambiguous != wave64_b64_ambiguous_in[successor] ||
-                    joined_scalar_words != wave64_scalar_word_in[successor]) {
+                    joined_scalar_words != wave64_scalar_word_in[successor] ||
+                    joined_scalar_scc != wave64_scalar_scc_valid_in[successor]) {
                     wave64_b64_mask_in[successor] = std::move(joined);
                     wave64_b64_ambiguous_in[successor] = std::move(joined_ambiguous);
                     wave64_scalar_word_in[successor] = std::move(joined_scalar_words);
+                    wave64_scalar_scc_valid_in[successor] = joined_scalar_scc;
                     pending.push_back(successor);
                 }
             }
@@ -16178,12 +16482,14 @@ bool emit_cfg_state_machine(
             std::set<int> masks = wave64_b64_mask_in[block];
             std::set<int> ambiguous = wave64_b64_ambiguous_in[block];
             std::set<int> scalar_words = wave64_scalar_word_in[block];
+            bool scalar_scc = wave64_scalar_scc_valid_in[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi || in.is_end) continue;
                 if (!advance_wave64_b64_masks(
-                        masks, ambiguous, scalar_words, in, /*record_compare*/true))
+                        masks, ambiguous, scalar_words, scalar_scc, in,
+                        /*record_compare*/true))
                     return false;
             }
         }
@@ -16844,7 +17150,14 @@ bool emit_cfg_state_machine(
         for (const auto& kv : lmv)
             state.vgpr_lane_mask_slots[kv.first.first][kv.first.second] =
                 b.load_function(b.t_bool, kv.second);
-        state.scc = b.load_function(b.t_bool, scc_var);
+        const bool filters_wave64_scalar_scc =
+            (b.is_compute || b.is_fragment) && b.wave_size == 64;
+        const bool live_scalar_scc = !filters_wave64_scalar_scc ||
+            (entry_block != UINT32_MAX &&
+             entry_block < wave64_scalar_scc_valid_in.size() &&
+             wave64_scalar_scc_valid_in[entry_block]);
+        state.scc = live_scalar_scc
+            ? b.load_function(b.t_bool, scc_var) : 0;
         const bool live_vcc = filters_wave64_b64
             ? entry_wave64_b64 && entry_wave64_b64->contains(106)
             : (!entry_b32 || entry_b32->contains(106));
@@ -19231,6 +19544,11 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         b.vcc_b32_low_only_pcs = proven_wave64_vcc_b32_low_only_pcs(ins);
         b.vcc_b32_low_only_analysis_done = true;
     }
+    if (!b.structured_wave64_mask_reduction_analysis_done) {
+        b.structured_wave64_mask_reduction_pcs =
+            proven_structured_wave64_mask_reduction_pcs(ins);
+        b.structured_wave64_mask_reduction_analysis_done = true;
+    }
     if (!rs.smem_x16_descriptor_analysis_done) {
         rs.smem_x16_descriptor_loads = proven_smem_x16_descriptor_loads(ins, rt);
         rs.smem_x16_descriptor_analysis_done = true;
@@ -20922,7 +21240,12 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords) {
     SpirvCompute b; b.begin(1);
     b.cselect_b64_low_only_pcs = proven_cselect_b64_low_only_pcs(ins);
     b.cselect_b64_low_only_analysis_done = true;
-    b.vcc_b32_low_only_pcs = proven_wave64_vcc_b32_low_only_pcs(ins);
+    // Coverage is deliberately a context-free instruction census. Preserve its historical
+    // CSELECT exception, but do not let a newly recognized whole-CFG logical lifetime poison the
+    // scratch compute state and make later instructions look unsupported. Real compute emission
+    // runs the complete proof in emit_body.
+    b.vcc_b32_low_only_pcs =
+        proven_wave64_vcc_b32_low_only_pcs(ins, /*include_logical*/false);
     b.vcc_b32_low_only_analysis_done = true;
     b.declare_guest_scratch(scratch);
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
