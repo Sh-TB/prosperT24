@@ -14582,6 +14582,8 @@ bool emit_cfg_state_machine(
                 candidate.fmt == Rdna2Format::FLAT ||
                 candidate.fmt == Rdna2Format::EXP ||
                 candidate.fmt == Rdna2Format::VINTRP ||
+                (candidate.fmt == Rdna2Format::SOP1 &&
+                 candidate.opcode == kSop1OpcodeMovB64) ||
                 sopp_is_noop(candidate);
             if (!preserves_scc) break;
         }
