@@ -4,6 +4,7 @@
 #include "diagnostic_selectors.hpp"
 #include "pm4_registers.hpp"
 #include "rdna2_decode.hpp"
+#include "rdna2_gta5_compute_contracts.hpp"
 #include "shader_resources.hpp"
 #include <algorithm>
 #include <bit>
@@ -12359,6 +12360,28 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     ok = false; return true;   // unresolvable V# -> reject; NEVER default to binding 2
                 }
+                if (is_proven_null_nullable_raw_buffer(*res)) {
+                    // The final compile boundary already re-established the exact production bytes,
+                    // s7-sized x256 launch, marker set, and retained +0x20 zero-qword witness. Keep the
+                    // instruction half fail-closed too: only one dword load may synthesize zero and
+                    // only the three exact dword stores may disappear.
+                    const Gta5NullableOutputAccess access =
+                        rdna2_gta5_nullable_output_site(in);
+                    if (res->fetch_pc != in.pc || is_format || is_atomic ||
+                        access == Gta5NullableOutputAccess::None ||
+                        (access == Gta5NullableOutputAccess::LoadDword && is_store) ||
+                        (access == Gta5NullableOutputAccess::StoreDword && !is_store)) {
+                        ok = false;
+                        return true;
+                    }
+                    if (access == Gta5NullableOutputAccess::LoadDword) {
+                        const int d = in.dst.value;
+                        const uint32_t old = vreg_old(b, rs, d);
+                        rs.vreg[d] = b.uconst(0);
+                        predicate_write(b, rs, d, old);
+                    }
+                    return true;
+                }
                 if (is_optional_null_raw_load_buffer(*res)) {
                     // Unlike NUM_RECORDS=0, this marker records an application-level optional
                     // entry, not an architectural empty descriptor. Only the exact admitted RAW
@@ -20934,12 +20957,18 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const bool has_null_guarded_raw_store = rt &&
         std::any_of(rt->resources.begin(), rt->resources.end(),
                     is_proven_null_guarded_raw_store);
+    const bool has_nullable_output_raw_buffer = rt &&
+        std::any_of(rt->resources.begin(), rt->resources.end(),
+                    is_nullable_raw_buffer_marker_candidate);
     // A resource table is externally constructible and can outlive the shader bytes or dispatch
     // that produced it. Re-establish the complete static guard and dynamic null-entry contract at
     // the final translation boundary before any marker is permitted to erase a real store.
     if (has_null_guarded_raw_store &&
         !rdna2_gta5_null_guarded_raw_store_dispatch(
             code, dwords, config.user_sgprs.data(), config.user_sgprs.size()))
+        return {};
+    if (has_nullable_output_raw_buffer &&
+        !rdna2_gta5_nullable_output_dispatch(code, dwords, config, *rt))
         return {};
     const uint32_t local_x = std::max(1u, config.local_x);
     const uint32_t local_y = std::max(1u, config.local_y);
