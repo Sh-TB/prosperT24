@@ -16368,8 +16368,15 @@ bool emit_cfg_state_machine(
             // An implicit VOPC destination is architectural VCC and is absent from the explicit
             // scalar-writer inventory.
             if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
-                !(in.dst.kind == OperandKind::SGPR && in.dst.value <= 105))
+                !(in.dst.kind == OperandKind::SGPR && in.dst.value <= 105)) {
                 erase_overlapping(106, 2);
+                // VOPC writes a complete Wave64 mask even though it has no explicit scalar
+                // destination in the generic write inventory. End both physical words' old
+                // scalar lifetimes: retaining them can falsely classify a later one-word VCC_LO
+                // overwrite as a complete scalar pair after a dispatcher reload.
+                scalar_words.erase(106);
+                scalar_words.erase(107);
+            }
             if (mask_write >= 0) {
                 masks.insert(mask_write);
                 ambiguous.erase(mask_write);
