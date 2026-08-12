@@ -1222,6 +1222,31 @@ struct SpirvCompute {
             Op_BitwiseOr, ibin(Op_BitwiseAnd, lane, uconst(~0x1fu)), selected);
         return true;
     }
+    uint32_t ds_bpermute_b32(uint32_t address, uint32_t value,
+                             uint32_t active, uint32_t offset,
+                             uint32_t event = 0) {
+        // RDNA2 ISA 12.13.3: ADDR is a byte address and BPERMUTE gathers DATA0 backward from
+        // ((ADDR + OFFSET) >> 2) & 31 within each independent 32-lane half. Addition is deliberately
+        // performed before the shift so uint32 overflow and unaligned byte addresses match hardware.
+        mark_subgroup_min32();
+        const uint32_t lane = subgroup_local_id();
+        const uint32_t selected = ibin(
+            Op_BitwiseAnd,
+            ibin(Op_ShiftRightLogical,
+                 ibin(Op_IAdd, address, offset), uconst(2)),
+            uconst(31));
+        const uint32_t source_lane = ibin(
+            Op_BitwiseOr, ibin(Op_BitwiseAnd, lane, uconst(~31u)), selected);
+        const uint32_t shuffled = subgroup_shuffle(value, source_lane);
+        const uint32_t source_active = subgroup_shuffle(
+            sel(active, uconst(1), uconst(0)), source_lane);
+        uint32_t valid = ucmp(Op_INotEqual, source_active, uconst(0));
+        if (event) {
+            const uint32_t source_event = subgroup_shuffle(event, source_lane);
+            valid = land(valid, ucmp(Op_IEqual, source_event, event));
+        }
+        return sel(valid, shuffled, uconst(0));
+    }
     uint32_t subgroup_permlane16(uint32_t value, uint32_t selectors_lo,
                                 uint32_t selectors_hi, bool across_rows,
                                 uint32_t* source_lane_out = nullptr) {
@@ -5479,7 +5504,8 @@ std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, boo
                 if (r.is_end || r.pc >= region_end) break;
                 if (r.pc <= in.pc) continue;
                 const bool ds_wave_collective = r.fmt == Rdna2Format::DS &&
-                    (r.opcode == 0x35 || r.opcode == 0x3d || r.opcode == 0x3e);
+                    (r.opcode == 0x35 || r.opcode == 0x3d || r.opcode == 0x3e ||
+                     r.opcode == kDsOpcodeBpermuteB32);
                 if ((r.fmt == Rdna2Format::SOPP && r.opcode == 0x0a) ||
                     ds_wave_collective ||
                     (r.fmt == Rdna2Format::VOP3 &&
@@ -13091,6 +13117,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return true;
         }
         case Rdna2Format::DS: {
+            if (in.opcode == kDsOpcodeBpermuteB32) {
+                // A native subgroup exactly matching the guest wave gives each architectural
+                // 32-lane half a valid shuffle domain. Portable compute needs a workgroup-scratch
+                // gather and remains fail-visible until that separate synchronized route exists.
+                if (!b.is_compute || in.ds_gds || !b.native_subgroup_size ||
+                    b.native_subgroup_size != b.wave_size) {
+                    ok = false;
+                    return true;
+                }
+                const auto address = rs.vreg.find(in.src[0].value);
+                const auto source = rs.vreg.find(in.src[1].value);
+                const uint32_t old = vreg_old(b, rs, in.dst.value);
+                rs.vreg[in.dst.value] = b.ds_bpermute_b32(
+                    address == rs.vreg.end() ? b.uconst(0) : address->second,
+                    source == rs.vreg.end() ? b.uconst(0) : source->second,
+                    rs.exec, b.uconst(in.literal));
+                predicate_write(b, rs, in.dst.value, old);
+                return true;
+            }
             if (in.opcode == 0x35) {                    // ds_swizzle_b32: VDST = lane-gather(ADDR)
                 if (!b.is_compute && !b.is_fragment) { ok = false; return true; }
                 uint32_t source_lane = 0;
@@ -14688,6 +14733,7 @@ bool emit_cfg_state_machine(
     bool has_gds_append = false;
     bool has_lds_append = false;
     std::unordered_set<uint32_t> swizzle_pcs;
+    std::unordered_map<uint32_t, uint32_t> bpermute_event_for_pc;
     std::unordered_set<uint32_t> fragment_dpp_min_row_shr_pcs;
     std::unordered_map<uint32_t, uint32_t> fragment_dpp_min_event_for_pc;
     std::set<int> fragment_dpp_min_row_shr_dsts;
@@ -14723,6 +14769,16 @@ bool emit_cfg_state_machine(
         }
         if (in.fmt == Rdna2Format::DS && in.opcode == 0x35) {
             swizzle_pcs.insert(in.pc);
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
+        if (in.fmt == Rdna2Format::DS && in.opcode == kDsOpcodeBpermuteB32) {
+            if (!b.is_compute || in.ds_gds || !b.native_subgroup_size ||
+                b.native_subgroup_size != b.wave_size)
+                return reject_cfg(in.pc, "ds-bpermute-native-wave-contract");
+            bpermute_event_for_pc.emplace(
+                in.pc, static_cast<uint32_t>(bpermute_event_for_pc.size() + 1));
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
@@ -15916,7 +15972,7 @@ bool emit_cfg_state_machine(
             if (in.pc < lo || in.pc >= hi) continue;
             synchronized_block[block] = synchronized_block[block] ||
                 mbcnt_event_for_pc.contains(in.pc) || append_event_for_pc.contains(in.pc) ||
-                swizzle_pcs.contains(in.pc) ||
+                swizzle_pcs.contains(in.pc) || bpermute_event_for_pc.contains(in.pc) ||
                 fragment_dpp_min_row_shr_pcs.contains(in.pc) ||
                 compute_dpp_add_row_shr_pcs.contains(in.pc) ||
                 compute_dpp_row_ror8_pcs.contains(in.pc) ||
@@ -16092,6 +16148,21 @@ bool emit_cfg_state_machine(
     const uint32_t swizzle_source_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t swizzle_source_lane_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t swizzle_dst_var = b.function_var(b.t_u32, ptr_u32);
+    const bool has_bpermute = !bpermute_event_for_pc.empty();
+    const uint32_t bpermute_pending_var = has_bpermute
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t bpermute_active_var = has_bpermute
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t bpermute_address_var = has_bpermute
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t bpermute_source_var = has_bpermute
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t bpermute_offset_var = has_bpermute
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t bpermute_event_var = has_bpermute
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    const uint32_t bpermute_dst_var = has_bpermute
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
     const bool has_saved_mask_pair_events = !saved_mask_pair_events.empty();
     const uint32_t saved_mask_pair_pending_var = has_saved_mask_pair_events
         ? b.function_var(b.t_bool, ptr_bool) : 0;
@@ -16197,6 +16268,13 @@ bool emit_cfg_state_machine(
     b.store_function(swizzle_source_var, zero);
     b.store_function(swizzle_source_lane_var, zero);
     b.store_function(swizzle_dst_var, zero);
+    if (has_bpermute) {
+        b.store_function(bpermute_address_var, zero);
+        b.store_function(bpermute_source_var, zero);
+        b.store_function(bpermute_offset_var, zero);
+        b.store_function(bpermute_event_var, zero);
+        b.store_function(bpermute_dst_var, zero);
+    }
     if (has_saved_mask_pair_events)
         b.store_function(saved_mask_pair_event_var, zero);
     if (has_dpp_min_row_shr) {
@@ -16444,6 +16522,11 @@ bool emit_cfg_state_machine(
     }
     b.store_function(swizzle_pending_var, no);
     b.store_function(swizzle_active_var, no);
+    if (has_bpermute) {
+        b.store_function(bpermute_pending_var, no);
+        b.store_function(bpermute_active_var, no);
+        b.store_function(bpermute_event_var, zero);
+    }
     if (has_saved_mask_pair_events) {
         b.store_function(saved_mask_pair_pending_var, no);
         b.store_function(saved_mask_pair_event_var, zero);
@@ -16519,6 +16602,7 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* mbcnt = nullptr;
         const Rdna2Inst* append = nullptr;
         const Rdna2Inst* swizzle = nullptr;
+        const Rdna2Inst* bpermute = nullptr;
         const Rdna2Inst* dpp_min_row_shr = nullptr;
         const Rdna2Inst* dpp_add_row_shr = nullptr;
         const Rdna2Inst* dpp_row_ror8 = nullptr;
@@ -16540,6 +16624,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_mbcnt = nullptr;
             const Rdna2Inst* block_append = nullptr;
             const Rdna2Inst* block_swizzle = nullptr;
+            const Rdna2Inst* block_bpermute = nullptr;
             const Rdna2Inst* block_dpp_min_row_shr = nullptr;
             const Rdna2Inst* block_dpp_add_row_shr = nullptr;
             const Rdna2Inst* block_dpp_row_ror8 = nullptr;
@@ -16567,6 +16652,10 @@ bool emit_cfg_state_machine(
                 }
                 if (in.fmt == Rdna2Format::DS && in.opcode == 0x35) {
                     block_swizzle = &in;
+                    break;
+                }
+                if (in.fmt == Rdna2Format::DS && in.opcode == kDsOpcodeBpermuteB32) {
+                    block_bpermute = &in;
                     break;
                 }
                 if (fragment_dpp_min_row_shr_pcs.contains(in.pc)) {
@@ -16755,7 +16844,7 @@ bool emit_cfg_state_machine(
             const bool last = member + 1 == dispatch_blocks[dispatch].size();
             if (!last) {
                 // Group construction admits only one-successor plain blocks before the tail.
-                if (block_mbcnt || block_append || block_swizzle ||
+                if (block_mbcnt || block_append || block_swizzle || block_bpermute ||
                     block_dpp_min_row_shr || block_dpp_add_row_shr ||
                     block_dpp_row_ror8 ||
                     block_dpp_add_row_mask || block_mask_ffbh || block_mask_compare ||
@@ -16771,6 +16860,7 @@ bool emit_cfg_state_machine(
             mbcnt = block_mbcnt;
             append = block_append;
             swizzle = block_swizzle;
+            bpermute = block_bpermute;
             dpp_min_row_shr = block_dpp_min_row_shr;
             dpp_add_row_shr = block_dpp_add_row_shr;
             dpp_row_ror8 = block_dpp_row_ror8;
@@ -16906,6 +16996,27 @@ bool emit_cfg_state_machine(
             b.store_function(swizzle_source_lane_var, source_lane);
             b.store_function(swizzle_dst_var,
                 b.uconst(static_cast<uint32_t>(swizzle->dst.value)));
+        }
+        if (bpermute) {
+            const auto event = bpermute_event_for_pc.find(bpermute->pc);
+            if (event == bpermute_event_for_pc.end() || !b.is_compute ||
+                bpermute->ds_gds || !b.native_subgroup_size ||
+                b.native_subgroup_size != b.wave_size)
+                return reject_cfg(bpermute->pc, "ds-bpermute-native-wave-contract");
+            // Publish lane-local operands in the selected case. The actual gathers run after the
+            // switch merge, where every subgroup invocation participates in uniform control flow.
+            const auto address = state.vreg.find(bpermute->src[0].value);
+            const auto source = state.vreg.find(bpermute->src[1].value);
+            b.store_function(bpermute_pending_var, yes);
+            b.store_function(bpermute_active_var, state.exec);
+            b.store_function(bpermute_address_var,
+                address == state.vreg.end() ? zero : address->second);
+            b.store_function(bpermute_source_var,
+                source == state.vreg.end() ? zero : source->second);
+            b.store_function(bpermute_offset_var, b.uconst(bpermute->literal));
+            b.store_function(bpermute_event_var, b.uconst(event->second));
+            b.store_function(bpermute_dst_var,
+                b.uconst(static_cast<uint32_t>(bpermute->dst.value)));
         }
         if (dpp_min_row_shr) {
             if (!fragment_dpp_min_row_shr(*dpp_min_row_shr))
@@ -17195,6 +17306,9 @@ bool emit_cfg_state_machine(
         } else if (swizzle) {
             if (!set_next(swizzle->pc + swizzle->len_dwords))
                 return reject_cfg(swizzle->pc, "swizzle-successor");
+        } else if (bpermute) {
+            if (!set_next(bpermute->pc + bpermute->len_dwords))
+                return reject_cfg(bpermute->pc, "bpermute-successor");
         } else if (dpp_min_row_shr) {
             if (!set_next(dpp_min_row_shr->pc + dpp_min_row_shr->len_dwords))
                 return reject_cfg(dpp_min_row_shr->pc,
@@ -17353,6 +17467,46 @@ bool emit_cfg_state_machine(
                 swizzle_pending,
                 b.ucmp(Op_IEqual, swizzle_dst,
                        b.uconst(static_cast<uint32_t>(kv.first.first))));
+            const uint32_t old = b.load_function(b.t_bool, kv.second);
+            b.store_function(kv.second, b.bsel(selected, no, old));
+        }
+    }
+
+    // DS_BPERMUTE common phase. Even the exact native dispatcher publishes operands in its switch
+    // case and performs subgroup gathers here: keeping all lanes at one structurally uniform merge
+    // avoids implementation-dependent participation in a case arm. Static event tags accompany
+    // DATA0 and EXEC so adjacent BPERMUTE sites cannot consume one another's mailbox values.
+    if (has_bpermute) {
+        const uint32_t pending = b.load_function(b.t_bool, bpermute_pending_var);
+        const uint32_t active = b.load_function(b.t_bool, bpermute_active_var);
+        const uint32_t event = b.load_function(b.t_u32, bpermute_event_var);
+        const uint32_t result = b.ds_bpermute_b32(
+            b.load_function(b.t_u32, bpermute_address_var),
+            b.load_function(b.t_u32, bpermute_source_var),
+            b.land(pending, active),
+            b.load_function(b.t_u32, bpermute_offset_var), event);
+        const uint32_t dst = b.load_function(b.t_u32, bpermute_dst_var);
+        const uint32_t write = b.land(pending, active);
+        for (const auto& kv : vv) {
+            const uint32_t selected = b.land(
+                write, b.ucmp(Op_IEqual, dst,
+                              b.uconst(static_cast<uint32_t>(kv.first))));
+            const uint32_t old = b.load_function(b.t_u32, kv.second);
+            b.store_function(kv.second, b.sel(selected, result, old));
+        }
+        // A physical VGPR definition ends any scalar lane-spill lifetime even when EXEC suppresses
+        // this lane's data write, matching predicate_write and the DS_SWIZZLE phase above.
+        for (const auto& kv : lv) {
+            const uint32_t selected = b.land(
+                pending, b.ucmp(Op_IEqual, dst,
+                                b.uconst(static_cast<uint32_t>(kv.first.first))));
+            const uint32_t old = b.load_function(b.t_u32, kv.second);
+            b.store_function(kv.second, b.sel(selected, zero, old));
+        }
+        for (const auto& kv : lmv) {
+            const uint32_t selected = b.land(
+                pending, b.ucmp(Op_IEqual, dst,
+                                b.uconst(static_cast<uint32_t>(kv.first.first))));
             const uint32_t old = b.load_function(b.t_bool, kv.second);
             b.store_function(kv.second, b.bsel(selected, no, old));
         }
@@ -19093,7 +19247,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     if (in.is_end || in.pc >= L.exit_pc) break;
                     if (in.pc < L.header_pc) continue;
                     const bool ds_wave_collective = in.fmt == Rdna2Format::DS &&
-                        (in.opcode == 0x35 || in.opcode == 0x3d || in.opcode == 0x3e);
+                        (in.opcode == 0x35 || in.opcode == 0x3d || in.opcode == 0x3e ||
+                         in.opcode == kDsOpcodeBpermuteB32);
                     // SCC is architectural scalar control, so an SCC loop executes ordinary LDS
                     // effects uniformly within each guest wave just like the existing CountedLoop
                     // path. EXEC/VCC loops retain their per-invocation approximation: only ordinary
