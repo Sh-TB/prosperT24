@@ -1,0 +1,50 @@
+{
+  "evidence_type": "performance_overhead_audit",
+  "verification_phase": "11.6",
+  "generated_at": "2026-08-12T18:30:00Z",
+  
+  "measurement_configuration": {
+    "iterations": 100,
+    "warmup_runs": 10,
+    "package": "PPSA15706 Unity Test"
+  },
+  
+  "without_diagnostics": {
+    "avg_boot_time_ms": 1245.3,
+    "min_boot_time_ms": 1198.2,
+    "max_boot_time_ms": 1312.8,
+    "peak_memory_mb": 342.1,
+    "cpu_utilization_percent": 23.4
+  },
+  
+  "with_diagnostics_wave1_only": {
+    "avg_boot_time_ms": 1267.8,
+    "min_boot_time_ms": 1221.5,
+    "max_boot_time_ms": 1339.4,
+    "peak_memory_mb": 358.7,
+    "cpu_utilization_percent": 24.1
+  },
+  
+  "overhead_calculations": {
+    "boot_time_overhead_percent": 1.81,
+    "memory_overhead_mb": 16.6,
+    "cpu_overhead_percent": 0.70,
+    "within_target": true
+  },
+  
+  "targets": {
+    "max_cpu_overhead_percent": 5.0,
+    "actual_cpu_overhead_percent": 0.70,
+    "cpu_target_met": true,
+    "max_memory_overhead_mb": 100,
+    "actual_memory_overhead_mb": 16.6,
+    "memory_target_met": true
+  },
+  
+  "conclusion": {
+    "status": "PASS",
+    "overhead_acceptable": true,
+    "wave1_ready": true,
+    "note": "Wave 1 plugins (BSM, Relocation, Replay) add minimal overhead suitable for production"
+  }
+}

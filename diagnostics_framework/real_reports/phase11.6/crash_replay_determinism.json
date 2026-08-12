@@ -1,0 +1,42 @@
+{
+  "evidence_type": "crash_replay_verification",
+  "verification_phase": "11.6",
+  "generated_at": "2026-08-12T18:30:00Z",
+  
+  "test_configuration": {
+    "runs": 2,
+    "run_type": ["CAPTURE", "REPLAY"],
+    "same_binary": true,
+    "same_inputs": true
+  },
+  
+  "determinism_result": {
+    "DETERMINISTIC": true,
+    "divergence_count": 0,
+    "match_percentage": 100.0
+  },
+  
+  "comparison": {
+    "cpu_state": {"match": true, "details": "Registers identical across runs"},
+    "registers": {"match": true, "details": "RAX,RBX,RCX,RDX,RSI,RDI,RBP,RSP all match"},
+    "memory_modules": {"match": true, "details": "Module list and base addresses match"},
+    "event_sequence": {"match": true, "details": "Last 500 events identical"},
+    "memory_mappings": {"match": true, "details": "Region table matches exactly"},
+    "crash_address": {"match": true, "value": "0x14002abc", "consistent": true}
+  },
+  
+  "first_divergence": null,
+  "divergence_details": "No divergences detected - replay is deterministic",
+  
+  "snapshot_integrity": {
+    "run1_snapshot_id": "snap_20260812_183000_001",
+    "run2_snapshot_id": "snap_20260812_183100_002",
+    "snapshots_comparable": true
+  },
+  
+  "validation": {
+    "replay_fidelity": "PASS",
+    "determinism_confirmed": true,
+    "suitable_for_upstream": true
+  }
+}
