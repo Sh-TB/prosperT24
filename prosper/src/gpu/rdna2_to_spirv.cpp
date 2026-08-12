@@ -7015,11 +7015,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             b.ibin(Op_ShiftRightLogical, scalar_mask_data, lane),
                             b.uconst(1));
                         mask = b.ucmp(Op_INotEqual, bit, b.uconst(0));
-                    } else if (in.src[0].value == -1) {
-                        mask = b.btrue();
-                        narrowed = false;
-                    } else if (in.src[0].value == 0) {
-                        mask = b.bfalse();
+                    } else if (in.src[0].kind == OperandKind::InlineInt) {
+                        // Every inline B32 dword is a valid Wave32 EXEC mask, not only 0/-1.
+                        // Select this invocation's architectural bit exactly; GTA V uses 1 here
+                        // to isolate lane zero before a scalar load.
+                        mask = inline_int_mask_bit(b, in.src[0].value);
+                        narrowed = in.src[0].value != -1;
                     }
                     if (!mask || in.dst.value == 127) {
                         ok = false;
