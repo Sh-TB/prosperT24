@@ -1,0 +1,19 @@
+{
+  "evidence_type": "ai_correlation",
+  "phase": "11.8",
+  
+  "hypotheses_generated": 5,
+  "top_hypothesis": {
+    "cause": "Invalid relocation write to RX memory region",
+    "confidence": 87.3,
+    "evidence_items": 3,
+    "rejected_alternatives": 2
+  },
+  
+  "safety_validation": {
+    "all_have_evidence": true,
+    "none_claim_certainty": true,
+    "rejected_recorded": true,
+    "confidence_capped_at_99": true
+  }
+}

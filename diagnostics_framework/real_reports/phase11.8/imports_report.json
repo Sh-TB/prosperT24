@@ -1,0 +1,33 @@
+{
+  "evidence_type": "import_resolution",
+  "phase": "11.8",
+  
+  "summary": {
+    "total_imports": 3421,
+    "resolved": 3387,
+    "missing_or_failed": 34,
+    "resolution_rate": 99.01
+  },
+  
+  "root_cause_rules_enforced": {
+    "import_must_be_called": true,
+    "crash_must_follow_call": true,
+    "evidence_correlation_required": true,
+    "no_stronger_alternative": true
+  },
+  
+  "classified_hypotheses": [
+    {
+      "nid": "sys_console_id",
+      "classification": "LIKELY_ROOT_CAUSE",
+      "confidence": 73.0,
+      "evidence_count": 3,
+      "rejected_alternatives": 2
+    }
+  ],
+  
+  "safety_check": {
+    "max_confidence": 73.0,
+    "never_100_percent": true
+  }
+}
