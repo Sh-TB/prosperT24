@@ -3770,6 +3770,12 @@ std::vector<uint32_t> recompile_interpolation_geometry(
 // operands may reference either (SGPR is a valid ALU operand), so both are resolved by operand_bits.
 struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
+    // Before the first compact structured construct, map presence means that the scalar value
+    // reaches this exact linear path. Branch/loop PHIs can synthesize zero for an absent SGPR and
+    // clear this marker. The CFG dispatcher likewise allocates Function variables for every
+    // statically observed SGPR and may load a zero placeholder where no scalar lifetime reaches the
+    // block. Keep that distinction explicit so a narrow prefix proof cannot weaken either route.
+    bool scalar_presence_has_no_placeholders = true;
     int max_vgpr = 0;          // highest statically referenced VGPR in this shader
     // Immutable raw user-data words for DIRECT descriptors. They stay absent from `sreg` so
     // descriptor provenance can still distinguish driver input from a shader overwrite, while
@@ -7674,8 +7680,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // can remain in the architectural mask domain only when the dispatcher proves that
                 // sibling is scalar data at this exact PC. Otherwise admit only a whole-stream
                 // low-only proof and poison VCC until its later complete replacement.
+                const bool path_local_scalar_pair =
+                    rs.scalar_presence_has_no_placeholders && rs.sreg.contains(107);
+                const bool complete_scalar_pair =
+                    path_local_scalar_pair || b.vcc_b32_scalar_pair_pcs.contains(in.pc);
                 if (!is_gtav_wave64_vcc_lo_scalar_cselect(in) ||
-                    (!b.vcc_b32_scalar_pair_pcs.contains(in.pc) &&
+                    (!complete_scalar_pair &&
                      !b.vcc_b32_low_only_pcs.contains(in.pc)) || !rs.scc) {
                     ok = false; return true;
                 }
@@ -7687,7 +7697,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_bool.erase(106);
                 rs.sreg_bool_narrowed.erase(106);
                 rs.sreg_bool_b32.erase(106);
-                if (b.vcc_b32_scalar_pair_pcs.contains(in.pc)) {
+                if (complete_scalar_pair) {
                     auto high = rs.sreg.find(107);
                     if (high == rs.sreg.end()) { ok = false; return true; }
                     const uint32_t lane = b.ibin(
@@ -16143,6 +16153,7 @@ bool emit_cfg_state_machine(
 
     auto load_state = [&](uint32_t dispatch = UINT32_MAX) {
         RegState state;
+        state.scalar_presence_has_no_placeholders = false;
         state.max_vgpr = initial.max_vgpr;
         state.sreg_input = initial.sreg_input;
         state.smem_x16_descriptor_loads = initial.smem_x16_descriptor_loads;
@@ -18741,6 +18752,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (!emit_range(0, F.branch_pc)) return false;
             if (idx >= ins.size() || ins[idx].pc != F.branch_pc) return false;
             ++idx; // consume the conditional branch
+            // The structured PHIs below use zero for an SGPR absent on one predecessor. From this
+            // point onward map presence alone is no longer a scalar-lifetime MUST fact.
+            rs.scalar_presence_has_no_placeholders = false;
             // An scc-conditioned forward-if with a POISONED SCC (rs.scc == 0: a 64-bit mask op was
             // the last architectural SCC writer, unrepresentable per-lane) must reject — this is
             // exactly the non-adjacent stale-SCC consumer from the ISA audit (#879).
@@ -18844,6 +18858,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             return false;
         const uint32_t preheader = b.cur_block;
         const uint32_t hdr = b.id(), check = b.id(), body = b.id(), cont = b.id(), merge = b.id();
+        // Loop-carried PHIs likewise seed a missing preheader SGPR with zero.
+        rs.scalar_presence_has_no_placeholders = false;
         b.emit_branch(hdr); b.emit_label(hdr);
         struct PhiRec { int reg; int dom; uint32_t phi; size_t patch; };   // dom: 0=vreg,1=sreg,2=scc,3=vcc,4=exec
         std::vector<PhiRec> phis;
@@ -19263,6 +19279,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // inside the body does not dominate it — a later read then rejects loudly instead of
         // emitting invalid SPIR-V). Execution tests cover both wave-vote outcomes and direct breaks.
         std::function<bool(const DivLoop&)> emit_divloop = [&](const DivLoop& L) -> bool {
+            // A loop-carried SGPR absent at the preheader receives a zero PHI input, so compact map
+            // presence inside or after the loop cannot stand in for a scalar-lifetime MUST proof.
+            rs.scalar_presence_has_no_placeholders = false;
             const bool entry_exec_narrowed = rs.exec_narrowed;
             std::set<int> cv, cs, condv, conds, scalar_may_writes;
             loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
@@ -19425,6 +19444,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (next_br == hi) return true;
                 const ForwardIf F = Fs[bi++];
                 if (idx < ins.size() && ins[idx].pc == F.branch_pc) ++idx;   // skip the branch itself
+                // Arm merges synthesize zero for a scalar absent on either predecessor. Keep the
+                // branch-free prefix eligible for exact path-local proofs, then turn them off for
+                // both arms and every successor of this construct.
+                rs.scalar_presence_has_no_placeholders = false;
                 // scc0/vccz/execz: branch (skip block) taken when the flag==0 → the block runs when
                 // flag!=0; scc1/vccnz are the inverse. Compute and fragment reduce per-invocation
                 // mask bits to the architecture's wave-wide "any lane active" predicate.
