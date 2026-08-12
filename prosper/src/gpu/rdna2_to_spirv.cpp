@@ -5674,10 +5674,14 @@ uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
             if (in.opcode == 0x360 || in.opcode == 0x361 ||
                 in.opcode == 0x365 || in.opcode == 0x366 || in.opcode == 0x11f)
                 return source < 2 ? 1u : UINT32_MAX;
+            if (in.opcode == kVop3OpcodeLshlrevB64 ||
+                in.opcode == kVop3OpcodeLshrrevB64)
+                return source == 0 ? 1u : (source == 1 ? 2u : UINT32_MAX);
             if (in.opcode == 0x101)
                 return source < 2 ? 1u : 2u; // cndmask data is B32; condition is a pair
             if (in.opcode == 0x141 || in.opcode == 0x143 || in.opcode == 0x347 ||
-                in.opcode == 0x36f || in.opcode == kVop3OpcodeAdd3U32)
+                in.opcode == 0x36f || in.opcode == kVop3OpcodeAdd3U32 ||
+                in.opcode == kVop3OpcodeAndOrB32)
                 return 1;
             return 2;
         default:
@@ -6802,9 +6806,12 @@ int shader_max_vgpr(const std::vector<Rdna2Inst>& ins) {
     int highest = 0;
     for (const auto& in : ins) {
         if (in.is_end) break;
-        for (uint32_t source = 0; source < in.n_src; ++source)
-            if (in.src[source].kind == OperandKind::VGPR)
-                highest = std::max(highest, in.src[source].value);
+        for (uint32_t source = 0; source < in.n_src; ++source) {
+            const uint32_t source_span = rdna2_vgpr_source_span(in, source);
+            if (source_span)
+                highest = std::max(highest,
+                    in.src[source].value + static_cast<int>(source_span) - 1);
+        }
         const uint32_t destination_span = rdna2_vgpr_destination_span(in);
         if (destination_span)
             highest = std::max(highest,
@@ -11407,7 +11414,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         b.ucmp(Op_ULessThan, byte, b.uconst(4)), low,
                         b.sel(b.ucmp(Op_ULessThan, byte, b.uconst(8)), upper, b.uconst(0)));
                 }
-            } else if (in.opcode == 0x2FF) {                          // v_lshlrev_b64
+            } else if (in.opcode == kVop3OpcodeLshlrevB64) {         // v_lshlrev_b64
                 // GTA V constructs a per-lane bit as `1ull << lane` immediately after MBCNT. This
                 // bounded admission keeps SRC1 at the exact inline integer 1; general register-pair
                 // and floating-inline sources need wider source-span/provenance handling.
@@ -11425,6 +11432,33 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     const uint32_t result = b.u64_shift(
                         Op_ShiftLeftLogical,
                         b.u64_from_lohi(b.uconst(1), b.uconst(0)), amount);
+                    const int hi_dst = in.dst.value + 1;
+                    const uint32_t old_hi = vreg_old(b, rs, hi_dst);
+                    vreg[in.dst.value] = b.u64_lo(result);
+                    vreg[hi_dst] = b.u64_hi(result);
+                    predicate_write(b, rs, hi_dst, old_hi);
+                }
+            } else if (in.opcode == kVop3OpcodeLshrrevB64) {         // v_lshrrev_b64
+                // GTA V's compact-BVH kernels shift a VGPR pair by either a scalar scratch word or
+                // a VGPR lane value. RDNA masks the count to six bits. Keep the pair and modifier
+                // admission exact: SRC1 must be an addressable consecutive register pair, and this
+                // integer operation has no float modifiers or output modifier spelling.
+                const uint32_t opsel = (in.words[0] >> 11) & 0xFu;
+                const bool source_pair = in.src[1].kind == OperandKind::VGPR &&
+                                         in.src[1].value >= 0 && in.src[1].value < 255;
+                if (in.dst.value < 0 || in.dst.value >= 255 || !source_pair ||
+                    in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
+                    in.src_neg[0] || in.src_neg[1] || in.src_neg[2] ||
+                    in.clamp || in.omod || opsel) {
+                    ok = false;
+                } else {
+                    const uint32_t amount = b.ibin(
+                        Op_BitwiseAnd, val(in.src[0]), b.uconst(63));
+                    Operand high_source = in.src[1];
+                    ++high_source.value;
+                    const uint32_t result = b.u64_shift(
+                        Op_ShiftRightLogical,
+                        b.u64_from_lohi(val(in.src[1]), val(high_source)), amount);
                     const int hi_dst = in.dst.value + 1;
                     const uint32_t old_hi = vreg_old(b, rs, hi_dst);
                     vreg[in.dst.value] = b.u64_lo(result);
@@ -11463,7 +11497,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (in.opcode == 0x346) {                          // v_lshl_add_u32 = (s0<<(s1&31))+s2
                 uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
                 vreg[in.dst.value] = b.ibin(Op_IAdd, b.ibin(Op_ShiftLeftLogical, val(in.src[0]), sh), val(in.src[2]));
-            } else if (in.opcode == 0x371) {                          // v_and_or_b32 = (s0&s1)|s2
+            } else if (in.opcode == kVop3OpcodeAndOrB32) {           // v_and_or_b32 = (s0&s1)|s2
                 uint32_t t = b.ibin(Op_BitwiseAnd, val(in.src[0]), val(in.src[1]));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, t, val(in.src[2]));
             } else if (in.opcode == 0x372) {                          // v_or3_b32 = s0|s1|s2
@@ -15545,11 +15579,8 @@ bool emit_cfg_state_machine(
         for (const auto& in : ins) {
             if (in.pc < lo || in.pc >= hi) continue;
             for (uint32_t source = 0; source < in.n_src; ++source) {
-                if (in.src[source].kind == OperandKind::VGPR) {
-                    // DS read/write2 and 64/96/128-bit transfers consume consecutive VGPRs that the
-                    // packet represents by their base register. Four is a safe architectural upper
-                    // bound for the forms accepted by emit_alu.
-                    const uint32_t words = in.fmt == Rdna2Format::DS ? 4u : 1u;
+                const uint32_t words = rdna2_vgpr_source_span(in, source);
+                if (words) {
                     for (uint32_t word = 0; word < words; ++word)
                         vector_reads[block].insert(
                             in.src[source].value + static_cast<int>(word));
