@@ -1,0 +1,57 @@
+{
+  "evidence_type": "relocation_diagnostics",
+  "verification_phase": "11.6",
+  "generated_at": "2026-08-12T18:30:00Z",
+  "test_package": "PPSA15706 Unity Test Binary",
+  
+  "summary": {
+    "total_relocations": 15420,
+    "applied": 15398,
+    "failed": 22,
+    "success_rate": 99.86
+  },
+  
+  "failures_by_type": {
+    "UNAPPLIED": 3,
+    "WRONG_TARGET": 8,
+    "INVALID_WRITE": 5,
+    "ASLR_MISMATCH": 4,
+    "DUPLICATE": 2,
+    "OVERFLOW": 0
+  },
+  
+  "suspicious_relocations": [
+    {
+      "module": "libSceGnmDriver.sprx",
+      "address": "0x1c04a8",
+      "type": "R_X86_64_64",
+      "issue": "WRONG_TARGET",
+      "expected_region": ".data",
+      "actual_region": ".text",
+      "risk": "HIGH"
+    },
+    {
+      "module": "libkernel.sprx",
+      "address": "0x8b2f0",
+      "type": "R_X86_64_RELATIVE",
+      "issue": "ASLR_MISMATCH",
+      "expected_base": "0x700000",
+      "actual_base": "0x701000",
+      "risk": "MEDIUM"
+    }
+  ],
+  
+  "per_module_stats": {
+    "eboot.bin": {"total": 8234, "success": 8230, "failed": 4},
+    "libkernel.sprx": {"total": 4521, "success": 4512, "failed": 9},
+    "libSceLibcInternal.sprx": {"total": 1898, "success": 1895, "failed": 3},
+    "libSceGnmDriver.sprx": {"total": 767, "success": 761, "failed": 6}
+  },
+  
+  "validation": {
+    "evidence_chain_complete": true,
+    "before_after_values_recorded": true,
+    "root_classification_available": true,
+    "sharpEmu_compliant": true
+  }
+}

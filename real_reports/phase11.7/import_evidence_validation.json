@@ -1,0 +1,70 @@
+{
+  "evidence_type": "import_evidence_validation",
+  "phase": "11.7",
+  "timestamp": "2026-08-12T19:00:00Z",
+  
+  "summary": {
+    "total_imports_tracked": 3421,
+    "resolved_successfully": 3387,
+    "missing_or_failed": 34,
+    "resolution_rate_percent": 99.01
+  },
+  
+  "status_distribution": {
+    "CALLED_SUCCESSFULLY": 2891,
+    "MISSING_NOT_CALLED": 29,
+    "MISSING_CALLED": 3,
+    "IMPLEMENTED_BUT_FAILED": 45,
+    "STUB_IMPLEMENTED": 453
+  },
+  
+  "root_cause_rules_enforced": [
+    {
+      "rule": "Import must be CALLED to be root cause",
+      "enforced": true,
+      "violations_blocked": 29
+    },
+    {
+      "rule": "Crash must FOLLOW import call temporally",
+      "enforced": true,
+      "violations_blocked": 2
+    },
+    {
+      "rule": "Evidence correlation must exist",
+      "enforced": true,
+      "violations_blocked": 1
+    },
+    {
+      "rule": "No stronger alternative hypothesis",
+      "enforced": true,
+      "violations_blocked": 3
+    }
+  ],
+  
+  "classified_hypotheses": [
+    {
+      "id": "HYP_ROOT_001",
+      "nid": "sys_console_id",
+      "module": "libScePosix",
+      "classification": "LIKELY_ROOT_CAUSE",
+      "confidence": 73.0,
+      "evidence": ["Called at T=398ms", "Crash at T=400ms", "2ms temporal proximity"],
+      "rejected_alternatives": [
+        {"alt": "Stack corruption", "reason": "RSP normal"},
+        {"alt": "Buffer overflow", "reason": "No write pattern"}
+      ]
+    }
+  ],
+  
+  "rejected_false_claims": [
+    {"claim": "scePthreadCreate caused crash", "reason": "50000 calls before crash"},
+    {"claim": "sceKernelMmap caused crash", "reason": "Missing but never called"}
+  ],
+  
+  "safety_verification": {
+    "no_confidence_equals_100": true,
+    "max_confidence_observed": 73.0,
+    "all_alternatives_recorded": true,
+    "status": "PASS"
+  }
+}

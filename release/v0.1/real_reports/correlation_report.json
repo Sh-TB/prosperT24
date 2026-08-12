@@ -1,0 +1,26 @@
+{
+  "report_type": "CORRELATION_REPORT",
+  "generated_at": "2026-08-12T16:44:47.277575",
+  "crash_summary": {
+    "signal": 11,
+    "fault_address": "0x801E518C8",
+    "time": "2026-08-12T16:44:47.162446"
+  },
+  "primary_hypothesis": {
+    "cause": "Unknown cause - insufficient evidence",
+    "confidence": "25%",
+    "requires_human_verification": true
+  },
+  "statistics": {
+    "total_hypotheses_generated": 2,
+    "rejected_hypotheses_recorded": 1,
+    "note": "All rejected hypotheses are recorded for transparency"
+  },
+  "recommendations": [
+    "Review relocation failures in detail",
+    "Check for unresolved symbols in dependent modules",
+    "Verify ASLR base addresses match expected values",
+    "Examine caller of any missing imports"
+  ],
+  "disclaimer": "AI analysis provides hypotheses only. Human judgment required for definitive diagnosis."
+}

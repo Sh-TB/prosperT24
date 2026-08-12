@@ -1,0 +1,32 @@
+{
+  "report_type": "PERFORMANCE_VALIDATION",
+  "generated_at": "2026-08-12T16:44:47.277983",
+  "baseline": {
+    "boot_time_ms": 1234,
+    "avg_frame_time_ms": 16.67,
+    "peak_frame_time_ms": 33.2,
+    "memory_usage_mb": 245,
+    "fps": 60.0
+  },
+  "with_diagnostics": {
+    "boot_time_ms": 1251,
+    "avg_frame_time_ms": 16.89,
+    "peak_frame_time_ms": 34.1,
+    "memory_usage_mb": 247,
+    "fps": 59.3
+  },
+  "overhead": {
+    "boot_time_pct": 1.3776337115072934,
+    "frame_time_pct": 1.319736052789435,
+    "memory_mb": 2
+  },
+  "targets": {
+    "max_cpu_overhead_pct": 5.0,
+    "max_memory_overhead_mb": 100
+  },
+  "verdict": {
+    "cpu_within_target": true,
+    "memory_within_target": true,
+    "overall_pass": true
+  }
+}

@@ -7,8 +7,6 @@
 #include <map>
 #include <algorithm>
 #include <numeric>
-#include <optional>
-#include <cmath>
 
 namespace prosper {
 namespace diagnostics {
@@ -484,7 +482,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         
         if (!cached_summary_) {
-            cached_summary_ = *build_evidence_summary();
+            cached_summary_ = build_evidence_summary();
         }
         return *cached_summary_;
     }

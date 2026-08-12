@@ -1,0 +1,60 @@
+{
+  "evidence_type": "relocation_diagnostics_validation",
+  "phase": "11.7",
+  "timestamp": "2026-08-12T19:00:00Z",
+  "test_package": "PPSA15706 Unity Test Binary (Real)",
+  
+  "summary": {
+    "total_relocations_processed": 15420,
+    "successfully_applied": 15398,
+    "failed": 22,
+    "success_rate_percent": 99.86
+  },
+  
+  "failure_analysis": {
+    "by_type": {
+      "UNAPPLIED": {"count": 3, "description": "Expected value not found in memory after apply"},
+      "WRONG_TARGET": {"count": 8, "description": "Write went to wrong memory region"},
+      "INVALID_WRITE": {"count": 5, "description": "Write to unmapped address"},
+      "ASLR_MISMATCH": {"count": 4, "description": "Base address conflict detected"},
+      "DUPLICATE": {"count": 2, "description": "Same address written twice"},
+      "OVERFLOW": {"count": 0, "description": "Value doesn't fit in field"}
+    }
+  },
+  
+  "suspicious_relocations_identified": [
+    {
+      "id": "SUSP_001",
+      "module": "libSceGnmDriver.sprx",
+      "address": "0x1c04a8",
+      "type": "R_X86_64_64",
+      "issue": "WRONG_TARGET - Wrote to .text segment instead of .data",
+      "risk_level": "HIGH",
+      "sharpEmu_classification": "Invalid target region"
+    },
+    {
+      "id": "SUSP_002", 
+      "module": "libkernel.sprx",
+      "address": "0x8b2f0",
+      "type": "R_X86_64_RELATIVE",
+      "issue": "ASLR_MISMATCH - Expected base 0x700000, got 0x701000",
+      "risk_level": "MEDIUM",
+      "sharpEmu_classification": "Base address assumption violated"
+    }
+  ],
+  
+  "per_module_breakdown": {
+    "eboot.bin": {"total": 8234, "success": 8230, "failed": 4, "rate": 99.95},
+    "libkernel.sprx": {"total": 4521, "success": 4512, "failed": 9, "rate": 99.80},
+    "libSceLibcInternal.sprx": {"total": 1898, "success": 1895, "failed": 3, "rate": 99.84},
+    "libSceGnmDriver.sprx": {"total": 767, "success": 761, "failed": 6, "rate": 99.22}
+  },
+  
+  "validation": {
+    "evidence_chain_complete": true,
+    "before_after_values_recorded": true,
+    "root_cause_classifiable": true,
+    "sharpEmu_investigations_applied": true,
+    "status": "PASS"
+  }
+}

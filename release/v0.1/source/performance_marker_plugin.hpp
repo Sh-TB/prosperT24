@@ -23,22 +23,6 @@ namespace prosper {
 namespace diagnostics {
 
 //=============================================================================
-// Helper Functions
-//=============================================================================
-
-/**
- * @brief Convert double to string with specified precision
- * @param value The double value to convert
- * @param precision Number of decimal places
- * @return Formatted string
- */
-inline std::string to_string_prec(double value, int precision) {
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(precision) << value;
-    return oss.str();
-}
-
-//=============================================================================
 // Frame Data Structure
 //=============================================================================
 
@@ -534,8 +518,8 @@ public:
                 }
                 
                 result.description = "Frame " + std::to_string(it->frame_number) + 
-                    " spike: " + to_string_prec(frame_time_ms, 1) + "ms (" +
-                    to_string_prec(result.deviation_percent, 1) + "% above average)";
+                    " spike: " + std::to_string(frame_time_ms, 1) + "ms (" +
+                    std::to_string(result.deviation_percent, 1) + "% above average)";
                 
                 // Record spike
                 spike_history_.push_back(result);
@@ -713,7 +697,7 @@ private:
             event.severity = frame_ms > target_frame_ms_ * 4.0 ? 
                              Severity::WARNING : Severity::INFO;
             event.message = "Frame " + std::to_string(frame.frame_number) + 
-                           " ended: " + to_string_prec(frame_ms, 1) + "ms";
+                           " ended: " + std::to_string(frame_ms, 1) + "ms";
             event.category = "performance";
             event.numeric_data["frame_number"] = frame.frame_number;
             event.float_data["frame_time_ms"] = frame_ms;
@@ -738,7 +722,7 @@ private:
         event.source_plugin = name();
         event.event_type = "vsync";
         event.severity = Severity::DEBUG;
-        event.message = "VSync at " + to_string_prec(timestamp_to_ms(time), 1) + "ms";
+        event.message = "VSync at " + std::to_string(timestamp_to_ms(time), 1) + "ms";
         event.category = "performance";
         
         emit_event(event);

@@ -5,7 +5,6 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
-#include <algorithm>
 
 /**
  * @file ai_report_generator_plugin.hpp
@@ -22,19 +21,6 @@
 
 namespace prosper {
 namespace diagnostics {
-
-//=============================================================================
-// Helper Functions
-//=============================================================================
-
-/**
- * @brief Convert double to string with specified precision
- */
-inline std::string to_string_prec(double value, int precision) {
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(precision) << value;
-    return oss.str();
-}
 
 //=============================================================================
 // Hypothesis Structure
@@ -56,7 +42,7 @@ struct Hypothesis {
         std::ostringstream oss;
         oss << "{";
         oss << "\"description\":\"" << escape_json(description) << "\",";
-        oss << "\"confidence\":" << std::fixed << std::setprecision(2) << confidence << ",";
+        oss << "\"confidence\":" << std::fixed << std::setprecision(2) confidence << ",";
         oss << "\"severity\":\"" << to_string(severity) << "\",";
         oss << "\"category\":\"" << escape_json(category) << "\",";
         oss << "\"source_plugin\":\"" << escape_json(source_plugin) << "\",";
@@ -267,14 +253,18 @@ struct GeneratedReport {
     
 private:
     static std::string format_timestamp(Timestamp ts) {
-        // Convert high_resolution_clock duration to milliseconds for display
-        auto duration = ts.time_since_epoch();
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-        
-        // Simple formatted output showing ms since epoch
-        std::ostringstream oss;
-        oss << "T+" << (ms / 1000) << "." << std::setfill('0') << std::setw(3) << (ms % 1000) << "s";
-        return oss.str();
+        auto time_t_val = std::chrono::system_clock::to_time_t(
+            std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                ts - Timestamp{} + std::chrono::system_clock::now() - now()));
+        std::tm tm_buf{};
+#ifdef _WIN32
+        gmtime_s(&tm_buf, &time_t_val);
+#else
+        gmtime_r(&time_t_val, &tm_buf);
+#endif
+        char buffer[64];
+        std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S UTC", &tm_buf);
+        return std::string(buffer);
     }
 };
 
@@ -803,7 +793,7 @@ private:
             if (frame_count > 0) {
                 double avg_spike_ms = total_frame_time / frame_count;
                 h.evidence.push_back("Average spike duration: " + 
-                    to_string_prec(avg_spike_ms, 1) + "ms");
+                    std::to_string(avg_spike_ms, 1) + "ms");
             }
             if (slow_frame_count > 0) {
                 h.evidence.push_back(std::to_string(slow_frame_count) + 
@@ -849,7 +839,7 @@ private:
             h.evidence.push_back(std::to_string(slow_hle_calls) + " slow HLE calls recorded");
             if (!slowest_function.empty()) {
                 h.evidence.push_back("Slowest function: " + slowest_function + 
-                    " (" + to_string_prec(slowest_duration / 1000.0, 1) + "ms)");
+                    " (" + std::to_string(slowest_duration / 1000.0, 1) + "ms)");
             }
             
             h.suggested_actions.push_back("Profile and optimize frequently-called HLE functions");

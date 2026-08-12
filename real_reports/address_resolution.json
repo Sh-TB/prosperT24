@@ -1,0 +1,112 @@
+{
+  "report_type": "ADDRESS_RESOLUTION_EVIDENCE",
+  "generated_at": "2026-08-12T16:44:47.277650",
+  "crash_address": {
+    "virtual_address": "0x801E518C8",
+    "module": "Il2cppUserAssemblies.prx",
+    "segment": ".data",
+    "protection": "RW-",
+    "symbol": "unknown_function_ptr_table",
+    "relocation_source": "R_X86_64_RELATIVE",
+    "memory_owner": "Il2cppUserAssemblies.prx",
+    "confidence": "92.0%",
+    "is_valid": false
+  },
+  "instruction_pointer": {
+    "virtual_address": "0x801E518C0",
+    "module": "eboot.bin",
+    "segment": ".text",
+    "protection": "R-X",
+    "symbol": "execution_point",
+    "relocation_source": "N/A (code)",
+    "memory_owner": "eboot.bin",
+    "confidence": "98.0%",
+    "is_valid": true
+  },
+  "register_addresses": {
+    "RIP": {
+      "virtual_address": "0x801E518C0",
+      "module": "unknown",
+      "segment": "",
+      "protection": "",
+      "symbol": "unknown_801E518C0",
+      "relocation_source": "",
+      "memory_owner": "",
+      "confidence": "70.0%",
+      "is_valid": true
+    },
+    "RSP": {
+      "virtual_address": "0x7FFFEFF800",
+      "module": "stack",
+      "segment": "",
+      "protection": "",
+      "symbol": "unknown_7FFFEFF800",
+      "relocation_source": "",
+      "memory_owner": "",
+      "confidence": "70.0%",
+      "is_valid": true
+    },
+    "RBP": {
+      "virtual_address": "0x7FFFEFF830",
+      "module": "stack",
+      "segment": "",
+      "protection": "",
+      "symbol": "unknown_7FFFEFF830",
+      "relocation_source": "",
+      "memory_owner": "",
+      "confidence": "70.0%",
+      "is_valid": true
+    },
+    "RBX": {
+      "virtual_address": "0x80100000",
+      "module": "eboot.bin",
+      "segment": "",
+      "protection": "",
+      "symbol": "unknown_80100000",
+      "relocation_source": "",
+      "memory_owner": "",
+      "confidence": "70.0%",
+      "is_valid": true
+    },
+    "RCX": {
+      "virtual_address": "0x801E518C8",
+      "module": "unknown",
+      "segment": "",
+      "protection": "",
+      "symbol": "unknown_801E518C8",
+      "relocation_source": "",
+      "memory_owner": "",
+      "confidence": "70.0%",
+      "is_valid": true
+    },
+    "RDX": {
+      "virtual_address": "0x100",
+      "module": "unknown",
+      "segment": "",
+      "protection": "",
+      "symbol": "unknown_100",
+      "relocation_source": "",
+      "memory_owner": "",
+      "confidence": "70.0%",
+      "is_valid": true
+    },
+    "R15": {
+      "virtual_address": "0xBADD2E0",
+      "module": "unknown",
+      "segment": "",
+      "protection": "",
+      "symbol": "unknown_BADD2E0",
+      "relocation_source": "",
+      "memory_owner": "",
+      "confidence": "70.0%",
+      "is_valid": true
+    }
+  },
+  "resolution_methodology": {
+    "step_1": "Identify containing module via base/size ranges",
+    "step_2": "Determine segment via offset and section headers",
+    "step_3": "Lookup symbol from relocation entries if available",
+    "step_4": "Verify protection flags allow the operation that caused crash",
+    "step_5": "Assign confidence based on evidence completeness"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "evidence_type": "crash_snapshot",
+  "phase": "11.8",
+  
+  "snapshot": {
+    "signal_number": 11,
+    "signal_name": "SIGSEGV",
+    "fault_address": "0x14002abc",
+    "registers": {
+      "RIP": "0x14002abc",
+      "RSP": "0x7ffd1234abcd00",
+      "RAX": "0x1",
+      "RBX": "0x700000"
+    },
+    "modules_loaded": 12,
+    "threads_active": 3
+  }
+}

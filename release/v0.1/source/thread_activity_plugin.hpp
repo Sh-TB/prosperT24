@@ -5,7 +5,6 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
-#include <algorithm>
 
 /**
  * @file thread_activity_plugin.hpp
@@ -102,7 +101,7 @@ struct DeadlockDetectionResult {
         oss << "\"detected_at_ms\":" << timestamp_to_ms(detected_at) << ",";
         oss << "\"description\":\"" << ThreadInfo::escape_json(description) << "\",";
         
-        oss << "\"involved_threads\":[";
+        oss << \"involved_threads\":[";
         for (size_t i = 0; i < involved_threads.size(); ++i) {
             if (i > 0) oss << ",";
             oss << involved_threads[i];
@@ -374,7 +373,7 @@ public:
         
         // Emit diagnostic event
         DiagnosticEvent event;
-        event.source_plugin = DiagnosticPlugin::name();
+        event.source_plugin = name();
         event.event_type = "thread_created";
         event.severity = Severity::INFO;
         event.message = "Thread created: " + info.name + " (TID=" + std::to_string(info.tid) + ")";
@@ -416,7 +415,7 @@ public:
         
         // Emit diagnostic event
         DiagnosticEvent event;
-        event.source_plugin = DiagnosticPlugin::name();
+        event.source_plugin = name();
         event.event_type = "thread_terminated";
         event.severity = Severity::INFO;
         event.message = "Thread terminated: " + it->second.name + " (TID=" + std::to_string(tid) + ")";
@@ -452,7 +451,7 @@ public:
         // Emit diagnostic event for significant state changes
         if (new_state == "blocked" || new_state == "sleeping") {
             DiagnosticEvent event;
-            event.source_plugin = DiagnosticPlugin::name();
+            event.source_plugin = name();
             event.event_type = "state_change";
             event.severity = new_state == "blocked" ? Severity::WARNING : Severity::DEBUG;
             event.message = "Thread " + it->second.name + " state: " + old_state + " -> " + new_state;
@@ -613,7 +612,7 @@ public:
             
             // Emit critical event
             DiagnosticEvent event;
-            event.source_plugin = DiagnosticPlugin::name();
+            event.source_plugin = name();
             event.event_type = "potential_deadlock";
             event.severity = Severity::CRITICAL;
             event.message = result.description;

@@ -6,8 +6,6 @@
 #include <iomanip>
 #include <csignal>
 #include <cstring>
-#include <unordered_set>
-#include <algorithm>
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <execinfo.h>
@@ -353,7 +351,7 @@ public:
         crash->registers.fault_addr = fault_addr;
         
         // Capture stack trace
-        crash->stack_trace = capture_stack_trace_internal(max_stack_frames_);
+        crash->stack_trace = capture_stack_trace_internal();
         
         // Record loaded modules
         crash->loaded_modules.assign(current_modules_.begin(), current_modules_.end());
@@ -373,7 +371,7 @@ public:
         // Auto-save if enabled
         if (auto_save_enabled_) {
             lock.unlock();  // Release lock before I/O
-            save_crash_snapshot_internal(*last_crash_, snapshot_path_);
+            save_crash_snapshot_internal(*last_crash_);
         }
         
         // Emit critical diagnostic event

@@ -500,7 +500,7 @@ private:
         report_ = InitTimelineReport{};
     }
     
-    void update_report() const {
+    mutable void update_report() const {
         report_.current_stage = current_stage_;
         report_.final_stage = current_stage_;  // Will be updated if failed
         report_.stage_timeline = stage_timeline_;
@@ -678,7 +678,7 @@ inline std::string InitTimelineReport::to_markdown() const {
        << crt_state.completion_percentage() << "%\n\n";
     
     md << "| Subsystem | Ready |\n";
-    md << "|-----------|--------|\n";
+    md("|-----------|--------|\n";
     md << "| atexit | " << (crt_state.atexit_setup ? "✅" : "⏳") << " |\n";
     md << "| malloc | " << (crt_state.malloc_initialized ? "✅" : "⏳") << " |\n";
     md << "| signals | " << (crt_state.signal_handlers_set ? "✅" : "⏳") << " |\n";

@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <numeric>
 #include <functional>
-#include <optional>
 
 namespace prosper {
 namespace diagnostics {
@@ -344,7 +343,7 @@ public:
             // Clear buffers
             event_buffer_.clear();
             crash_history_.clear();
-            last_report_.reset();
+            hypothesis_cache_.clear();
             
             // Subscribe to all events for analysis
             if (global::is_initialized()) {
@@ -377,7 +376,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         event_buffer_.clear();
         crash_history_.clear();
-        last_report_.reset();
+        hypothesis_cache_.clear();
     }
     
     /**

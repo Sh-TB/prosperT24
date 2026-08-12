@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <random>
 #include <filesystem>
-#include <optional>
 
 namespace prosper {
 namespace diagnostics {

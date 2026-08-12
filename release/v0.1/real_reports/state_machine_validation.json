@@ -1,0 +1,88 @@
+{
+  "report_type": "STATE_MACHINE_VALIDATION",
+  "generated_at": "2026-08-12T16:44:47.277820",
+  "transitions": [
+    {
+      "from": "POWER_ON",
+      "to": "LOADER_INIT",
+      "timestamp": "2026-08-12T16:44:46.804031",
+      "duration_ms": 0,
+      "valid": true
+    },
+    {
+      "from": "LOADER_INIT",
+      "to": "MODULE_LOAD",
+      "timestamp": "2026-08-12T16:44:46.804103",
+      "duration_ms": 0.072021484375,
+      "valid": true
+    },
+    {
+      "from": "MODULE_LOAD",
+      "to": "SEGMENTS_MAPPED",
+      "timestamp": "2026-08-12T16:44:46.804164",
+      "duration_ms": 0.061279296875,
+      "valid": true
+    },
+    {
+      "from": "SEGMENTS_MAPPED",
+      "to": "RELOCATION",
+      "timestamp": "2026-08-12T16:44:46.804174",
+      "duration_ms": 0.010009765625,
+      "valid": true
+    },
+    {
+      "from": "RELOCATION",
+      "to": "IMPORT_RESOLUTION",
+      "timestamp": "2026-08-12T16:44:47.152100",
+      "duration_ms": 347.925537109375,
+      "valid": true
+    },
+    {
+      "from": "IMPORT_RESOLUTION",
+      "to": "INIT",
+      "timestamp": "2026-08-12T16:44:47.152259",
+      "duration_ms": 0.158935546875,
+      "valid": true
+    },
+    {
+      "from": "INIT",
+      "to": "RUNNING",
+      "timestamp": "2026-08-12T16:44:47.152272",
+      "duration_ms": 0.01318359375,
+      "valid": true
+    },
+    {
+      "from": "RUNNING",
+      "to": "FIRST_RENDER",
+      "timestamp": "2026-08-12T16:44:47.162368",
+      "duration_ms": 10.096435546875,
+      "valid": true
+    },
+    {
+      "from": "FIRST_RENDER",
+      "to": "BOOT_COMPLETE",
+      "timestamp": "2026-08-12T16:44:47.162425",
+      "duration_ms": 0.056640625,
+      "valid": true
+    }
+  ],
+  "violations": [],
+  "validation_result": {
+    "passed": true,
+    "total_transitions": 9,
+    "violations_detected": 0,
+    "final_state": "CRASHED"
+  },
+  "state_machine_definition": {
+    "valid_sequences": [
+      "POWER_ON \u2192 LOADER_INIT \u2192 MODULE_LOAD \u2192 SEGMENTS_MAPPED \u2192 RELOCATION \u2192 IMPORT_RESOLUTION \u2192 INIT \u2192 RUNNING \u2192 FIRST_RENDER \u2192 BOOT_COMPLETE"
+    ],
+    "terminal_states": [
+      "BOOT_COMPLETE",
+      "CRASHED"
+    ],
+    "error_states": [
+      "CRASHED"
+    ]
+  }
+}

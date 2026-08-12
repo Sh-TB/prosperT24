@@ -5,7 +5,6 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
-#include <algorithm>
 
 /**
  * @file file_access_plugin.hpp
@@ -802,7 +801,7 @@ private:
         // Update file statistics
         auto it = file_stats_.find(access.path);
         if (it == file_stats_.end()) {
-            FileStatistics stats;
+            FileStats stats;
             stats.path = access.path;
             stats.update(access);
             file_stats_[access.path] = stats;

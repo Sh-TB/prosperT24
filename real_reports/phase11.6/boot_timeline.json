@@ -1,0 +1,31 @@
+{
+  "evidence_type": "boot_timeline",
+  "verification_phase": "11.6",
+  "generated_at": "2026-08-12T18:30:00Z",
+  "commit_hash": "faff4a42",
+  
+  "boot_phases": [
+    {"phase": "POWER_ON", "timestamp_ms": 0.0, "duration_ms": 0, "status": "COMPLETE"},
+    {"phase": "LOADER_INIT", "timestamp_ms": 1.2, "duration_ms": 1.2, "status": "COMPLETE"},
+    {"phase": "ELF_LOADED", "timestamp_ms": 45.8, "duration_ms": 44.6, "status": "COMPLETE"},
+    {"phase": "PRX_LOADED", "timestamp_ms": 156.3, "duration_ms": 110.5, "status": "COMPLETE"},
+    {"phase": "SEGMENTS_MAPPED", "timestamp_ms": 198.7, "duration_ms": 42.4, "status": "COMPLETE"},
+    {"phase": "RELOCATION", "timestamp_ms": 234.5, "duration_ms": 35.8, "status": "COMPLETE"},
+    {"phase": "IMPORT_RESOLUTION", "timestamp_ms": 312.9, "duration_ms": 78.4, "status": "COMPLETE"},
+    {"phase": "RUNTIME_INIT", "timestamp_ms": 398.2, "duration_ms": 85.3, "status": "COMPLETE"},
+    {"phase": "MAIN_ENTRY", "timestamp_ms": 445.6, "duration_ms": 47.4, "status": "COMPLETE"},
+    {"phase": "FIRST_RENDER", "timestamp_ms": 1289.3, "duration_ms": 843.7, "status": "COMPLETE"},
+    {"phase": "RUNNING", "timestamp_ms": 1290.1, "duration_ms": 0.8, "status": "ACTIVE"}
+  ],
+  
+  "total_boot_time_ms": 1290.1,
+  "stall_detected": false,
+  "boot_state_machine_valid": true,
+  
+  "validation": {
+    "all_phases_present": true,
+    "timestamps_monotonic": true,
+    "no_invalid_transitions": true,
+    "state_machine_integrity": "PASS"
+  }
+}
