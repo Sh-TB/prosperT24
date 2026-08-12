@@ -19037,12 +19037,23 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
             if (dispatcher_initializer_dominates) {
                 const uint32_t last_store_pc = ins[phase_stores.back()].pc;
                 for (const Rdna2Inst& edge : ins) {
-                    if (edge.pc >= phase_dispatcher_initializer_pc ||
-                        edge.fmt != Rdna2Format::SOPP || edge.opcode < 0x02 ||
-                        edge.opcode > 0x09 || edge.opcode == 0x03)
-                        continue;
-                    const uint32_t target = branch_target(edge);
-                    if (target > phase_dispatcher_initializer_pc && target <= last_store_pc) {
+                    // The deferred proof deliberately owns only a linear initializer region. Any
+                    // scalar edge in that region could skip one of its lane-zero operations, while
+                    // a later edge back into it could revisit a store after EXEC was restored full.
+                    // Reject both, independent of whether the branch condition happens to look
+                    // constant in this shader. GTA's captured initializer has no such edges.
+                    if (edge.fmt == Rdna2Format::SOPP && edge.opcode >= 0x02 &&
+                        edge.opcode <= 0x09 && edge.opcode != 0x03) {
+                        const uint32_t target = branch_target(edge);
+                        if (edge.pc <= last_store_pc || target <= last_store_pc) {
+                            dispatcher_initializer_dominates = false;
+                            break;
+                        }
+                    }
+                    // An indirect PC update has no statically bounded target, so it cannot prove
+                    // that the single-writer initializer is never re-entered.
+                    if (edge.fmt == Rdna2Format::SOP1 && edge.opcode >= 0x20u &&
+                        edge.opcode <= 0x22u) {
                         dispatcher_initializer_dominates = false;
                         break;
                     }
