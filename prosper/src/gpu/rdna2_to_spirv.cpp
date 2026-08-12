@@ -531,6 +531,10 @@ struct SpirvCompute {
         return sel(ucmp(Op_INotEqual, a, uconst(0)),
                    leading_zeroes, uconst(0xffffffffu));
     }
+    // RDNA V_FFBL_B32 returns the first set-bit index from the LSB, with the same all-ones
+    // sentinel for zero. Reversing the dword turns that index into FFBH's leading-zero count and
+    // keeps the sentinel exact, so both instructions share one zero-safe FindUMsb lowering.
+    uint32_t ffbl_b32(uint32_t a) { return ffbh_u32(iun(Op_BitReverse, a)); }
     // IEEE-754 binary32 ldexp on raw bits, with round-to-nearest-even for a subnormal result.
     // GLSL.std.450 Ldexp is NOT sufficient here: its contract leaves an overflowing product and
     // exp>128 undefined, while a guest exponent is an arbitrary i32. Keep the whole operation in
@@ -9389,6 +9393,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // DPP reaches and rejects in the stage-specific source-transform block above.
                     if (in.has_sdwa || in.has_dpp) { ok = false; break; }
                     d = b.ffbh_u32(a);
+                    break;
+                }
+                case kVop1OpcodeFfblB32: {                            // v_ffbl_b32 (plain e32)
+                    // GTA V's Wave32 terrain dispatcher reaches the exact 0x7e047515 packet at
+                    // pc106. Like FFBH above this integer scan has no valid SDWA/DPP admission:
+                    // accepting either would let the common VOP1 modifier path reinterpret the
+                    // source as float before scanning its bits.
+                    if (in.has_sdwa || in.has_dpp) { ok = false; break; }
+                    d = b.ffbl_b32(a);
                     break;
                 }
                 case 0x43: {   // v_movrels_b32: dst = VGPR[src0# + M0] (relative-indexed VGPR read)
