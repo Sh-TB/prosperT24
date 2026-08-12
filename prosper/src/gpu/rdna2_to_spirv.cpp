@@ -15083,7 +15083,11 @@ bool emit_cfg_state_machine(
 
                 bool writes_b32_mask = false;
                 auto register_mask = [&](const Operand& source) {
-                    return source.value == 126 || source.value == 127 ||
+                    // EXEC_HI is the architectural zero dword in Wave32, not the second half of
+                    // a live mask. Keep this transfer classification aligned with emit_alu's
+                    // scalar materialization so an ordinary value derived from EXEC_HI survives
+                    // dispatcher save/reload boundaries as scalar data.
+                    return (source.kind == OperandKind::Special && source.value == 126) ||
                         ((source.kind == OperandKind::SGPR ||
                           source.kind == OperandKind::Special) &&
                          (masks.contains(source.value) ||
