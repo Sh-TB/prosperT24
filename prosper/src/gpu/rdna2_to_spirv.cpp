@@ -4015,6 +4015,7 @@ inline bool sopk_sets_full_flat_scratch_base(const Rdna2Inst& in) {
 namespace {
 uint32_t scalar_write_width(const Rdna2Inst& in);
 uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in);
+uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source);
 }
 
 inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R) {
@@ -4046,9 +4047,19 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
             if (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x06 || in.opcode == 0x07)) return false;
         }
         switch (in.fmt) {
-            // SOPK is intentionally EXCLUDED: several SOPK ops (s_addk/s_mulk/s_cmovk/s_cmpk) READ or
-            // read-modify-write their "dst" via the implicit SIMM16, but decode with n_src==0 — so the
-            // read-scan below can't see the read and the dst-match would falsely report a redefinition.
+            // Most SOPK instructions remain fail-closed: s_addk/s_mulk/s_cmovk/s_cmpk read or
+            // read-modify-write their encoded "dst" while decode exposes no source. MOVK_I32 is a
+            // pure one-word definition and WAITCNT_VSCNT is register-transparent; GTA's low-only
+            // VCC lifetime crosses both before the actual pair replacement.
+            case Rdna2Format::SOPK:
+                if (in.opcode == kSopkOpcodeWaitcntVscnt &&
+                    in.dst.kind == OperandKind::SGPR && in.dst.value == 125)
+                    break;
+                if (in.opcode == kSopkOpcodeMovkI32 && in.dst.kind == OperandKind::SGPR) {
+                    if (in.dst.value == R) continue;
+                    break;
+                }
+                return false;
             case Rdna2Format::SOPP:
                 // Hint/sync SOPPs read and write nothing — scan through them (s_waitcnt is ubiquitous
                 // after the merge). A barrier is also scalar-register-transparent; it changes only
@@ -4101,18 +4112,14 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                 for (int k = 0; k < in.n_src; k++) {
                     if (in.src[k].kind != OperandKind::SGPR &&
                         in.src[k].kind != OperandKind::Special) continue;
-                    if (in.src[k].value == R) return false;              // direct read before redef -> live
-                    // Vector ALU operands are single dwords even when the scalar field names VCC_LO.
-                    // Do not mistake that low-half read for a read of VCC_HI: a later VOPC can kill the
-                    // complete physical pair before any real B64 consumer. Scalar ALU operands retain
-                    // the conservative pair interpretation because their opcode-specific B32/B64 width
-                    // is not represented in Operand. VOP3 is conservative too: cndmask's third operand
-                    // can be an explicit mask pair. The ordinary VOP1/VOP2/VOPC scalar inputs here are
-                    // dwords (implicit VOP2 VCC-mask readers were handled above). This distinction proves
-                    // UE4's temporary VCC_HI descriptor word dead without weakening mask lifetimes.
-                    const bool dword_vector_alu = in.fmt == Rdna2Format::VOP1 ||
-                        in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOPC;
-                    if (!dword_vector_alu && in.src[k].value == R - 1) return false;
+                    // Operand does not carry B32/B64 width. Use the shared opcode inventory so a
+                    // physical low-half read (notably GTA's CSELECT_B32 -> V_ADD3 chain) cannot
+                    // falsely keep the sibling live, while unlisted VOP3 sources remain pairs.
+                    const uint32_t words = scalar_alu_source_words(in, k);
+                    if (words == UINT32_MAX) continue;
+                    if (R >= in.src[k].value &&
+                        R < in.src[k].value + static_cast<int>(words))
+                        return false;
                 }
                 // A VOP3B carry-out (sdst) is a 64-bit mask write — reads none of R beyond its sources.
                 if (in.sdst.kind == OperandKind::SGPR &&
@@ -4193,7 +4200,7 @@ std::unordered_set<uint32_t> proven_cselect_b64_low_only_pcs(
 // operands are exact dword constants, independent of their values. Whether the untouched VCC_HI
 // word may be discarded or must form a complete scalar pair is proved separately at each PC.
 bool is_gtav_wave64_vcc_lo_scalar_cselect(const Rdna2Inst& in) {
-    return in.fmt == Rdna2Format::SOP2 && in.opcode == 0x0au &&
+    return in.fmt == Rdna2Format::SOP2 && in.opcode == kSop2OpcodeCselectB32 &&
         in.dst.kind == OperandKind::SGPR && in.dst.value == 106 &&
         (in.src[0].kind == OperandKind::InlineInt ||
          in.src[0].kind == OperandKind::InlineFloat) &&
@@ -5563,6 +5570,52 @@ uint32_t scalar_write_width(const Rdna2Inst& in) {
         case Rdna2Format::VOP1: return in.opcode == 0x02 ? 1u : 0u; // v_readfirstlane
         case Rdna2Format::VOP3: return in.opcode == 0x360 ? 1u : 0u; // v_readlane
         default: return 0;
+    }
+}
+
+// Number of consecutive scalar dwords consumed by one explicit ALU source. Operand decode names
+// only the first physical register, so every CFG/liveness user must share this opcode-aware width
+// rather than infer B64 from the register number. Unknown VOP3 operations stay conservative.
+uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
+    switch (in.fmt) {
+        case Rdna2Format::SOP1:
+            if (in.opcode == 0x1f) return UINT32_MAX; // s_getpc has no source
+            if (in.opcode == 0x10 || in.opcode == 0x14 || in.opcode == 0x16 ||
+                in.opcode == 0x18 || in.opcode == 0x2d)
+                return 2;                    // bcnt/ff1/flbit consume a B64 pair
+            return scalar_write_width(in) == 1 ? 1u : 2u;
+        case Rdna2Format::SOP2:
+            if (in.opcode == 0x1f || in.opcode == 0x21)
+                return source == 1 ? 1u : 2u; // B64 shifts use a B32 shift count
+            if (in.opcode == 0x25) return 1;  // BFM width and offset are B32
+            if (in.opcode == 0x29)
+                return source == 1 ? 1u : 2u;
+            return scalar_write_width(in) == 1 ? 1u : 2u;
+        case Rdna2Format::SOPC:
+            return in.opcode == 0x12 || in.opcode == 0x13 ? 2u : 1u;
+        case Rdna2Format::VOP1:
+        case Rdna2Format::VOP2:
+            return 1;
+        case Rdna2Format::VOPC: {
+            const uint32_t effective = vopc_is_cmpx(in.opcode)
+                ? in.opcode - 0x10u : in.opcode;
+            const bool integer64 =
+                (effective >= 0xa1u && effective <= 0xa6u) ||
+                (effective >= 0xe1u && effective <= 0xe6u);
+            return integer64 ? 2u : 1u;
+        }
+        case Rdna2Format::VOP3:
+            if (in.opcode == 0x360 || in.opcode == 0x361 ||
+                in.opcode == 0x365 || in.opcode == 0x366 || in.opcode == 0x11f)
+                return source < 2 ? 1u : UINT32_MAX;
+            if (in.opcode == 0x101)
+                return source < 2 ? 1u : 2u; // cndmask data is B32; condition is a pair
+            if (in.opcode == 0x141 || in.opcode == 0x143 || in.opcode == 0x347 ||
+                in.opcode == 0x36f || in.opcode == kVop3OpcodeAdd3U32)
+                return 1;
+            return 2;
+        default:
+            return 0;
     }
 }
 
@@ -10783,7 +10836,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 vreg[in.dst.value] = b.ibin(Op_IAdd,
                                              b.iun(Op_BitCount, val(in.src[0])),
                                              val(in.src[1]));
-            } else if (in.opcode == 0x36D) {                          // v_add3_u32 = s0+s1+s2
+            } else if (in.opcode == kVop3OpcodeAdd3U32) {             // v_add3_u32 = s0+s1+s2
                 vreg[in.dst.value] = b.ibin(Op_IAdd, b.ibin(Op_IAdd, val(in.src[0]), val(in.src[1])), val(in.src[2]));
             } else if (in.opcode == 0x346) {                          // v_lshl_add_u32 = (s0<<(s1&31))+s2
                 uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
@@ -15202,27 +15255,11 @@ bool emit_cfg_state_machine(
         };
         auto scalar_source_read = [&](const Rdna2Inst& in, uint32_t source)
                 -> ScalarSourceRead {
+            const uint32_t alu_words = scalar_alu_source_words(in, source);
+            if (alu_words == UINT32_MAX) return ScalarSourceRead::None;
+            if (alu_words)
+                return static_cast<ScalarSourceRead>(alu_words);
             switch (in.fmt) {
-                case Rdna2Format::SOP1:
-                    if (in.opcode == 0x1f) return ScalarSourceRead::None; // s_getpc has no source
-                    if (in.opcode == 0x10 || in.opcode == 0x14 ||
-                        in.opcode == 0x16 || in.opcode == 0x18 || in.opcode == 0x2d)
-                        return ScalarSourceRead::Pair; // bcnt/ff1/flbit consume a B64 pair
-                    return scalar_write_width(in) == 1
-                        ? ScalarSourceRead::B32 : ScalarSourceRead::Pair;
-                case Rdna2Format::SOP2:
-                    // B64 shifts take a B64 value followed by a one-dword shift count. BFM's width
-                    // and offset operands are likewise B32 even though its result is a B64 mask.
-                    if (in.opcode == 0x1f || in.opcode == 0x21)
-                        return source == 1 ? ScalarSourceRead::B32 : ScalarSourceRead::Pair;
-                    if (in.opcode == 0x25) return ScalarSourceRead::B32;
-                    if (in.opcode == 0x29)
-                        return source == 1 ? ScalarSourceRead::B32 : ScalarSourceRead::Pair;
-                    return scalar_write_width(in) == 1
-                        ? ScalarSourceRead::B32 : ScalarSourceRead::Pair;
-                case Rdna2Format::SOPC:
-                    return in.opcode == 0x12 || in.opcode == 0x13
-                        ? ScalarSourceRead::Pair : ScalarSourceRead::B32;
                 case Rdna2Format::SMEM:
                     // Ordinary scalar memory uses a two-word base. S_BUFFER_* opcodes use a
                     // complete four-word descriptor; SOFFSET remains one scalar dword.
@@ -15249,40 +15286,6 @@ bool emit_cfg_state_machine(
                             ? ScalarSourceRead::None : ScalarSourceRead::Quad;
                     return ScalarSourceRead::B32;
                 }
-                case Rdna2Format::VOP1:
-                case Rdna2Format::VOP2:
-                    return ScalarSourceRead::B32;
-                case Rdna2Format::VOPC:
-                    // The e64 integer B64 comparison family encodes the low word of a pair. Other
-                    // scalar VALU operands, including SDWA, broadcast exactly one dword.
-                    {
-                        const uint32_t effective = vopc_is_cmpx(in.opcode)
-                            ? in.opcode - 0x10u : in.opcode;
-                        const bool integer64 =
-                            (effective >= 0xa1u && effective <= 0xa6u) ||
-                            (effective >= 0xe1u && effective <= 0xe6u);
-                        return integer64 ? ScalarSourceRead::Pair : ScalarSourceRead::B32;
-                    }
-                case Rdna2Format::VOP3:
-                    // Decode exposes an unused SRC2=s0 on the lane read/write encodings. Their real
-                    // scalar data and lane-selector operands are each one dword. The six ordinary
-                    // VOP3A operations below are the exact GTA consumers in this reject family and
-                    // likewise broadcast one scalar dword per source. Retain the conservative pair
-                    // rule for every un-inventoried VOP3 opcode, including explicit mask inputs.
-                    if (in.opcode == 0x360 || in.opcode == 0x361)
-                        return source < 2 ? ScalarSourceRead::B32 : ScalarSourceRead::None;
-                    if (in.opcode == 0x365 || in.opcode == 0x366)
-                        return source < 2 ? ScalarSourceRead::B32 : ScalarSourceRead::None;
-                    if (in.opcode == 0x11f)
-                        return source < 2 ? ScalarSourceRead::B32 : ScalarSourceRead::None;
-                    // CNDMASK's two data operands are dwords; SRC2 remains a Wave64 condition
-                    // pair and deliberately keeps the conservative full-pair inventory.
-                    if (in.opcode == 0x101)
-                        return source < 2 ? ScalarSourceRead::B32 : ScalarSourceRead::Pair;
-                    if (in.opcode == 0x141 || in.opcode == 0x143 ||
-                        in.opcode == 0x347 || in.opcode == 0x36f)
-                        return ScalarSourceRead::B32;
-                    return ScalarSourceRead::Pair;
                 default:
                     return ScalarSourceRead::Pair;
             }
