@@ -2,6 +2,7 @@
 #include <atomic>
 #include "rdna2_to_spirv.hpp"
 #include "diagnostic_selectors.hpp"
+#include "pm4_registers.hpp"
 #include "rdna2_decode.hpp"
 #include "shader_resources.hpp"
 #include <algorithm>
@@ -445,6 +446,7 @@ struct SpirvCompute {
     uint32_t native_storage_format_support=0;
     bool storage_buffer_int64_atomics=false;
     bool packed_r11_storage=true;
+    uint32_t compute_pgm_rsrc1=kDefaultComputePgmRsrc1;
     uint32_t compute_min_subgroup_size=0;             // non-semantic backend contract (4/16/32/64)
     uint32_t fragment_required_subgroup_size=0;       // exact guest-wave contract (32 or 64)
     // WHY that width was required, as a bitmask (#2147). The size alone is not actionable: a
@@ -2272,12 +2274,28 @@ struct SpirvCompute {
         put(code, Op_Label, {merge}); cur_block = merge;
         return emit_phi_2way(t_u32, result, then_end, fallback, entry);
     }
-    // RDNA2 BUFFER_ATOMIC_FMIN/FMAX share DS_MIN/MAX_F32's MINNUM/MAXNUM bit semantics, but
-    // operate on descriptor-backed Device memory and optionally return the pre-operation value.
-    // SPIR-V 1.3 has no core floating-point min/max atomic, so use the same raw-u32 CAS loop as LDS.
-    // Keeping all selection arithmetic in integer space also preserves denormal ordering regardless
-    // of the host shader float mode.
+    // RDNA2 BUFFER_ATOMIC_FMIN/FMAX and DS_MIN/MAX_F32 use floating min/max bit semantics, but
+    // operate on memory for which SPIR-V 1.3 has no core floating-point min/max atomic. Keep the CAS
+    // loop and all selection arithmetic in integer space so host-driver float controls cannot alter
+    // the guest result. Signaling NaNs are quieted and propagated before ordinary MINNUM/MAXNUM
+    // selection. COMPUTE_PGM_RSRC1.FP32_DENORM controls whether subnormal operands compare as
+    // signed zero. MIN/MAX still publishes the selected operand's original, non-flushed bits.
     uint32_t atomic_fminmax_bits(uint32_t resident, uint32_t value, bool is_min) {
+        const uint32_t denorm_mode =
+            (compute_pgm_rsrc1 >>
+             prosper::agc::Pm4::COMPUTE_PGM_RSRC1_FP32_DENORM_SHIFT) &
+            prosper::agc::Pm4::COMPUTE_PGM_RSRC1_FP32_DENORM_MASK;
+        const bool flush_inputs = denorm_mode == 0u || denorm_mode == 2u;
+        auto flush_subnormal = [&](uint32_t bits) {
+            const uint32_t absolute = ibin(Op_BitwiseAnd, bits, uconst(0x7fffffffu));
+            const uint32_t nonzero = ucmp(Op_INotEqual, absolute, uconst(0));
+            const uint32_t below_normal = ucmp(Op_ULessThan, absolute, uconst(0x00800000u));
+            const uint32_t subnormal = land(nonzero, below_normal);
+            const uint32_t signed_zero = ibin(Op_BitwiseAnd, bits, uconst(0x80000000u));
+            return sel(subnormal, signed_zero, bits);
+        };
+        const uint32_t resident_compare = flush_inputs ? flush_subnormal(resident) : resident;
+        const uint32_t value_compare = flush_inputs ? flush_subnormal(value) : value;
         auto ordered_key = [&](uint32_t bits) {
             const uint32_t negative = ucmp(
                 Op_INotEqual, ibin(Op_BitwiseAnd, bits, uconst(0x80000000u)), uconst(0));
@@ -2292,14 +2310,27 @@ struct SpirvCompute {
             Op_UGreaterThan, resident_abs, uconst(0x7f800000u));
         const uint32_t value_nan = ucmp(
             Op_UGreaterThan, value_abs, uconst(0x7f800000u));
+        const uint32_t resident_snan = land(
+            resident_nan,
+            ucmp(Op_IEqual,
+                 ibin(Op_BitwiseAnd, resident, uconst(0x00400000u)), uconst(0)));
+        const uint32_t value_snan = land(
+            value_nan,
+            ucmp(Op_IEqual,
+                 ibin(Op_BitwiseAnd, value, uconst(0x00400000u)), uconst(0)));
         const uint32_t ordered = ucmp(
             is_min ? Op_ULessThan : Op_UGreaterThan,
-            ordered_key(value), ordered_key(resident));
+            ordered_key(value_compare), ordered_key(resident_compare));
         const uint32_t numeric = sel(ordered, value, resident);
         const uint32_t resident_number = sel(value_nan, resident, numeric);
         const uint32_t quiet_resident = ibin(
             Op_BitwiseOr, resident, uconst(0x00400000u));
-        return sel(resident_nan, sel(value_nan, quiet_resident, value), resident_number);
+        const uint32_t quiet_value = ibin(
+            Op_BitwiseOr, value, uconst(0x00400000u));
+        return sel(
+            resident_snan, quiet_resident,
+            sel(value_snan, quiet_value,
+                sel(resident_nan, sel(value_nan, quiet_resident, value), resident_number)));
     }
     uint32_t cbuf_atomic_fminmax_rtn(uint32_t idx, uint32_t value, uint32_t binding,
                                      bool is_min, bool predicated, uint32_t pred,
@@ -11807,6 +11838,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
             if (is_atomic) {
+                if (is_atomic_fminmax && b.compute_pgm_rsrc1 == UINT32_MAX) {
+                    ok = false;
+                    return true;
+                }
                 const int d = in.dst.value;
                 const uint32_t old = vreg_old(b, rs, d);
                 const auto it = rs.vreg.find(d);
@@ -13112,7 +13147,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Exact ordinary GFX10 encoding: ADDR + DATA0 only. DATA1 and VDST are reserved for
                 // these non-returning forms (llvm-mc gfx1030 emits both as zero); reject a packet
                 // carrying either field instead of interpreting an unmodeled SRC2/return variant.
-                if ((in.words[1] & 0xffff0000u) != 0u) { ok = false; return true; }
+                if ((in.words[1] & 0xffff0000u) != 0u ||
+                    b.compute_pgm_rsrc1 == UINT32_MAX) { ok = false; return true; }
                 b.lds_atomic_fminmax(idx, vread(in.src[1].value), in.opcode == 0x12,
                                      rs.exec_narrowed, rs.exec);
             } else if (in.opcode >= 0x05 && in.opcode <= 0x0b) {
@@ -19382,7 +19418,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
 
 std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
                                      uint32_t num_inputs, uint32_t out_vgpr,
-                                     const ShaderResourceTable* rt, uint32_t lds_bytes) {
+                                     const ShaderResourceTable* rt, uint32_t lds_bytes,
+                                     uint32_t compute_pgm_rsrc1) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
     // This shell publishes register state after the structured region, so both terminal arms can
@@ -19393,6 +19430,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     if (!prepare_lds_fminmax_synchronization(ins, {}, true)) return {};
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
     SpirvCompute b;
+    b.compute_pgm_rsrc1 = compute_pgm_rsrc1;
     // Size the LDS array from the shader's real allocation when known (#130): bytes -> dwords, at
     // least the ds ops need, clamped to the RDNA2 64 KB (16384-dword) max. 0 keeps the 16 KB default.
     if (lds_bytes) {
@@ -19533,6 +19571,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     b.native_storage_format_support = config.native_storage_format_support;
     b.storage_buffer_int64_atomics = config.storage_buffer_int64_atomics;
     b.packed_r11_storage = config.packed_r11_storage;
+    b.compute_pgm_rsrc1 = config.compute_pgm_rsrc1;
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
             static_cast<uint32_t>(config.user_sgprs.size()));
     b.allow_b32_masks = wave_size == 32;
