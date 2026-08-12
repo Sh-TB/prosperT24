@@ -6488,6 +6488,22 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
             if (it != rs.sreg.end()) return it->second;
             auto input = rs.sreg_input.find(o.value);
             if (input != rs.sreg_input.end()) return input->second;
+            // A proven Wave32 B32 mask occupies one complete physical SGPR. When Vulkan supplies
+            // one exact native subgroup per guest wave, its ballot is therefore the architectural
+            // scalar dword. GTA V's terrain kernel writes s20 with an explicit VOPC destination,
+            // then consumes s20 as ordinary DATA at pc67. The dispatcher MUST analysis filters the
+            // Bool lifetime at every block entry, while record_scalar_write ends it on any scalar
+            // overwrite, so this cannot resurrect a stale mask after an SGPR is recycled.
+            if (b.is_compute && b.wave_size == 32 && b.native_subgroup_size == 32 &&
+                rs.sreg_bool_b32.contains(o.value)) {
+                auto mask = rs.sreg_bool.find(o.value);
+                if (mask != rs.sreg_bool.end()) {
+                    const uint32_t word = b.native_wave_ballot_half(mask->second, 0);
+                    if (word) return word;
+                }
+                if (ok) *ok = false;
+                return b.uconst(0);
+            }
             // A persisted B64 wave mask has no ordinary scalar dword unless the transfer proof
             // retained that word explicitly. Reject a data-domain read of either physical half;
             // returning the generic unwritten-SGPR zero here would silently replace live ballot
@@ -7790,20 +7806,65 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_bool_b32.insert(106);
                 return true;
             }
+            auto wave32_mask_operand = [&](const Operand& source) {
+                // Inline integer/literal operands are representable in both domains. Classify
+                // them as masks so a pure mask operation preserves its Bool lifetime; only a
+                // genuinely mixed mask/raw-data operation should take the scalar route below.
+                if (source.kind == OperandKind::InlineInt ||
+                    source.kind == OperandKind::Literal)
+                    return true;
+                if (source.kind == OperandKind::Special && source.value == 126)
+                    return true; // EXEC_LO
+                return (source.kind == OperandKind::SGPR ||
+                        source.kind == OperandKind::Special) &&
+                    rs.sreg_bool_b32.contains(source.value);
+            };
+            auto wave32_live_mask_operand = [&](const Operand& source) {
+                if (source.kind == OperandKind::Special && source.value == 126)
+                    return true; // EXEC_LO
+                return (source.kind == OperandKind::SGPR ||
+                        source.kind == OperandKind::Special) &&
+                    rs.sreg_bool_b32.contains(source.value);
+            };
+            auto exact_wave32_scalar_dword = [&](const Operand& source) {
+                switch (source.kind) {
+                    case OperandKind::InlineInt:
+                    case OperandKind::InlineFloat:
+                    case OperandKind::Literal:
+                        return true;
+                    case OperandKind::SGPR:
+                        return rs.sreg.contains(source.value) ||
+                            rs.sreg_input.contains(source.value) ||
+                            (b.is_compute && b.wave_size == 32 &&
+                             b.native_subgroup_size == 32 &&
+                             rs.sreg_bool_b32.contains(source.value) &&
+                             rs.sreg_bool.contains(source.value));
+                    case OperandKind::Special:
+                        if (source.value == 125) return true; // SGPR_NULL
+                        if (source.value == 253) return rs.scc != 0;
+                        if (source.value >= 106 && source.value <= 124)
+                            return rs.sreg.contains(source.value);
+                        return b.is_compute && b.wave_size == 32 &&
+                            b.native_subgroup_size == 32 &&
+                            (source.value == 126 || source.value == 127) && rs.exec;
+                    default:
+                        return false;
+                }
+            };
+            const bool mixed_wave32_mask_scalar_data =
+                b.is_compute && b.wave_size == 32 && b.native_subgroup_size == 32 &&
+                in.dst.kind == OperandKind::SGPR && in.dst.value <= 105 &&
+                wave32_mask_operand(in.src[0]) != wave32_mask_operand(in.src[1]) &&
+                exact_wave32_scalar_dword(in.src[0]) &&
+                exact_wave32_scalar_dword(in.src[1]);
             if (b.allow_b32_masks &&
                 (b.is_fragment || (b.is_compute && b.wave_size == 32)) &&
                 !gtav_wave32_vcchi_scalar_packet &&
-                (in.opcode == 0x0e || in.opcode == 0x10 || in.opcode == 0x12 ||
-                 in.opcode == 0x14 || in.opcode == 0x16 || in.opcode == 0x18 ||
-                 in.opcode == 0x1a || in.opcode == 0x1c) &&
+                !mixed_wave32_mask_scalar_data &&
+                sop2_is_b32_logical(in.opcode) &&
                 (in.dst.value == 126 ||
-                 in.src[0].value == 126 || in.src[1].value == 126 ||
-                 ((in.src[0].kind == OperandKind::SGPR ||
-                   in.src[0].kind == OperandKind::Special) &&
-                  rs.sreg_bool_b32.contains(in.src[0].value)) ||
-                 ((in.src[1].kind == OperandKind::SGPR ||
-                   in.src[1].kind == OperandKind::Special) &&
-                  rs.sreg_bool_b32.contains(in.src[1].value)))) {
+                 wave32_live_mask_operand(in.src[0]) ||
+                 wave32_live_mask_operand(in.src[1]))) {
                 // Wave32 B32 logical operations are one-word wave-mask operations, parallel to the
                 // B64 family immediately below. The live Astro material uses
                 //   s_andn2_b32 s64, s64, vcc_hi
@@ -7832,13 +7893,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!m0 || !m1 || in.dst.value == 127) { ok = false; return true; }
                 const uint32_t n0 = b.logical_not(m0), n1 = b.logical_not(m1);
                 const uint32_t x = b.bsel(m0, n1, m1);
-                const uint32_t r = in.opcode == 0x0e ? b.land(m0, m1)
-                                 : in.opcode == 0x10 ? b.lor(m0, m1)
-                                 : in.opcode == 0x12 ? x
-                                 : in.opcode == 0x14 ? b.land(m0, n1)
-                                 : in.opcode == 0x16 ? b.lor(m0, n1)
-                                 : in.opcode == 0x18 ? b.lor(n0, n1)
-                                 : in.opcode == 0x1a ? b.land(n0, n1)
+                const uint32_t r = in.opcode == kSop2OpcodeAndB32 ? b.land(m0, m1)
+                                 : in.opcode == kSop2OpcodeOrB32 ? b.lor(m0, m1)
+                                 : in.opcode == kSop2OpcodeXorB32 ? x
+                                 : in.opcode == kSop2OpcodeAndn2B32 ? b.land(m0, n1)
+                                 : in.opcode == kSop2OpcodeOrn2B32 ? b.lor(m0, n1)
+                                 : in.opcode == kSop2OpcodeNandB32 ? b.lor(n0, n1)
+                                 : in.opcode == kSop2OpcodeNorB32 ? b.land(n0, n1)
                                  : b.logical_not(x);
                 // SCC=(result!=0) is a guest-wave reduction. A fragment with proven Wave32 can
                 // request one exact 32-lane Vulkan subgroup and vote here; compute retains the
@@ -14518,18 +14579,13 @@ bool emit_cfg_state_machine(
     // use one exact subgroup vote. Restrict the vote to the last architectural SCC writer before
     // the branch; generated traversal kernels often chain several mask intersections and only the
     // final result is live, so voting after every intermediate AND would add needless hot-loop work.
-    auto b32_mask_logical_opcode = [](uint32_t opcode) {
-        return opcode == 0x0e || opcode == 0x10 || opcode == 0x12 ||
-               opcode == 0x14 || opcode == 0x16 || opcode == 0x18 ||
-               opcode == 0x1a || opcode == 0x1c;
-    };
     std::unordered_set<uint32_t> native_b32_mask_scc_vote_pcs;
     if (b.native_subgroup_size && proven_wave32_masks) {
         for (size_t i = 0; i + 1 < ins.size(); ++i) {
             const Rdna2Inst& producer = ins[i];
             const Rdna2Inst& consumer = ins[i + 1];
             if (producer.fmt == Rdna2Format::SOP2 &&
-                b32_mask_logical_opcode(producer.opcode) &&
+                sop2_is_b32_logical(producer.opcode) &&
                 consumer.fmt == Rdna2Format::SOPP &&
                 (consumer.opcode == 0x04 || consumer.opcode == 0x05) &&
                 producer.pc + producer.len_dwords == consumer.pc)
