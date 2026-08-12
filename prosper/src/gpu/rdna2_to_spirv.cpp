@@ -5852,10 +5852,10 @@ std::unordered_set<uint32_t> proven_structured_wave64_mask_reduction_pcs(
 }
 
 // Prove GTA V's S_LOAD_DWORDX2 descriptor-fragment shapes: the general register-offset table fetch
-// and the exact immediate +0x58 optional-buffer entry. The load supplies one or two live words of a
-// four-dword V#; scalar code fills or replaces the other words before MUBUF, MTBUF, or S_BUFFER_LOAD
-// consumes the complete live descriptor. The front half has already read the guest words and
-// published the resulting resource at that exact consumer PC, so the loaded fragment is
+// and GTA V's exact immediate +0x50/+0x58 descriptor-table entries. The load supplies one or two
+// live words of a four-dword V#; scalar code fills or replaces the other words before MUBUF, MTBUF,
+// or S_BUFFER_LOAD consumes the complete live descriptor. The front half has already read the guest
+// words and published the resulting resource at that exact consumer PC, so the loaded fragment is
 // provenance-only in SPIR-V and can be represented by zero placeholders.
 //
 // This is deliberately a whole-CFG use proof, not opcode-wide admission. Every reachable path is
@@ -5896,10 +5896,13 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
         const bool optional_null_immediate =
             load.src[1].kind == OperandKind::Special && load.src[1].value == 125 &&
             load.literal == kGtaOptionalBufferPointerOffset;
+        const bool gta_descriptor_immediate = optional_null_immediate ||
+            (load.src[1].kind == OperandKind::Special && load.src[1].value == 125 &&
+             load.literal == kGtaBufferDescriptorFragmentOffset);
         if (load.is_end || load.fmt != Rdna2Format::SMEM ||
             load.opcode != kSmemOpcodeLoadDwordX2 ||
             load.dst.kind != OperandKind::SGPR || load.dst.value < 0 ||
-            load.dst.value + 1 > 105 || (!register_offset && !optional_null_immediate))
+            load.dst.value + 1 > 105 || (!register_offset && !gta_descriptor_immediate))
             continue;
 
         const int base = load.dst.value;
@@ -12091,7 +12094,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (in.fmt == Rdna2Format::MTBUF && in.opcode >= 8u) { ok = false; return true; }
             // TFE appends a fault/status result after the data VGPRs. Dropping that write can corrupt
             // later register consumers, so reject until status-return semantics are implemented.
-            if (in.fmt == Rdna2Format::MTBUF && in.mtbuf_tfe) { ok = false; return true; }
+            if ((in.fmt == Rdna2Format::MUBUF && in.mubuf_tfe) ||
+                (in.fmt == Rdna2Format::MTBUF && in.mtbuf_tfe)) {
+                ok = false;
+                return true;
+            }
             uint32_t n = 0; bool is_format = false, is_store = false, is_atomic = false;
             bool is_atomic_x2 = false, is_atomic_fminmax = false, atomic_fmin = false;
             uint32_t atomic_op = 0;   // SPIR-V atomic RMW opcode for is_atomic (set by the switch)
@@ -14601,7 +14608,7 @@ bool shader_constant_compare(const std::vector<Rdna2Inst>& ins, size_t block_fir
 
 bool scalar_cfg_branch(const Rdna2Inst& in) {
     return in.fmt == Rdna2Format::SOPP &&
-        (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09));
+        sopp_opcode_is_direct_branch(in.opcode);
 }
 
 void prune_scalar_cfg_reachability(std::vector<Rdna2Inst>& ins) {
@@ -14972,6 +14979,236 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
     return specialized;
 }
 
+bool valid_scalar_pair_base(int base) {
+    return base >= 0 && !(base & 1) &&
+        (base <= 104 || base == 106 ||
+         (base >= 108 && base <= 122) || base == 126);
+}
+
+bool scalar_pair_operand(const Operand& operand, int& base) {
+    if ((operand.kind != OperandKind::SGPR && operand.kind != OperandKind::Special) ||
+        !valid_scalar_pair_base(operand.value))
+        return false;
+    base = operand.value;
+    return true;
+}
+
+bool valid_buffer_resource_base(const Operand& operand) {
+    if (operand.kind != OperandKind::SGPR || operand.value < 0 ||
+        (operand.value & 3))
+        return false;
+    return operand.value <= 100 ||
+        (operand.value >= 108 && operand.value <= 120);
+}
+
+bool zero_record_load_shape(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::MUBUF &&
+        in.opcode == kMubufOpcodeLoadDword && in.len_dwords == 2u &&
+        in.dst.kind == OperandKind::VGPR && in.dst.value >= 0 &&
+        in.src[0].kind == OperandKind::VGPR &&
+        valid_buffer_resource_base(in.src[1]) &&
+        in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0 &&
+        !in.mubuf_glc && !in.mubuf_dlc && !in.mubuf_lds && !in.mubuf_tfe;
+}
+
+bool scalar_instruction_writes_anything(const Rdna2Inst& in) {
+    bool writes = false;
+    for_each_scalar_write(in, [&](int, uint32_t) { writes = true; });
+    return writes;
+}
+
+bool dynamic_vgpr_destination(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32;
+}
+
+bool writes_vgpr(const Rdna2Inst& in, int vgpr) {
+    if (dynamic_vgpr_destination(in)) return true;
+    const uint32_t words = rdna2_vgpr_write_count(in);
+    if (words && in.dst.kind == OperandKind::VGPR && in.dst.value <= vgpr &&
+        vgpr < in.dst.value + static_cast<int>(words))
+        return true;
+    return rdna2_tfe_status_vgpr(in) == vgpr;
+}
+
+// Prove that every lane active at `and_index` was also active when `load_index` wrote zero. The
+// scalar compiler idioms in the live shader elect one lane and later restore a saved mask; tracking
+// only subset lineage is enough and deliberately cannot prove an unrelated mask or an expanding
+// EXEC write. Conditional skips inside the interval must contain no proof-relevant writes so the
+// lexical transfer below represents both paths.
+bool zero_load_reaches_and_under_exec_subset(const std::vector<Rdna2Inst>& ins,
+                                             size_t load_index, size_t and_index,
+                                             const std::unordered_map<uint32_t, size_t>& index_by_pc) {
+    const int zero_vgpr = ins[load_index].dst.value;
+
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const Rdna2Inst& branch = ins[i];
+        if (!scalar_cfg_branch(branch)) continue;
+        const auto target = index_by_pc.find(scalar_branch_target(branch));
+        if (target == index_by_pc.end()) return false;
+
+        const bool source_inside = i > load_index && i < and_index;
+        // The compare and branch are part of the proof too: an external edge to either would
+        // bypass the zero-reaching definition just as surely as one into the transfer interval.
+        const bool target_enters_after_load = target->second > load_index &&
+            target->second <= and_index + 2u;
+        if (!source_inside && target_enters_after_load) return false;
+        if (!source_inside) continue;
+        if (branch.opcode == kSoppOpcodeBranch || target->second <= i ||
+            target->second > and_index)
+            return false;
+        for (size_t skipped = i + 1; skipped < target->second; ++skipped) {
+            const Rdna2Inst& candidate = ins[skipped];
+            if (rdna2_instruction_may_change_exec(candidate) ||
+                scalar_instruction_writes_anything(candidate) ||
+                writes_vgpr(candidate, zero_vgpr))
+                return false;
+        }
+    }
+
+    std::array<bool, 128> mask_subset{};
+    bool exec_subset = true; // the load's EXEC is the reference set
+
+    auto pair_is_subset = [&](const Operand& operand) {
+        if (operand.value == 126 &&
+            (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special))
+            return exec_subset;
+        int base = -1;
+        return scalar_pair_operand(operand, base) &&
+            mask_subset[base] && mask_subset[base + 1];
+    };
+
+    for (size_t i = load_index + 1; i < and_index; ++i) {
+        const Rdna2Inst& in = ins[i];
+        if (writes_vgpr(in, zero_vgpr)) return false;
+
+        bool derived_mask = false;
+        int mask_dst = -1;
+        bool next_exec_subset = exec_subset;
+        if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64) {
+            if (in.dst.value == 126) {
+                next_exec_subset = pair_is_subset(in.src[0]);
+                if (!next_exec_subset) return false;
+            } else if (in.dst.value == 127) {
+                // A B64 destination pair must be even-aligned. Reject the invalid EXEC_HI-rooted
+                // packet here rather than letting it carry proof state through this exact analysis.
+                return false;
+            } else if (pair_is_subset(in.src[0])) {
+                if (!valid_scalar_pair_base(in.dst.value))
+                    return false;
+                derived_mask = true;
+                mask_dst = in.dst.value;
+            }
+        }
+        if (in.fmt == Rdna2Format::SOP1 &&
+            in.opcode == kSop1OpcodeAndSaveexecB64) {
+            // The destination receives OLD_EXEC and the new EXEC is OLD_EXEC & src.
+            if (!valid_scalar_pair_base(in.dst.value))
+                return false;
+            derived_mask = exec_subset;
+            mask_dst = in.dst.value;
+            next_exec_subset = exec_subset;
+        } else if (rdna2_instruction_may_change_exec(in)) {
+            // CMPX only removes lanes from the current mask. Every other unhandled EXEC writer may
+            // activate a lane whose destination was preserved by the zero-record load.
+            if (!(in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)) &&
+                !(in.fmt == Rdna2Format::SOP1 &&
+                  (in.opcode == kSop1OpcodeMovB64 ||
+                   in.opcode == kSop1OpcodeAndSaveexecB64)))
+                return false;
+        }
+
+        for_each_scalar_write(in, [&](int base, uint32_t width) {
+            for (uint32_t word = 0; word < width; ++word) {
+                const int reg = base + static_cast<int>(word);
+                if (reg < 0 || reg >= 128) continue;
+                mask_subset[reg] = false;
+            }
+        });
+        if (derived_mask && mask_dst >= 0 && mask_dst + 1 < 128) {
+            mask_subset[mask_dst] = true;
+            mask_subset[mask_dst + 1] = true;
+        }
+        exec_subset = next_exec_subset;
+    }
+    return exec_subset;
+}
+
+size_t specialize_zero_record_execz_exits(std::vector<Rdna2Inst>& ins,
+                                          const ShaderResourceTable* rt,
+                                          uint32_t wave_size) {
+    if (!rt || wave_size != 64 || ins.empty()) return 0;
+    if (std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+            return (in.fmt == Rdna2Format::SOP1 &&
+                    in.opcode >= kSop1OpcodeSetpcB64 &&
+                    in.opcode <= kSop1OpcodeRfeB64) ||
+                   (in.fmt == Rdna2Format::SOPK &&
+                    (in.opcode == kSopkOpcodeCallB64 ||
+                     in.opcode == kSopkOpcodeSubvectorLoopBegin ||
+                     in.opcode == kSopkOpcodeSubvectorLoopEnd));
+        }))
+        return 0;
+
+    std::unordered_map<uint32_t, size_t> index_by_pc;
+    for (size_t i = 0; i < ins.size(); ++i) index_by_pc.emplace(ins[i].pc, i);
+    std::set<uint32_t> specialized_branches;
+
+    for (const ShaderResource& resource : rt->resources) {
+        if (!is_zero_record_raw_buffer(resource)) continue;
+        // Translation resolves an instruction-scoped buffer through the table's first matching
+        // fetch PC. A later zero marker must not override an earlier ordinary resource here.
+        if (rt->by_fetch_pc(resource.fetch_pc) != &resource) continue;
+        const auto load_found = index_by_pc.find(resource.fetch_pc);
+        if (load_found == index_by_pc.end()) continue;
+        const size_t load_index = load_found->second;
+        const Rdna2Inst& load = ins[load_index];
+        if (!zero_record_load_shape(load)) continue;
+
+        for (size_t i = load_index + 1; i + 2 < ins.size(); ++i) {
+            const Rdna2Inst& bit_and = ins[i];
+            const Rdna2Inst& compare = ins[i + 1];
+            const Rdna2Inst& branch = ins[i + 2];
+            if (writes_vgpr(bit_and, load.dst.value)) break;
+            const bool and_shape = bit_and.fmt == Rdna2Format::VOP2 &&
+                bit_and.opcode == kVop2OpcodeAndB32 &&
+                bit_and.len_dwords == 1u && !bit_and.has_sdwa &&
+                !bit_and.has_modifier && !bit_and.has_dpp &&
+                bit_and.dst.kind == OperandKind::VGPR &&
+                bit_and.src[0].kind == OperandKind::InlineInt &&
+                bit_and.src[0].value == 7 &&
+                bit_and.src[1].kind == OperandKind::VGPR &&
+                bit_and.src[1].value == load.dst.value;
+            if (!and_shape) continue;
+            const bool compare_shape = compare.pc == bit_and.pc + bit_and.len_dwords &&
+                compare.fmt == Rdna2Format::VOPC &&
+                compare.opcode == kVopcOpcodeCmpxEqU32 &&
+                compare.len_dwords == 1u && !compare.has_sdwa &&
+                !compare.has_modifier && !compare.has_dpp &&
+                compare.src[0].kind == OperandKind::InlineInt &&
+                compare.src[0].value == 5 &&
+                compare.src[1].kind == OperandKind::VGPR &&
+                compare.src[1].value == bit_and.dst.value;
+            const bool branch_shape = branch.pc == compare.pc + compare.len_dwords &&
+                branch.fmt == Rdna2Format::SOPP &&
+                branch.opcode == kSoppOpcodeCbranchExecz && branch.simm16 > 0 &&
+                index_by_pc.contains(scalar_branch_target(branch));
+            if (!compare_shape || !branch_shape ||
+                !zero_load_reaches_and_under_exec_subset(
+                    ins, load_index, i, index_by_pc))
+                continue;
+            specialized_branches.insert(branch.pc);
+            break;
+        }
+    }
+
+    for (uint32_t pc : specialized_branches) {
+        Rdna2Inst& branch = ins[index_by_pc.at(pc)];
+        branch.opcode = kSoppOpcodeBranch;
+        branch.words[0] = 0xbf820000u | static_cast<uint16_t>(branch.simm16);
+    }
+    if (!specialized_branches.empty()) prune_scalar_cfg_reachability(ins);
+    return specialized_branches.size();
+}
+
 } // namespace
 
 bool rdna2_specialize_pcrel_dispatch(std::vector<Rdna2Inst>& instructions,
@@ -14989,6 +15226,12 @@ size_t rdna2_specialize_proven_null_bvh_paths(
         std::vector<Rdna2Inst>& instructions, const ShaderResourceTable* resources,
         uint32_t wave_size) {
     return specialize_proven_null_bvh_exits(instructions, resources, wave_size);
+}
+
+size_t rdna2_specialize_zero_record_execz_paths(
+        std::vector<Rdna2Inst>& instructions, const ShaderResourceTable* resources,
+        uint32_t wave_size) {
+    return specialize_zero_record_execz_exits(instructions, resources, wave_size);
 }
 
 PcrelDispatchInfo rdna2_pcrel_dispatch_info(const uint32_t* code, size_t dwords) {
@@ -20989,6 +21232,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // marker + fetch PC) is already part of the compute module cache key, so a later non-null dispatch
     // receives a distinct module.
     (void)rdna2_specialize_proven_null_bvh_paths(ins, rt, config.wave_size);
+    (void)rdna2_specialize_zero_record_execz_paths(ins, rt, config.wave_size);
     (void)rdna2_specialize_shader_constant_branches(ins);
     // See recompile_valu: compute has no branch-external EXP state, so the common host-shell merge is
     // only a place to finish the invocation after either guest arm has terminated.
