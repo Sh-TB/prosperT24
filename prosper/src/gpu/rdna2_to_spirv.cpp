@@ -2528,13 +2528,14 @@ struct SpirvCompute {
         put(code, Op_Branch, {merge});
         put(code, Op_Label, {merge}); cur_block = merge;
     }
-    // RDNA2 DS_MIN/MAX_F32 are numeric floating-point atomics: one NaN yields the number, infinities
-    // and denormals retain their IEEE ordering, and signed-zero ties choose -0 for min / +0 for max.
+    // RDNA2 DS_MIN/MAX_F32 quiet and propagate signaling NaNs before numeric selection; a lone quiet
+    // NaN yields the number. FP32_DENORM controls whether subnormal inputs compare at their true
+    // value or as signed zero, while signed-zero ties choose -0 for min / +0 for max.
     // SPIR-V 1.3 has no core floating atomic min/max, while integer AtomicS/UMin orders the raw bits
     // incorrectly. Implement the architectural operation as a u32 compare-exchange loop instead.
     // The ordering key is monotonic for every non-NaN binary32 bit pattern and therefore does not
-    // depend on the host driver's denormal mode. AMD's both-NaN MINNUM/MAXNUM rule returns a quieted
-    // first operand; the resident `*ptr` value is that first operand for an atomic min/max update.
+    // depend on the host driver's denormal mode. AMD's both-qNaN selection returns the first operand;
+    // the resident `*ptr` value is that first operand for an atomic min/max update.
     void lds_atomic_fminmax(uint32_t idx, uint32_t value, bool is_min,
                             bool predicated, uint32_t pred) {
         auto emit = [&]() {
