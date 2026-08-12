@@ -1,0 +1,762 @@
+     1→#pragma once
+     2→#include "../core/diagnostic_interface.hpp"
+     3→#include "../core/event_bus.hpp"
+     4→#include <fstream>
+     5→#include <sstream>
+     6→#include <iomanip>
+     7→#include <unordered_map>
+     8→#include <algorithm>
+     9→
+    10→namespace prosper {
+    11→namespace diagnostics {
+    12→
+    13→//=============================================================================
+    14→// Import Resolution Plugin - Phase 9.5 Diagnostic Plugin
+    15→//
+    16→// Tracks NID/import resolution for PS4 emulator diagnostics.
+    17→// Records each import resolution attempt (success/failure), tracks NID to
+    18→// function name mapping, records caller addresses, and classifies imports
+    19→// by status for risk assessment.
+    20→//=============================================================================
+    21→
+    22→/**
+    23→ * @brief Represents a single import entry with full tracking data
+    24→ */
+    25→struct ImportEntry {
+    26→    std::string nid;                        ///< NID (Name ID) - unique identifier for the import
+    27→    std::string name;                       ///< Human-readable function/symbol name
+    28→    std::string module;                     ///< Module this import belongs to
+    29→    ImportStatus status{ImportStatus::MISSING_NOT_CALLED};  ///< Current status of this import
+    30→    uint64_t caller_addr{0};                ///< Address of code calling this import
+    31→    size_t call_count{0};                   ///< Number of times this import was called
+    32→    Timestamp first_call;                   ///< Timestamp of first call attempt
+    33→    Timestamp last_call;                    ///< Timestamp of most recent call
+    34→    uint64_t resolved_addr{0};              ///< Address where import was resolved to
+    35→    
+    36→    /// Default constructor
+    37→    ImportEntry() = default;
+    38→    
+    39→    /// Constructor with essential fields
+    40→    ImportEntry(const std::string& n, const std::string& nm, const std::string& mod)
+    41→        : nid(n), name(nm), module(mod) {}
+    42→    
+    43→    /// Check if this import is considered "working"
+    44→    bool is_working() const {
+    45→        return status == ImportStatus::CALLED_SUCCESSFULLY || 
+    46→               status == ImportStatus::STUB_IMPLEMENTED;
+    47→    }
+    48→    
+    49→    /// Check if this import represents a potential crash risk
+    50→    bool is_high_risk() const {
+    51→        return status == ImportStatus::MISSING_CALLED;
+    52→    }
+    53→    
+    54→    /// Get status as human-readable string
+    55→    std::string status_string() const {
+    56→        switch (status) {
+    57→            case ImportStatus::MISSING_NOT_CALLED: return "MISSING_NOT_CALLED";
+    58→            case ImportStatus::MISSING_CALLED: return "MISSING_CALLED";
+    59→            case ImportStatus::IMPLEMENTED_BUT_FAILED: return "IMPLEMENTED_BUT_FAILED";
+    60→            case ImportStatus::CALLED_SUCCESSFULLY: return "CALLED_SUCCESSFULLY";
+    61→            case ImportStatus::STUB_IMPLEMENTED: return "STUB_IMPLEMENTED";
+    62→            default: return "UNKNOWN";
+    63→        }
+    64→    }
+    65→    
+    66→    /// Serialize to JSON string
+    67→    std::string to_json() const {
+    68→        std::ostringstream oss;
+    69→        oss << "{";
+    70→        oss << "\"nid\":\"" << nid << "\",";
+    71→        oss << "\"name\":\"" << name << "\",";
+    72→        oss << "\"module\":\"" << module << "\",";
+    73→        oss << "\"status\":" << static_cast<int>(status) << ",";
+    74→        oss << "\"status_str\":\"" << status_string() << "\",";
+    75→        oss << "\"caller_addr\":\"0x" << std::hex << caller_addr << std::dec << "\",";
+    76→        oss << "\"resolved_addr\":\"0x" << std::hex << resolved_addr << std::dec << "\",";
+    77→        oss << "\"call_count\":" << call_count << ",";
+    78→        
+    79→        if (first_call.time_since_epoch().count() != 0) {
+    80→            oss << "\"first_call_ms\":" << std::fixed << std::setprecision(3)
+    81→                << timestamp_to_ms(first_call) << ",";
+    82→        } else {
+    83→            oss << "\"first_call_ms\":null,";
+    84→        }
+    85→        
+    86→        if (last_call.time_since_epoch().count() != 0) {
+    87→            oss << "\"last_call_ms\":" << std::fixed << std::setprecision(3)
+    88→                << timestamp_to_ms(last_call);
+    89→        } else {
+    90→            oss << "\"last_call_ms\":null";
+    91→        }
+    92→        
+    93→        oss << "}";
+    94→        return oss.str();
+    95→    }
+    96→};
+    97→
+    98→/**
+    99→ * @brief Summary statistics for import analysis
+   100→ */
+   101→struct ImportStatistics {
+   102→    size_t total_imports{0};
+   103→    size_t resolved_imports{0};
+   104→    size_t missing_not_called{0};
+   105→    size_t missing_called{0};           // HIGH RISK
+   106→    size_t implemented_but_failed{0};
+   107→    size_t called_successfully{0};
+   108→    size_t stub_implemented{0};
+   109→    
+   110→    double coverage_percent() const {
+   111→        return total_imports > 0 
+   112→            ? (static_cast<double>(called_successfully + stub_implemented) / total_imports) * 100.0
+   113→            : 0.0;
+   114→    }
+   115→    
+   116→    double risk_percent() const {
+   117→        return total_imports > 0 
+   118→            ? (static_cast<double>(missing_called) / total_imports) * 100.0
+   119→            : 0.0;
+   120→    }
+   121→    
+   122→    std::string to_json() const {
+   123→        std::ostringstream oss;
+   124→        oss << "{";
+   125→        oss << "\"total_imports\":" << total_imports << ",";
+   126→        oss << "\"resolved_imports\":" << resolved_imports << ",";
+   127→        oss << "\"missing_not_called\":" << missing_not_called << ",";
+   128→        oss << "\"missing_called\":" << missing_called << ",";
+   129→        oss << "\"implemented_but_failed\":" << implemented_but_failed << ",";
+   130→        oss << "\"called_successfully\":" << called_successfully << ",";
+   131→        oss << "\"stub_implemented\":" << stub_implemented << ",";
+   132→        oss << "\"coverage_percent\":" << std::fixed << std::setprecision(2) << coverage_percent() << ",";
+   133→        oss << "\"risk_percent\":" << std::fixed << std::setprecision(2) << risk_percent();
+   134→        oss << "}";
+   135→        return oss.str();
+   136→    }
+   137→};
+   138→
+   139→/**
+   140→ * @brief Import Resolution Plugin implementation
+   141→ * 
+   142→ * This plugin provides comprehensive import/NID tracking:
+   143→ * - Records each import resolution attempt with success/failure status
+   144→ * - Maintains NID to function name mapping
+   145→ * - Records caller address for each import
+   146→ * - Classifies imports by status for risk assessment
+   147→ * - Generates detailed reports on import health
+   148→ */
+   149→class ImportResolutionPlugin : public DiagnosticPlugin {
+   150→public:
+   151→    //=========================================================================
+   152→    // Constructor / Destructor
+   153→    //=========================================================================
+   154→    
+   155→    ImportResolutionPlugin()
+   156→        : max_events_(10000),
+   157→          track_callers_(true) {}
+   158→    
+   159→    virtual ~ImportResolutionPlugin() override {
+   160→        shutdown();
+   161→    }
+   162→    
+   163→    //=========================================================================
+   164→    // DiagnosticPlugin Interface Implementation
+   165→    //=========================================================================
+   166→    
+   167→    std::string name() const override { return "ImportResolution"; }
+   168→    
+   169→    std::string version() const override { return "1.5.0"; }
+   170→    
+   171→    std::string description() const override {
+   172→        return "Tracks NID/import resolution, status classification, and risk assessment";
+   173→    }
+   174→    
+   175→    bool initialize() override {
+   176→        std::lock_guard<std::mutex> lock(mutex_);
+   177→        
+   178→        imports_.clear();
+   179→        nid_index_.clear();
+   180→        name_index_.clear();
+   181→        module_index_.clear();
+   182→        
+   183→        active_ = true;
+   184→        
+   185→        // Parse configuration
+   186→        auto it = config_.find("max_events");
+   187→        if (it != config_.end()) {
+   188→            try { max_events_ = static_cast<size_t>(std::stoull(it->second)); } catch (...) {}
+   189→        }
+   190→        
+   191→        it = config_.find("track_callers");
+   192→        if (it != config_.end()) {
+   193→            track_callers_ = (it->second == "true" || it->second == "1");
+   194→        }
+   195→        
+   196→        emit_info("ImportResolution initialized successfully");
+   197→        return true;
+   198→    }
+   199→    
+   200→    void shutdown() override {
+   201→        std::lock_guard<std::mutex> lock(mutex_);
+   202→        active_ = false;
+   203→        emit_info("ImportResolution shut down");
+   204→    }
+   205→    
+   206→    void reset() override {
+   207→        std::lock_guard<std::mutex> lock(mutex_);
+   208→        
+   209→        imports_.clear();
+   210→        nid_index_.clear();
+   211→        name_index_.clear();
+   212→        module_index_.clear();
+   213→        event_count_ = 0;
+   214→    }
+   215→    
+   216→    void on_event(const DiagnosticEvent& event) override {
+   217→        std::lock_guard<std::mutex> lock(mutex_);
+   218→        
+   219→        if (!active_) return;
+   220→        if (event_count_ >= max_events_) return;
+   221→        
+   222→        // Process import-related events
+   223→        if (event.event_type == "import_resolved") {
+   224→            auto nid_it = event.metadata.find("nid");
+   225→            auto name_it = event.metadata.find("name");
+   226→            auto mod_it = event.metadata.find("module");
+   227→            
+   228→            if (nid_it != event.metadata.end()) {
+   229→                uint64_t resolved_addr = 0;
+   230→                uint64_t caller_addr = 0;
+   231→                
+   232→                auto addr_it = event.numeric_data.find("resolved_addr");
+   233→                if (addr_it != event.numeric_data.end()) {
+   234→                    resolved_addr = static_cast<uint64_t>(addr_it->second);
+   235→                }
+   236→                
+   237→                auto caller_it = event.numeric_data.find("caller_addr");
+   238→                if (caller_it != event.numeric_data.end()) {
+   239→                    caller_addr = static_cast<uint64_t>(caller_it->second);
+   240→                }
+   241→                
+   242→                on_import_resolved_internal(nid_it->second,
+   243→                    name_it != event.metadata.end() ? name_it->second : "",
+   244→                    mod_it != event.metadata.end() ? mod_it->second : "",
+   245→                    resolved_addr, caller_addr, event.timestamp);
+   246→            }
+   247→        }
+   248→        else if (event.event_type == "import_failed") {
+   249→            auto nid_it = event.metadata.find("nid");
+   250→            if (nid_it != event.metadata.end()) {
+   251→                uint64_t caller_addr = 0;
+   252→                
+   253→                auto caller_it = event.numeric_data.find("caller_addr");
+   254→                if (caller_it != event.numeric_data.end()) {
+   255→                    caller_addr = static_cast<uint64_t>(caller_it->second);
+   256→                }
+   257→                
+   258→                on_import_failed_internal(nid_it->second,
+   259→                    event.metadata.count("name") ? event.metadata.at("name") : "",
+   260→                    event.metadata.count("module") ? event.metadata.at("module") : "",
+   261→                    caller_addr, event.timestamp);
+   262→            }
+   263→        }
+   264→        else if (event.event_type == "import_called") {
+   265→            auto nid_it = event.metadata.find("nid");
+   266→            if (nid_it != event.metadata.end()) {
+   267→                bool success = true;
+   268→                auto success_it = event.numeric_data.find("success");
+   269→                if (success_it != event.numeric_data.end()) {
+   270→                    success = success_it->second != 0;
+   271→                }
+   272→                
+   273→                update_import_call_internal(nid_it->second, success, event.timestamp);
+   274→            }
+   275→        }
+   276→        
+   277→        event_count_++;
+   278→    }
+   279→    
+   280→    std::string generate_report() const override {
+   281→        std::lock_guard<std::mutex> lock(mutex_);
+   282→        return generate_report_internal();
+   283→    }
+   284→    
+   285→    void export_json(const std::string& path) const override {
+   286→        std::lock_guard<std::mutex> lock(mutex_);
+   287→        
+   288→        std::ofstream file(path);
+   289→        if (!file.is_open()) return;
+   290→        
+   291→        file << generate_report_internal();
+   292→        file.close();
+   293→    }
+   294→    
+   295→    //=========================================================================
+   296→    // Public API Methods
+   297→    //=========================================================================
+   298→    
+   299→    /**
+   300→     * @brief Record that an import was successfully resolved
+   301→     * @param nid NID of the import
+   302→     * @param name Function/symbol name
+   303→     * @param module Module containing this import
+   304→     * @param resolved_addr Address where import was resolved
+   305→     * @param caller_addr Address of code requesting this import
+   306→     * @param timestamp Optional timestamp (defaults to now)
+   307→     */
+   308→    void on_import_resolved(const std::string& nid,
+   309→                            const std::string& name,
+   310→                            const std::string& module,
+   311→                            uint64_t resolved_addr,
+   312→                            uint64_t caller_addr = 0,
+   313→                            Timestamp timestamp = Timestamp{}) {
+   314→        std::lock_guard<std::mutex> lock(mutex_);
+   315→        on_import_resolved_internal(nid, name, module, resolved_addr, caller_addr,
+   316→                                    timestamp.time_since_epoch().count() == 0 ? now() : timestamp);
+   317→    }
+   318→    
+   319→    /**
+   320→     * @brief Record that an import failed to resolve
+   321→     * @param nid NID of the failed import
+   322→     * @param name Function/symbol name (may be unknown)
+   323→     * @param module Module containing this import
+   324→     * @param caller_addr Address of code requesting this import
+   325→     * @param timestamp Optional timestamp (defaults to now)
+   326→     */
+   327→    void on_import_failed(const std::string& nid,
+   328→                          const std::string& name,
+   329→                          const std::string& module,
+   330→                          uint64_t caller_addr = 0,
+   331→                          Timestamp timestamp = Timestamp{}) {
+   332→        std::lock_guard<std::mutex> lock(mutex_);
+   333→        on_import_failed_internal(nid, name, module, caller_addr,
+   334→                                  timestamp.time_since_epoch().count() == 0 ? now() : timestamp);
+   335→    }
+   336→    
+   337→    /**
+   338→     * @brief Get the current status of a specific import by NID
+   339→     * @param nid NID to look up
+   340→     * @return ImportStatus of the import, or MISSING_NOT_CALLED if not found
+   341→     */
+   342→    ImportStatus get_import_status(const std::string& nid) const {
+   343→        std::lock_guard<std::mutex> lock(mutex_);
+   344→        
+   345→        auto it = nid_index_.find(nid);
+   346→        if (it != nid_index_.end()) {
+   347→            return imports_[it->second].status;
+   348→        }
+   349→        return ImportStatus::MISSING_NOT_CALLED;
+   350→    }
+   351→    
+   352→    /**
+   353→     * @brief Get complete information about an import by NID
+   354→     * @param nid NID to look up
+   355→     * @return Pointer to ImportEntry or nullptr if not found
+   356→     */
+   357→    const ImportEntry* get_import_info(const std::string& nid) const {
+   358→        std::lock_guard<std::mutex> lock(mutex_);
+   359→        
+   360→        auto it = nid_index_.find(nid);
+   361→        if (it != nid_index_.end()) {
+   362→            return &imports_[it->second];
+   363→        }
+   364→        return nullptr;
+   365→    }
+   366→    
+   367→    /**
+   368→     * @brief Get all imports that are missing (not implemented)
+   369→     * @return Vector of pointers to missing imports
+   370→     */
+   371→    std::vector<const ImportEntry*> get_missing_imports() const {
+   372→        std::lock_guard<std::mutex> lock(mutex_);
+   373→        
+   374→        std::vector<const ImportEntry*> result;
+   375→        for (const auto& imp : imports_) {
+   376→            if (imp.status == ImportStatus::MISSING_NOT_CALLED ||
+   377→                imp.status == ImportStatus::MISSING_CALLED) {
+   378→                result.push_back(&imp);
+   379→            }
+   380→        }
+   381→        return result;
+   382→    }
+   383→    
+   384→    /**
+   385→     * @brief Get all high-risk imports (missing but being called)
+   386→     * @return Vector of pointers to high-risk imports
+   387→     */
+   388→    std::vector<const ImportEntry*> get_high_risk_imports() const {
+   389→        std::lock_guard<std::mutex> lock(mutex_);
+   390→        
+   391→        std::vector<const ImportEntry*> result;
+   392→        for (const auto& imp : imports_) {
+   393→            if (imp.status == ImportStatus::MISSING_CALLED) {
+   394→                result.push_back(&imp);
+   395→            }
+   396→        }
+   397→        return result;
+   398→    }
+   399→    
+   400→    /**
+   401→     * @brief Get imports belonging to a specific module
+   402→     * @param module_name Module to filter by
+   403→     * @return Vector of pointers to imports in that module
+   404→     */
+   405→    std::vector<const ImportEntry*> get_module_imports(const std::string& module_name) const {
+   406→        std::lock_guard<std::mutex> lock(mutex_);
+   407→        
+   408→        std::vector<const ImportEntry*> result;
+   409→        auto range = module_index_.equal_range(module_name);
+   410→        for (auto it = range.first; it != range.second; ++it) {
+   411→            result.push_back(&imports_[it->second]);
+   412→        }
+   413→        return result;
+   414→    }
+   415→    
+   416→    /**
+   417→     * @brief Get overall import statistics
+   418→     */
+   419→    ImportStatistics get_statistics() const {
+   420→        std::lock_guard<std::mutex> lock(mutex_);
+   421→        return calculate_statistics();
+   422→    }
+   423→    
+   424→    /**
+   425→     * @brief Record that an import was called and its result
+   426→     * @param nid NID of the called import
+   427→     * @param success Whether the call succeeded
+   428→     * @param timestamp Optional timestamp (defaults to now)
+   429→     */
+   430→    void record_import_call(const std::string& nid, bool success, Timestamp timestamp = Timestamp{}) {
+   431→        std::lock_guard<std::mutex> lock(mutex_);
+   432→        update_import_call_internal(nid, success,
+   433→                                    timestamp.time_since_epoch().count() == 0 ? now() : timestamp);
+   434→    }
+   435→    
+   436→    /**
+   437→     * @brief Set or update the function name for an NID
+   438→     * @param nid NID to update
+   439→     * @param name New function name
+   440→     */
+   441→    void set_import_name(const std::string& nid, const std::string& name) {
+   442→        std::lock_guard<std::mutex> lock(mutex_);
+   443→        
+   444→        auto it = nid_index_.find(nid);
+   445→        if (it != nid_index_.end()) {
+   446→            // Update name index - remove old entry if name changed
+   447→            if (!imports_[it->second].name.empty()) {
+   448→                auto name_range = name_index_.equal_range(imports_[it->second].name);
+   449→                for (auto nit = name_range.first; nit != name_range.second; ++nit) {
+   450→                    if (nit->second == it->second) {
+   451→                        name_index_.erase(nit);
+   452→                        break;
+   453→                    }
+   454→                }
+   455→            }
+   456→            
+   457→            imports_[it->second].name = name;
+   458→            if (!name.empty()) {
+   459→                name_index_.insert({name, it->second});
+   460→            }
+   461→        }
+   462→    }
+   463→    
+   464→    /**
+   465→     * @brief Look up an import by function name
+   466→     * @param name Function name to search for
+   467→     * @return Pointer to first matching ImportEntry or nullptr
+   468→     */
+   469→    const ImportEntry* find_by_name(const std::string& name) const {
+   470→        std::lock_guard<std::mutex> lock(mutex_);
+   471→        
+   472→        auto it = name_index_.find(name);
+   473→        if (it != name_index_.end()) {
+   474→            return &imports_[it->second];
+   475→        }
+   476→        return nullptr;
+   477→    }
+   478→    
+   479→    /**
+   480→     * @brief Get total number of tracked imports
+   481→     */
+   482→    size_t import_count() const {
+   483→        std::lock_guard<std::mutex> lock(mutex_);
+   484→        return imports_.size();
+   485→    }
+   486→
+   487→private:
+   488→    //=========================================================================
+   489→    // Internal Implementation Methods
+   490→    //=========================================================================
+   491→    
+   492→    /**
+   493→     * @brief Internal import resolution handler (assumes lock held)
+   494→     */
+   495→    void on_import_resolved_internal(const std::string& nid,
+   496→                                     const std::string& name,
+   497→                                     const std::string& module,
+   498→                                     uint64_t resolved_addr,
+   499→                                     uint64_t caller_addr,
+   500→                                     Timestamp timestamp) {
+   501→        // Check for existing entry
+   502→        auto it = nid_index_.find(nid);
+   503→        if (it != nid_index_.end()) {
+   504→            // Update existing entry
+   505→            auto& entry = imports_[it->second];
+   506→            entry.resolved_addr = resolved_addr;
+   507→            
+   508→            if (track_callers_ && caller_addr != 0) {
+   509→                entry.caller_addr = caller_addr;
+   510→            }
+   511→            
+   512→            // Update status based on previous state
+   513→            if (entry.status == ImportStatus::MISSING_NOT_CALLED ||
+   514→                entry.status == ImportStatus::MISSING_CALLED) {
+   515→                entry.status = ImportStatus::STUB_IMPLEMENTED;
+   516→            }
+   517→            
+   518→            emit_info("Import re-resolved: " + nid + " (" + name + ")");
+   519→            return;
+   520→        }
+   521→        
+   522→        // Create new entry
+   523→        ImportEntry entry(nid, name.empty() ? "unknown_" + nid : name, module);
+   524→        entry.status = ImportStatus::STUB_IMPLEMENTED;
+   525→        entry.resolved_addr = resolved_addr;
+   526→        entry.caller_addr = track_callers_ ? caller_addr : 0;
+   527→        entry.first_call = timestamp;
+   528→        entry.last_call = timestamp;
+   529→        
+   530→        size_t index = imports_.size();
+   531→        imports_.push_back(std::move(entry));
+   532→        nid_index_[nid] = index;
+   533→        
+   534→        if (!name.empty()) {
+   535→            name_index_.insert({name, index});
+   536→        }
+   537→        if (!module.empty()) {
+   538→            module_index_.insert({module, index});
+   539→        }
+   540→        
+   541→        // Emit diagnostic event
+   542→        DiagnosticEvent event;
+   543→        event.source_plugin = name();
+   544→        event.event_type = "import_tracked";
+   545→        event.severity = Severity::INFO;
+   546→        event.message = "Import resolved: " + nid + " -> " + name;
+   547→        event.metadata["nid"] = nid;
+   548→        event.metadata["function_name"] = name;
+   549→        event.metadata["module"] = module;
+   550→        event.numeric_data["resolved_addr"] = static_cast<int64_t>(resolved_addr);
+   551→        event.numeric_data["total_imports"] = static_cast<int64_t>(imports_.size());
+   552→        
+   553→        emit_event(event);
+   554→    }
+   555→    
+   556→    /**
+   557→     * @brief Internal import failure handler (assumes lock held)
+   558→     */
+   559→    void on_import_failed_internal(const std::string& nid,
+   560→                                   const std::string& name,
+   561→                                   const std::string& module,
+   562→                                   uint64_t caller_addr,
+   563→                                   Timestamp timestamp) {
+   564→        // Check for existing entry
+   565→        auto it = nid_index_.find(nid);
+   566→        if (it != nid_index_.end()) {
+   567→            auto& entry = imports_[it->second];
+   568→            
+   569→            if (entry.call_count > 0) {
+   570→                entry.status = ImportStatus::MISSING_CALLED;
+   571→            }
+   572→            
+   573→            emit_warning("Import failed (already tracked): " + nid);
+   574→            return;
+   575→        }
+   576→        
+   577→        // Create new entry as missing
+   578→        ImportEntry entry(nid, name.empty() ? "unknown_" + nid : name, module);
+   579→        entry.status = ImportStatus::MISSING_NOT_CALLED;
+   580→        entry.caller_addr = track_callers_ ? caller_addr : 0;
+   581→        entry.first_call = timestamp;
+   582→        
+   583→        size_t index = imports_.size();
+   584→        imports_.push_back(std::move(entry));
+   585→        nid_index_[nid] = index;
+   586→        
+   587→        if (!name.empty()) {
+   588→            name_index_.insert({name, index});
+   589→        }
+   590→        if (!module.empty()) {
+   591→            module_index_.insert({module, index});
+   592→        }
+   593→        
+   594→        // Emit diagnostic event
+   595→        DiagnosticEvent event;
+   596→        event.source_plugin = name();
+   597→        event.event_type = "import_missing";
+   598→        event.severity = Severity::WARNING;
+   599→        event.message = "Import not found: " + nid + " (" + name + ")";
+   600→        event.metadata["nid"] = nid;
+   601→        event.metadata["function_name"] = name;
+   602→        event.metadata["module"] = module;
+   603→        event.numeric_data["caller_addr"] = static_cast<int64_t>(caller_addr);
+   604→        
+   605→        emit_event(event);
+   606→    }
+   607→    
+   608→    /**
+   609→     * @brief Update import call status (assumes lock held)
+   610→     */
+   611→    void update_import_call_internal(const std::string& nid, bool success, Timestamp timestamp) {
+   612→        auto it = nid_index_.find(nid);
+   613→        if (it == nid_index_.end()) {
+   614→            return;
+   615→        }
+   616→        
+   617→        auto& entry = imports_[it->second];
+   618→        entry.call_count++;
+   619→        entry.last_call = timestamp;
+   620→        
+   621→        // Update status based on call outcome
+   622→        if (success) {
+   623→            if (entry.status == ImportStatus::STUB_IMPLEMENTED ||
+   624→                entry.status == ImportStatus::MISSING_NOT_CALLED) {
+   625→                entry.status = ImportStatus::CALLED_SUCCESSFULLY;
+   626→            }
+   627→        } else {
+   628→            if (entry.status == ImportStatus::STUB_IMPLEMENTED ||
+   629→                entry.status == ImportStatus::CALLED_SUCCESSFULLY) {
+   630→                entry.status = ImportStatus::IMPLEMENTED_BUT_FAILED;
+   631→            } else if (entry.status == ImportStatus::MISSING_NOT_CALLED) {
+   632→                entry.status = ImportStatus::MISSING_CALLED;  // HIGH RISK
+   633→            }
+   634→        }
+   635→    }
+   636→    
+   637→    /**
+   638→     * @brief Calculate current statistics (assumes lock held)
+   639→     */
+   640→    ImportStatistics calculate_statistics() const {
+   641→        ImportStatistics stats;
+   642→        stats.total_imports = imports_.size();
+   643→        
+   644→        for (const auto& imp : imports_) {
+   645→            switch (imp.status) {
+   646→                case ImportStatus::MISSING_NOT_CALLED:
+   647→                    stats.missing_not_called++;
+   648→                    break;
+   649→                case ImportStatus::MISSING_CALLED:
+   650→                    stats.missing_called++;  // HIGH RISK
+   651→                    break;
+   652→                case ImportStatus::IMPLEMENTED_BUT_FAILED:
+   653→                    stats.implemented_but_failed++;
+   654→                    stats.resolved_imports++;
+   655→                    break;
+   656→                case ImportStatus::CALLED_SUCCESSFULLY:
+   657→                    stats.called_successfully++;
+   658→                    stats.resolved_imports++;
+   659→                    break;
+   660→                case ImportStatus::STUB_IMPLEMENTED:
+   661→                    stats.stub_implemented++;
+   662→                    stats.resolved_imports++;
+   663→                    break;
+   664→            }
+   665→        }
+   666→        
+   667→        return stats;
+   668→    }
+   669→    
+   670→    /**
+   671→     * @brief Generate comprehensive report (assumes lock held)
+   672→     */
+   673→    std::string generate_report_internal() const {
+   674→        std::ostringstream json;
+   675→        ImportStatistics stats = calculate_statistics();
+   676→        
+   677→        json << "{\n";
+   678→        json << "  \"plugin\": \"" << name() << "\",\n";
+   679→        json << "  \"version\": \"" << version() << "\",\n";
+   680→        json << "  \"generated_at_ms\": " << std::fixed << std::setprecision(3)
+   681→             << timestamp_to_ms(now()) << ",\n";
+   682→        
+   683→        // Statistics
+   684→        json << "  \"statistics\": " << stats.to_json() << ",\n";
+   685→        
+   686→        // High-risk imports summary
+   687→        json << "  \"high_risk_count\": " << stats.missing_called << ",\n";
+   688→        
+   689→        // Imports array (limited to avoid huge output)
+   690→        json << "  \"imports\": [\n";
+   691→        size_t export_count = std::min(imports_.size(), static_cast<size_t>(1000));
+   692→        for (size_t i = 0; i < export_count; ++i) {
+   693→            json << "    " << imports_[i].to_json();
+   694→            if (i < export_count - 1) json << ",";
+   695→            json << "\n";
+   696→        }
+   697→        if (imports_.size() > export_count) {
+   698→            json << "    ,\"... (" << (imports_.size() - export_count) << " more imports truncated)\"\n";
+   699→        }
+   700→        json << "  ],\n";
+   701→        
+   702→        // Missing imports list
+   703→        json << "  \"missing_imports\": [\n";
+   704→        std::vector<size_t> missing_indices;
+   705→        for (size_t i = 0; i < imports_.size(); ++i) {
+   706→            if (imports_[i].status == ImportStatus::MISSING_NOT_CALLED ||
+   707→                imports_[i].status == ImportStatus::MISSING_CALLED) {
+   708→                missing_indices.push_back(i);
+   709→            }
+   710→        }
+   711→        for (size_t i = 0; i < missing_indices.size(); ++i) {
+   712→            json << "    " << imports_[missing_indices[i]].to_json();
+   713→            if (i < missing_indices.size() - 1) json << ",";
+   714→            json << "\n";
+   715→        }
+   716→        json << "  ]\n";
+   717→        
+   718→        json << "}\n";
+   719→        
+   720→        return json.str();
+   721→    }
+   722→    
+   723→    /**
+   724→     * @brief Emit an info-level diagnostic event
+   725→     */
+   726→    void emit_info(const std::string& message) {
+   727→        DiagnosticEvent event;
+   728→        event.source_plugin = name();
+   729→        event.event_type = "info";
+   730→        event.severity = Severity::INFO;
+   731→        event.message = message;
+   732→        emit_event(event);
+   733→    }
+   734→    
+   735→    /**
+   736→     * @brief Emit a warning diagnostic event
+   737→     */
+   738→    void emit_warning(const std::string& message) {
+   739→        DiagnosticEvent event;
+   740→        event.source_plugin = name();
+   741→        event.event_type = "warning";
+   742→        event.severity = Severity::WARNING;
+   743→        event.message = message;
+   744→        emit_event(event);
+   745→    }
+   746→    
+   747→    //=========================================================================
+   748→    // Member Variables
+   749→    //=========================================================================
+   750→    
+   751→    std::vector<ImportEntry> imports_;                          ///< All tracked imports
+   752→    std::unordered_map<std::string, size_t> nid_index_;         ///< NID -> index in imports_
+   753→    std::unordered_multimap<std::string, size_t> name_index_;   ///< Name -> index (multiple NIDs can have same name)
+   754→    std::unordered_multimap<std::string, size_t> module_index_; ///< Module -> index
+   755→    
+   756→    size_t max_events_;
+   757→    bool track_callers_;
+   758→};
+   759→
+   760→} // namespace diagnostics
+   761→} // namespace prosper
+   762→
