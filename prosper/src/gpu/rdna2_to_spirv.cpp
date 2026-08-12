@@ -5704,11 +5704,12 @@ void for_each_scalar_write(const Rdna2Inst& in, Visitor&& visit,
                                vop3b_fresh_carry_output(in)) ? 1u : 2u);
 }
 
-// Prove GTA V's register-offset S_LOAD_DWORDX2 descriptor-fragment shape. The load supplies one or
-// two live words of a four-dword V#; scalar code fills or replaces the other words before MUBUF,
-// MTBUF, or S_BUFFER_LOAD consumes the complete live descriptor. The front half has already read the
-// guest words and published the resulting resource at that exact consumer PC, so the loaded fragment
-// is provenance-only in SPIR-V and can be represented by zero placeholders.
+// Prove GTA V's S_LOAD_DWORDX2 descriptor-fragment shapes: the general register-offset table fetch
+// and the exact immediate +0x58 optional-buffer entry. The load supplies one or two live words of a
+// four-dword V#; scalar code fills or replaces the other words before MUBUF, MTBUF, or S_BUFFER_LOAD
+// consumes the complete live descriptor. The front half has already read the guest words and
+// published the resulting resource at that exact consumer PC, so the loaded fragment is
+// provenance-only in SPIR-V and can be represented by zero placeholders.
 //
 // This is deliberately a whole-CFG use proof, not opcode-wide admission. Every reachable path is
 // followed until the loaded words are overwritten or execution ends. A loaded word may only be read
@@ -5728,8 +5729,7 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
                (operand.kind == OperandKind::Special &&
                 operand.value >= 106 && operand.value <= 124);
     };
-    auto exact_buffer_resource = [&](const Rdna2Inst& consumer,
-                                     bool scalar_buffer) {
+    auto exact_buffer_resource = [&](const Rdna2Inst& consumer, bool scalar_buffer) {
         const ShaderResource* resource = rt->by_fetch_pc(consumer.pc);
         if (!resource || resource->fetch_pc != consumer.pc ||
             resource->srt_offset != 0xffffffffu ||
@@ -5742,13 +5742,17 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
 
     for (size_t load_index = 0; load_index < ins.size(); ++load_index) {
         const Rdna2Inst& load = ins[load_index];
+        const bool register_offset =
+            load.src[1].kind == OperandKind::SGPR ||
+            (load.src[1].kind == OperandKind::Special &&
+             load.src[1].value >= 106 && load.src[1].value <= 123);
+        const bool optional_null_immediate =
+            load.src[1].kind == OperandKind::Special && load.src[1].value == 125 &&
+            load.literal == kGtaOptionalBufferPointerOffset;
         if (load.is_end || load.fmt != Rdna2Format::SMEM ||
             load.opcode != kSmemOpcodeLoadDwordX2 ||
             load.dst.kind != OperandKind::SGPR || load.dst.value < 0 ||
-            load.dst.value + 1 > 105 ||
-            (load.src[1].kind != OperandKind::SGPR &&
-             !(load.src[1].kind == OperandKind::Special &&
-               load.src[1].value >= 106 && load.src[1].value <= 123)))
+            load.dst.value + 1 > 105 || (!register_offset && !optional_null_immediate))
             continue;
 
         const int base = load.dst.value;
@@ -5806,11 +5810,21 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
             // the V# is consumed. Its result remains descriptor provenance: retain that word's live
             // marker so every later use is still checked, but do not mistake this exact RMW patch for
             // an ordinary scalar observation of guest data.
-            const bool descriptor_patch =
+            const bool bitset_descriptor_patch =
                 in.fmt == Rdna2Format::SOP1 &&
                 in.opcode == kSop1OpcodeBitset1B32 &&
                 in.dst.kind == OperandKind::SGPR && overlap(live, in.dst.value, 1) &&
                 in.n_src == 1 && in.src[0].kind == OperandKind::InlineInt;
+            const bool or_descriptor_patch =
+                optional_null_immediate && in.fmt == Rdna2Format::SOP2 &&
+                in.opcode == kSop2OpcodeOrB32 &&
+                in.dst.kind == OperandKind::SGPR && in.dst.value == base + 1 &&
+                in.n_src == 2 && in.literal == kGtaOptionalBufferStrideWord &&
+                ((in.src[0].kind == OperandKind::SGPR && in.src[0].value == in.dst.value &&
+                  in.src[1].kind == OperandKind::Literal) ||
+                 (in.src[1].kind == OperandKind::SGPR && in.src[1].value == in.dst.value &&
+                  in.src[0].kind == OperandKind::Literal));
+            const bool descriptor_patch = bitset_descriptor_patch || or_descriptor_patch;
 
             bool branch = false;
             bool fallthrough = true;
@@ -5890,14 +5904,16 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
                     valid = false;
                     break;
                 }
-                for (uint32_t source = 0; source < in.n_src; ++source) {
-                    if (!is_scalar_operand(in.src[source])) continue;
-                    uint32_t words = scalar_alu_source_words(in, source);
-                    if (words == UINT32_MAX) continue;
-                    if (!words) words = 1; // decoded non-ALU scalar operands remain fail-closed
-                    if (overlap(live, in.src[source].value, words)) {
-                        valid = false;
-                        break;
+                if (!descriptor_patch) {
+                    for (uint32_t source = 0; source < in.n_src; ++source) {
+                        if (!is_scalar_operand(in.src[source])) continue;
+                        uint32_t words = scalar_alu_source_words(in, source);
+                        if (words == UINT32_MAX) continue;
+                        if (!words) words = 1; // decoded non-ALU scalar operands remain fail-closed
+                        if (overlap(live, in.src[source].value, words)) {
+                            valid = false;
+                            break;
+                        }
                     }
                 }
                 if (!valid) break;
@@ -6671,7 +6687,7 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
         switch (in.fmt) {
             case Rdna2Format::VOP1:
                 if (in.opcode == 0x02) sregs.insert(in.dst.value);        // v_readfirstlane -> SGPR
-                else if (in.opcode == 0x42)                              // v_movreld: any observable
+                else if (in.opcode == kVop1OpcodeMovreldB32)             // v_movreld: any observable
                     for (int reg = in.dst.value; reg <= shader_max_vgpr(ins); ++reg)
                         vregs.insert(reg);                               // VDST+M0 target
                 else vregs.insert(in.dst.value); break;
@@ -9429,7 +9445,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg_srt.erase(in.dst.value);
                 return true;
             }
-            if (in.opcode == 0x42) {   // v_movreld_b32: VGPR[VDST + M0] = SRC0
+            if (in.opcode == kVop1OpcodeMovreldB32) { // VGPR[VDST + M0] = SRC0
                 // RDNA2 ISA sec. 6.6. M0 is a runtime unsigned VGPR offset. Represent the indexed
                 // write as selects over every statically referenced destination at or above VDST;
                 // an out-of-range destination is unobservable because no later instruction names it.
@@ -11602,11 +11618,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
-            // GTA V assembles a four-dword V# from a register-offset S_LOAD_DWORDX2 fragment plus
-            // later scalar writes. The whole-CFG proof established that the loaded words are never
-            // scalar/address data and that every descriptor observation resolves through an exact-PC
-            // resource, so no runtime load belongs in the emitted module. Keep this before generic
-            // SOFFSET handling: the offset selects front-half provenance, not emitted scalar data.
+            // GTA V assembles a four-dword V# from a register-offset or exact immediate +0x58
+            // S_LOAD_DWORDX2 fragment plus later scalar writes. The whole-CFG proof established that
+            // the loaded words are never scalar/address data and that every descriptor observation
+            // resolves through an exact-PC resource, so no runtime load belongs in the emitted
+            // module. Keep this before generic SOFFSET handling: the offset selects front-half
+            // provenance, not emitted scalar data.
             if (rt && in.opcode == kSmemOpcodeLoadDwordX2 &&
                 rs.smem_x2_descriptor_fragment_loads.contains(in.pc)) {
                 for (uint32_t k = 0; k < n; ++k) {
@@ -12133,6 +12150,21 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                 sreg_range_written(rs, in.src[1].value, 4), rt->resources.size());
                     }
                     ok = false; return true;   // unresolvable V# -> reject; NEVER default to binding 2
+                }
+                if (is_optional_null_raw_load_buffer(*res)) {
+                    // Unlike NUM_RECORDS=0, this marker records an application-level optional
+                    // entry, not an architectural empty descriptor. Only the exact admitted RAW
+                    // dword load may consume it; stores, atomics, wider loads, and packet variants
+                    // stay fail-visible rather than inheriting drop-write behavior.
+                    if (!rdna2_optional_null_raw_load_shape(in)) {
+                        ok = false;
+                        return true;
+                    }
+                    const int d = in.dst.value;
+                    const uint32_t old = vreg_old(b, rs, d);
+                    rs.vreg[d] = b.uconst(0);
+                    predicate_write(b, rs, d, old);
+                    return true;
                 }
                 if (is_zero_record_raw_buffer(*res)) {
                     // The front half proved all four live V# words at this exact instruction and
@@ -15290,7 +15322,7 @@ bool emit_cfg_state_machine(
     // ordinary write can leave a stale mask-half proof attached to an erased slot.
     const int max_observable_vgpr = shader_max_vgpr(ins);
     auto for_each_possible_vector_write = [&](const Rdna2Inst& in, const auto& callback) {
-        if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x42) {
+        if (in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32) {
             for (int reg = in.dst.value; reg <= max_observable_vgpr; ++reg) callback(reg);
             return;
         }
