@@ -11370,24 +11370,38 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // (0x3c/0x3d, wrap semantics), and most x2 64-bit variants stay deferred
                 // (fail-visible) via the default case below. Opcodes 0x50/0x5a have separately
                 // guarded GTA V lowerings: one true qword RMW, never two ordinary 32-bit atomics.
-                case 0x30: n = 1; is_atomic = true; atomic_op = Op_AtomicExchange; break; // swap
-                case 0x32: n = 1; is_atomic = true; atomic_op = Op_AtomicIAdd;     break; // add
-                case 0x33: n = 1; is_atomic = true; atomic_op = Op_AtomicISub;     break; // sub
-                case 0x35: n = 1; is_atomic = true; atomic_op = Op_AtomicSMin;     break; // smin (signed)
-                case 0x36: n = 1; is_atomic = true; atomic_op = Op_AtomicUMin;     break; // umin (unsigned)
-                case 0x37: n = 1; is_atomic = true; atomic_op = Op_AtomicSMax;     break; // smax (signed)
-                case 0x38: n = 1; is_atomic = true; atomic_op = Op_AtomicUMax;     break; // umax (unsigned)
-                case 0x39: n = 1; is_atomic = true; atomic_op = Op_AtomicAnd;      break; // and
-                case 0x3a: n = 1; is_atomic = true; atomic_op = Op_AtomicOr;       break; // or
-                case 0x3b: n = 1; is_atomic = true; atomic_op = Op_AtomicXor;      break; // xor
-                case 0x3f: n = 1; is_atomic = true; is_atomic_fminmax = true;
-                           atomic_fmin = true; break;                              // fmin
-                case 0x40: n = 1; is_atomic = true; is_atomic_fminmax = true;
-                           atomic_fmin = false; break;                             // fmax
-                case 0x50: n = 2; is_atomic = true; is_atomic_x2 = true;
-                           atomic_op = Op_AtomicExchange; break;                    // swap_x2
-                case 0x5a: n = 2; is_atomic = true; is_atomic_x2 = true;
-                           atomic_op = Op_AtomicOr; break;                          // or_x2
+                case kMubufOpcodeAtomicSwap:
+                    n = 1; is_atomic = true; atomic_op = Op_AtomicExchange; break;
+                case kMubufOpcodeAtomicAdd:
+                    n = 1; is_atomic = true; atomic_op = Op_AtomicIAdd; break;
+                case kMubufOpcodeAtomicSub:
+                    n = 1; is_atomic = true; atomic_op = Op_AtomicISub; break;
+                case kMubufOpcodeAtomicSmin:
+                    n = 1; is_atomic = true; atomic_op = Op_AtomicSMin; break;
+                case kMubufOpcodeAtomicUmin:
+                    n = 1; is_atomic = true; atomic_op = Op_AtomicUMin; break;
+                case kMubufOpcodeAtomicSmax:
+                    n = 1; is_atomic = true; atomic_op = Op_AtomicSMax; break;
+                case kMubufOpcodeAtomicUmax:
+                    n = 1; is_atomic = true; atomic_op = Op_AtomicUMax; break;
+                case kMubufOpcodeAtomicAnd:
+                    n = 1; is_atomic = true; atomic_op = Op_AtomicAnd; break;
+                case kMubufOpcodeAtomicOr:
+                    n = 1; is_atomic = true; atomic_op = Op_AtomicOr; break;
+                case kMubufOpcodeAtomicXor:
+                    n = 1; is_atomic = true; atomic_op = Op_AtomicXor; break;
+                case kMubufOpcodeAtomicFmin:
+                    n = 1; is_atomic = true; is_atomic_fminmax = true;
+                    atomic_fmin = true; break;
+                case kMubufOpcodeAtomicFmax:
+                    n = 1; is_atomic = true; is_atomic_fminmax = true;
+                    atomic_fmin = false; break;
+                case kMubufOpcodeAtomicSwapX2:
+                    n = 2; is_atomic = true; is_atomic_x2 = true;
+                    atomic_op = Op_AtomicExchange; break;
+                case kMubufOpcodeAtomicOrX2:
+                    n = 2; is_atomic = true; is_atomic_x2 = true;
+                    atomic_op = Op_AtomicOr; break;
                 default: ok = false; return true;           // remaining typed/atomic opcodes deferred
             }
             uint32_t offset = in.literal & 0xFFFu;
