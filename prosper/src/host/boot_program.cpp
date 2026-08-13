@@ -9,6 +9,12 @@
 #include <system_error>
 #include <vector>
 
+// Phase 7A: IL2CPP Metadata Registration (prototype)
+#include "il2cpp_metadata.hpp"
+
+// Diagnostics Plugin Registry (real call site — exercises API contract)
+#include "diagnostics.hpp"
+
 namespace prosper {
 
 // See boot_program.hpp. The fixed preload list names each module with ONE hard-coded casing, but
@@ -268,6 +274,16 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     register_builtin_hle();
     if (after_hle_registered) after_hle_registered();   // caller installs host frontends here
 
+    // Register diagnostics plugin (exercises API contract — real call site)
+    {
+        PluginInfo boot_diag{
+            "boot_state",
+            "1.0",
+            "Boot phase diagnostics"
+        };
+        plugin_registry().register_plugin(boot_diag);
+    }
+
     set_app0_root(d);
     for (auto& img : p.imgs) if (!map_image(img, &e)) return fail("map failed: " + e);
     {
@@ -308,6 +324,44 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     if (!getenv("PROSPER_NO_PSN"))
         set_module_start_param_ranges({ { BOOT_PSN, BOOT_SAVEDATA }, { BOOT_SAVEDATA, BOOT_LIBC },
                                         { BOOT_PSNCORE, 0x490000000ull }, { BOOT_PSNCOMMON, 0x4b0000000ull } });
+
+    // === PHASE 7A: IL2CPP Metadata Registration (Prototype) ===
+    // Register IL2CPP metadata BEFORE guest init functions run.
+    // This ensures type information (System.Object, UnityEngine.Object) is available
+    // when IL2CPP's init code executes, preventing NULL TypeInfo crashes.
+    // See: IL2CPP_MINIMAL_REGISTRATION_RESULT.md for evidence.
+    {
+        extern bool il2cpp_metadata_register(const std::string&, prosper::il2cpp_meta::DiagnosticInfo&);
+        extern void il2cpp_metadata_dump_status(const prosper::il2cpp_meta::DiagnosticInfo&);
+        extern bool il2cpp_metadata_verify_critical_types(prosper::il2cpp_meta::DiagnosticInfo&);
+        
+        prosper::il2cpp_meta::DiagnosticInfo meta_diag;
+        
+        // Step 1: Load and parse global-metadata.dat
+        bool meta_ok = il2cpp_metadata_register(d, meta_diag);
+        
+        if (meta_ok) {
+            // Step 2: Verify critical types exist
+            il2cpp_metadata_verify_critical_types(meta_diag);
+            
+            // Step 3: Dump status (diagnostic output)
+            if (getenv("PROSPER_IL2CPP_META_VERBOSE")) {
+                il2cpp_metadata_dump_status(meta_diag);
+            } else {
+                printf("[il2cpp-meta] Registration: %s | System.Object: %s | UnityEngine.Object: %s\n",
+                       meta_diag.status == prosper::il2cpp_meta::RegistrationStatus::SUCCESS ? "OK" : "PARTIAL",
+                       meta_diag.system_object_found ? "FOUND" : "MISSING",
+                       meta_diag.unity_engine_object_found ? "FOUND" : "MISSING");
+            }
+        } else {
+            printf("[il2cpp-meta] WARNING: Metadata registration failed (%s) - "
+                   "IL2CPP crashes may still occur\n",
+                   meta_diag.error_details.c_str());
+        }
+        // NOTE: We continue boot even if metadata registration fails - this is
+        // a prototype diagnostic, not a hard dependency yet.
+    }
+    // === END PHASE 7A ===
 
     run_guest_inits(p.init_fns);
     return true;
