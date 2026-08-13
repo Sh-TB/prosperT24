@@ -5931,19 +5931,20 @@ std::unordered_set<uint32_t> proven_structured_wave64_mask_reduction_pcs(
     return proven;
 }
 
-// Prove GTA V's S_LOAD_DWORDX2 descriptor-fragment shapes: the general register-offset table fetch
-// and GTA V's exact immediate +0x50/+0x58 descriptor-table entries. The load supplies one or two
-// live words of a four-dword V#; scalar code fills or replaces the other words before MUBUF, MTBUF,
-// or S_BUFFER_LOAD consumes the complete live descriptor. The front half has already read the guest
-// words and published the resulting resource at that exact consumer PC, so the loaded fragment is
-// provenance-only in SPIR-V and can be represented by zero placeholders.
+// Prove S_LOAD_DWORDX2 descriptor-fragment shapes. The load supplies one or two live words of a
+// four-dword V#; scalar code fills or replaces the other words before MUBUF, MTBUF, or S_BUFFER_LOAD
+// consumes the complete live descriptor. The front half has already read the guest words and
+// published the resulting resource at that exact consumer PC, so the loaded fragment is
+// provenance-only in SPIR-V and can be represented by zero placeholders. Immediate descriptor-table
+// offsets are admitted by this use proof rather than a title-specific offset inventory.
 //
 // This is deliberately a whole-CFG use proof, not opcode-wide admission. Every reachable path is
 // followed until the loaded words are overwritten or execution ends. A loaded word may only be read
 // through an exact-PC, key-less buffer descriptor; every ordinary scalar/address read and every
 // unresolved control edge rejects the candidate. CONFIDENCE: HIGH for the admitted shape.
 std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
-        const std::vector<Rdna2Inst>& ins, const ShaderResourceTable* rt) {
+        const std::vector<Rdna2Inst>& ins, const ShaderResourceTable* rt,
+        uint32_t wave_size) {
     std::unordered_set<uint32_t> proven;
     if (!rt || ins.empty()) return proven;
 
@@ -5966,6 +5967,29 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
         return resource->cls == ResourceClass::ConstantBuffer ||
                resource->cls == ResourceClass::VertexBuffer;
     };
+    auto scalar_register_is = [&](const Operand& operand, int reg) {
+        return is_scalar_operand(operand) && operand.value == reg;
+    };
+    auto instruction_reads_scc = [](const Rdna2Inst& in) {
+        for (uint32_t source = 0; source < in.n_src; ++source)
+            if (in.src[source].kind == OperandKind::Special && in.src[source].value == 253)
+                return true;
+        if (in.fmt == Rdna2Format::SOP2)
+            return in.opcode == kSop2OpcodeAddcU32 || in.opcode == 0x05u ||
+                   in.opcode == kSop2OpcodeCselectB32 ||
+                   in.opcode == kSop2OpcodeCselectB64;
+        if (in.fmt == Rdna2Format::SOPP)
+            return in.opcode == kSoppOpcodeCbranchScc0 || in.opcode == 0x05u;
+        if (in.fmt == Rdna2Format::SOP1)
+            return in.opcode == kSop1OpcodeCmovB32 || in.opcode == kSop1OpcodeCmovB64;
+        return in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCmovkI32;
+    };
+
+    std::unordered_set<uint32_t> direct_branch_targets;
+    for (const Rdna2Inst& in : ins)
+        if (!in.is_end && in.fmt == Rdna2Format::SOPP &&
+            sopp_opcode_is_direct_branch(in.opcode))
+            direct_branch_targets.insert(branch_target(in));
 
     for (size_t load_index = 0; load_index < ins.size(); ++load_index) {
         const Rdna2Inst& load = ins[load_index];
@@ -5976,38 +6000,127 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
         const bool optional_null_immediate =
             load.src[1].kind == OperandKind::Special && load.src[1].value == 125 &&
             load.literal == kGtaOptionalBufferPointerOffset;
-        const bool gta_descriptor_immediate = optional_null_immediate ||
-            (load.src[1].kind == OperandKind::Special && load.src[1].value == 125 &&
-             load.literal == kGtaBufferDescriptorFragmentOffset);
+        const bool aligned_immediate =
+            load.src[1].kind == OperandKind::Special && load.src[1].value == 125 &&
+            static_cast<int32_t>(load.literal) >= 0 && (load.literal & 3u) == 0;
         if (load.is_end || load.fmt != Rdna2Format::SMEM ||
             load.opcode != kSmemOpcodeLoadDwordX2 ||
             load.dst.kind != OperandKind::SGPR || load.dst.value < 0 ||
-            load.dst.value + 1 > 105 || (!register_offset && !gta_descriptor_immediate))
+            (load.dst.value > 104 && load.dst.value != 106) ||
+            (!register_offset && !aligned_immediate))
             continue;
 
         const int base = load.dst.value;
-        auto overlap = [base](uint8_t live, int first, uint32_t words) {
+        struct DescriptorRelocation {
+            size_t low_index = SIZE_MAX;
+            size_t high_index = SIZE_MAX;
+            int destination_base = -1;
+        } relocation;
+
+        // Some descriptor builders relocate a loaded 64-bit address with an ordinary carry pair:
+        //   s_add_u32  dst.lo, loaded.lo, base.lo
+        //   s_addc_u32 dst.hi, loaded.hi, base.hi
+        // Admit only the exact pair in one straight-line SCC lifetime. Interposed scalar moves are
+        // SCC-transparent, and the produced final carry must have no later observer. This keeps the
+        // loaded address as descriptor provenance without treating general scalar arithmetic as a
+        // descriptor transformation.
+        for (size_t low_index = load_index + 1;
+             low_index < ins.size() && relocation.low_index == SIZE_MAX; ++low_index) {
+            const Rdna2Inst& low = ins[low_index];
+            if (low.is_end ||
+                (low.fmt == Rdna2Format::SOPP && !sopp_is_noop(low)) ||
+                (low.fmt == Rdna2Format::SOP1 &&
+                 low.opcode >= kSop1OpcodeSetpcB64 && low.opcode <= kSop1OpcodeRfeB64))
+                break;
+            if (low.fmt != Rdna2Format::SOP2 || low.opcode != kSop2OpcodeAddU32 ||
+                low.dst.kind != OperandKind::SGPR || low.dst.value < 0 ||
+                low.dst.value + 3 > 105 || low.n_src != 2)
+                continue;
+            if (low.dst.value <= base + 1 && base <= low.dst.value + 1)
+                continue;
+            int loaded_source = -1;
+            if (scalar_register_is(low.src[0], base)) loaded_source = 0;
+            if (scalar_register_is(low.src[1], base)) {
+                if (loaded_source >= 0) continue;
+                loaded_source = 1;
+            }
+            if (loaded_source < 0 ||
+                !is_scalar_operand(low.src[static_cast<uint32_t>(1 - loaded_source)]))
+                continue;
+            const int other_base = low.src[static_cast<uint32_t>(1 - loaded_source)].value;
+            if (other_base < 0 || other_base + 1 > 105 ||
+                (other_base <= base + 1 && base <= other_base + 1) ||
+                (other_base <= low.dst.value + 1 &&
+                 low.dst.value <= other_base + 1))
+                continue;
+
+            for (size_t high_index = low_index + 1; high_index < ins.size(); ++high_index) {
+                const Rdna2Inst& high = ins[high_index];
+                if (direct_branch_targets.contains(high.pc)) break;
+                if (high.fmt == Rdna2Format::SOP2 &&
+                    high.opcode == kSop2OpcodeAddcU32 && high.n_src == 2 &&
+                    high.dst.kind == OperandKind::SGPR &&
+                    high.dst.value == low.dst.value + 1) {
+                    const bool matched_sources =
+                        (scalar_register_is(high.src[0], base + 1) &&
+                         scalar_register_is(high.src[1], other_base + 1)) ||
+                        (scalar_register_is(high.src[1], base + 1) &&
+                         scalar_register_is(high.src[0], other_base + 1));
+                    if (!matched_sources) break;
+                    bool carry_observed = false;
+                    for (size_t later = high_index + 1; later < ins.size(); ++later)
+                        if (instruction_reads_scc(ins[later])) {
+                            carry_observed = true;
+                            break;
+                        }
+                    if (!carry_observed)
+                        relocation = {low_index, high_index, low.dst.value};
+                    break;
+                }
+                if (high.fmt != Rdna2Format::SOP1 ||
+                    high.opcode != kSop1OpcodeMovB32)
+                    break;
+                if (instruction_reads_scc(high)) break;
+                if (high.dst.value == base || high.dst.value == base + 1 ||
+                    high.dst.value == low.dst.value ||
+                    high.dst.value == low.dst.value + 1)
+                    break;
+            }
+        }
+
+        auto overlap = [base, &relocation](uint8_t live, int first, uint32_t words) {
             if (first < 0 || !words) return false;
             for (uint32_t word = 0; word < words; ++word) {
-                const int relative = first + static_cast<int>(word) - base;
-                if (relative >= 0 && relative < 2 && (live & (1u << relative)))
+                const int reg = first + static_cast<int>(word);
+                const int original_relative = reg - base;
+                if (original_relative >= 0 && original_relative < 2 &&
+                    (live & (1u << original_relative)))
+                    return true;
+                const int relocated_relative = reg - relocation.destination_base;
+                if (relocation.destination_base >= 0 && relocated_relative >= 0 &&
+                    relocated_relative < 2 && (live & (1u << (relocated_relative + 2))))
                     return true;
             }
             return false;
         };
-        auto clear_written = [base](uint8_t& live, int first, uint32_t words) {
+        auto clear_written = [base, &relocation](uint8_t& live, int first, uint32_t words) {
             if (first < 0) return;
             for (uint32_t word = 0; word < words; ++word) {
-                const int relative = first + static_cast<int>(word) - base;
-                if (relative >= 0 && relative < 2)
-                    live &= static_cast<uint8_t>(~(1u << relative));
+                const int reg = first + static_cast<int>(word);
+                const int original_relative = reg - base;
+                if (original_relative >= 0 && original_relative < 2)
+                    live &= static_cast<uint8_t>(~(1u << original_relative));
+                const int relocated_relative = reg - relocation.destination_base;
+                if (relocation.destination_base >= 0 && relocated_relative >= 0 &&
+                    relocated_relative < 2)
+                    live &= static_cast<uint8_t>(~(1u << (relocated_relative + 2)));
             }
         };
 
         struct PendingState { size_t index; uint8_t live; };
         std::vector<PendingState> pending;
         if (load_index + 1 < ins.size()) pending.push_back({load_index + 1, 0x3u});
-        std::vector<uint8_t> visited(ins.size(), 0);
+        std::vector<uint16_t> visited(ins.size(), 0);
         bool consumed = false;
         bool valid = true;
 
@@ -6028,7 +6141,7 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
             PendingState state = pending.back();
             pending.pop_back();
             if (!state.live || state.index >= ins.size()) continue;
-            const uint8_t state_bit = static_cast<uint8_t>(1u << state.live);
+            const uint16_t state_bit = static_cast<uint16_t>(1u << state.live);
             if (visited[state.index] & state_bit) continue;
             visited[state.index] |= state_bit;
 
@@ -6062,8 +6175,25 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
                 in.n_src == 2 && in.src[0].kind == OperandKind::SGPR &&
                 in.src[0].value == in.dst.value && in.src[1].kind == OperandKind::Literal &&
                 in.literal == kGtavBufferDescriptorHighControlBits;
+            const bool relocation_low = state.index == relocation.low_index;
+            const bool relocation_high = state.index == relocation.high_index;
             const bool descriptor_patch = bitset_descriptor_patch || or_descriptor_patch ||
-                high_control_descriptor_patch;
+                high_control_descriptor_patch || relocation_low || relocation_high;
+
+            // A load overlapping physical VCC also creates a mask lifetime. Reject every implicit
+            // mask observation until a real VCC writer replaces the live half or pair; explicit
+            // scalar observations remain covered by the ordinary operand walk below.
+            const bool implicit_vcc_read =
+                overlap(live, 106, wave_size == 32 ? 1u : 2u) &&
+                ((in.fmt == Rdna2Format::SOPP &&
+                  (in.opcode == 0x06u || in.opcode == 0x07u)) ||
+                 (in.fmt == Rdna2Format::VOP2 &&
+                  (in.opcode == 0x01u ||
+                   (in.opcode >= 0x28u && in.opcode <= 0x2au))));
+            if (implicit_vcc_read) {
+                valid = false;
+                break;
+            }
 
             bool branch = false;
             bool fallthrough = true;
@@ -6158,10 +6288,22 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
                 if (!valid) break;
             }
 
-            if (!descriptor_patch) {
+            if (relocation_low || relocation_high) {
+                const uint8_t destination_bit = relocation_low ? 0x4u : 0x8u;
+                const bool source_live = relocation_low
+                    ? (live & 0x1u) != 0
+                    : (live & (0x2u | 0x4u)) != 0;
+                clear_written(live,
+                              relocation.destination_base + (relocation_high ? 1 : 0), 1);
+                if (source_live) live |= destination_bit;
+            } else if (!descriptor_patch) {
                 for_each_scalar_write(in, [&](int first, uint32_t words) {
                     clear_written(live, first, words);
-                });
+                }, wave_size == 32);
+                if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
+                    (in.dst.kind == OperandKind::SGPR ||
+                     in.dst.kind == OperandKind::Special) && in.dst.value == 106)
+                    clear_written(live, 106, wave_size == 32 ? 1u : 2u);
             }
             if (!live) continue;
 
@@ -12014,12 +12156,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 return true;
             }
-            // GTA V assembles a four-dword V# from a register-offset or exact immediate +0x58
-            // S_LOAD_DWORDX2 fragment plus later scalar writes. The whole-CFG proof established that
-            // the loaded words are never scalar/address data and that every descriptor observation
-            // resolves through an exact-PC resource, so no runtime load belongs in the emitted
-            // module. Keep this before generic SOFFSET handling: the offset selects front-half
-            // provenance, not emitted scalar data.
+            // The whole-CFG proof established that this register-offset or aligned-immediate
+            // S_LOAD_DWORDX2 feeds only a complete V# (possibly after an exact scalar carry-pair
+            // relocation), never ordinary scalar/address or mask state. Every descriptor observation
+            // resolves through an exact-PC resource, so no runtime load belongs in the emitted module.
+            // Keep this before generic SOFFSET handling: the offset selects front-half provenance,
+            // not emitted scalar data.
             if (rt && in.opcode == kSmemOpcodeLoadDwordX2 &&
                 rs.smem_x2_descriptor_fragment_loads.contains(in.pc)) {
                 for (uint32_t k = 0; k < n; ++k) {
@@ -20521,7 +20663,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     }
     if (!rs.smem_x2_descriptor_fragment_analysis_done) {
         rs.smem_x2_descriptor_fragment_loads =
-            proven_smem_x2_descriptor_fragment_loads(ins, rt);
+            proven_smem_x2_descriptor_fragment_loads(ins, rt, b.wave_size);
         rs.smem_x2_descriptor_fragment_analysis_done = true;
     }
     // Fold PC-relative embedded-table loads (s_getpc_b64-built V#s) before the walk — emit_alu's
