@@ -179,8 +179,8 @@ enum : uint32_t {
     // operations that merely share the word; `grep -c NonUniform` on this file returns 45 hits and every
     // one of them is a GroupNonUniform op, which reads exactly like descriptor indexing is already
     // supported. It was not.
-    Cap_ShaderNonUniform=5301, Cap_RuntimeDescriptorArray=5302,
-    Cap_StorageBufferArrayNonUniformIndexing=5306,
+    Cap_ShaderNonUniform=5301,
+    Cap_StorageBufferArrayNonUniformIndexing=5308,
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
     EM_OutputVertices=26, EM_OutputTriangleStrip=29, EM_Xfb=11,   // transform-feedback execution mode
@@ -210,7 +210,7 @@ enum : uint32_t {
     Dec_DescriptorSet=34, Dec_Offset=35, Dec_XfbBuffer=36, Dec_XfbStride=37,
     // Decoration 5300 -- descriptor indexing's NonUniform, unrelated to the GroupNonUniform ops.
     Dec_NonUniform=5300,
-    BI_Position=0, BI_FragCoord=15, BI_FragDepth=22, BI_HelperInvocation=23,
+    BI_Position=0, BI_FragCoord=15, BI_SampleMask=20, BI_FragDepth=22, BI_HelperInvocation=23,
     BI_WorkgroupId=26, BI_LocalInvocationId=27,
     BI_GlobalInvocationId=28, BI_SubgroupId=40, BI_SubgroupLocalInvocationId=41,
     BI_VertexIndex=42, BI_InstanceIndex=43,
@@ -368,7 +368,6 @@ struct SpirvCompute {
         if (descriptor_indexing_declared) return;
         descriptor_indexing_declared = true;
         put(caps, Op_Capability, {Cap_ShaderNonUniform});
-        put(caps, Op_Capability, {Cap_RuntimeDescriptorArray});
         put(caps, Op_Capability, {Cap_StorageBufferArrayNonUniformIndexing});
         std::vector<uint32_t> o; pstr(o, "SPV_EXT_descriptor_indexing");
         putv(exts, Op_Extension, o);
@@ -387,6 +386,7 @@ struct SpirvCompute {
     // entry guard, which is never legal around a workgroup barrier.
     bool partial_barrier_phases_emitted = false;
     uint32_t v_push_constants = 0, t_ptr_push_u32 = 0;
+    uint32_t push_constant_dword_count = 0;
     uint32_t linear_localid = 0, local_count = 64, wave_size = 64;
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
     uint32_t t_ptr_sb_struct_u=0;                    // shared runtime-u32 Block pointer type
@@ -403,6 +403,10 @@ struct SpirvCompute {
     std::map<uint32_t, uint32_t> cbuf_table_arity;
     // binding -> user SGPR holding the descriptor index, when one is available.
     std::map<uint32_t, uint32_t> cbuf_table_index_sgpr;
+    // Set when an array access cannot be represented exactly. The backend already refuses writable
+    // arrays; keeping the same boundary in the emitter prevents a caller that bypasses reflection
+    // from receiving a module that redirects an invalid store/atomic to descriptor zero.
+    bool invalid_cbuf_array_access = false;
     // A two-byte guest V# can only back our u32 SSBO ABI when every use of that binding is the exact
     // one-record Uint16/Float16 path. Ordinary load/store/atomic helpers blacklist their bindings;
     // finish() emits the explicit typed zero-pad contract only for candidates with no competing use.
@@ -419,6 +423,12 @@ struct SpirvCompute {
     uint32_t ngg_vertex_index_value = 0;
     bool     is_compute=0;                            // true in the compute shell (gates LDS / s_barrier)
     bool     uses_barrier=0;                          // guest or synthesized workgroup barrier emitted
+    // Ordinary LDS writes that feed a synthesized float-atomic publication boundary are emitted as
+    // atomic exchanges. RDNA serializes indexed same-bank conflicts, while Vulkan ordinary stores
+    // from separate invocations would otherwise form a data race before the common-phase barrier.
+    // The whole-stream synchronization proof populates exact guest PCs; unrelated LDS stores retain
+    // their ordinary lowering.
+    std::unordered_set<uint32_t> atomicized_lds_store_pcs;
     // GTA V 0x413ce6000's exact pc153 scalar descriptor-table read is admitted only after the
     // complete dispatch/source/table proof has been repeated at the final compiler boundary.
     // Keeping that authority on the builder, rather than inferring it from a resource field inside
@@ -2252,20 +2262,37 @@ struct SpirvCompute {
     //
     // Hence one function: the sites cannot drift apart again, and a fifth caller inherits the selector
     // rather than a stale comment promising there is only one.
-    uint32_t cbuf_element_ptr(uint32_t buf, uint32_t binding, uint32_t idx) {
+    uint32_t cbuf_element_ptr(uint32_t buf, uint32_t binding, uint32_t idx,
+                              uint32_t* array_valid = nullptr) {
+        if (array_valid) *array_valid = 0;
         auto arity = cbuf_table_arity.find(binding);
         auto index_sgpr = cbuf_table_index_sgpr.find(binding);
         uint32_t ptr = id();
-        if (arity != cbuf_table_arity.end() && index_sgpr != cbuf_table_index_sgpr.end()) {
-            const uint32_t sel = load_push_constant(index_sgpr->second);
+        if (arity != cbuf_table_arity.end()) {
+            // Only the compute shell declares the user-SGPR push-constant block. Graphics paths do
+            // not currently have a runtime source for this selector, so emitting an access there
+            // would manufacture type/variable id zero and an invalid module.
+            if (!is_compute || arity->second > 4096u ||
+                index_sgpr == cbuf_table_index_sgpr.end() ||
+                index_sgpr->second >= push_constant_dword_count) {
+                invalid_cbuf_array_access = true;
+                putv(code, Op_AccessChain,
+                     {t_ptr_sb_u32, ptr, buf, uconst(0), uconst(0), idx});
+                return ptr;
+            }
+            const uint32_t selector = load_push_constant(index_sgpr->second);
+            const uint32_t valid = ucmp(Op_ULessThan, selector, uconst(arity->second));
+            const uint32_t safe_selector = sel(valid, selector, uconst(0));
+            if (array_valid) *array_valid = valid;
             // NonUniform on both the selector and the pointer, unconditionally. Measured: of
             // PPSA04263's 51 compute launches, 5 are local=256x1x1 -- four waves per workgroup, so four
             // EXECs and four distinct scalar indices, wave-uniform but NOT dynamically uniform across
             // the invocation group. 43 of 51 are one wave per group, which is why the "obviously
             // uniform" reading looks safe and is wrong. `load_push_constant` mints a fresh id per call
             // and does not cache, so these decorations never duplicate onto one id.
-            put(deco, Op_Decorate, {sel, Dec_NonUniform});
-            putv(code, Op_AccessChain, {t_ptr_sb_u32, ptr, buf, sel, uconst(0), idx});
+            put(deco, Op_Decorate, {safe_selector, Dec_NonUniform});
+            putv(code, Op_AccessChain,
+                 {t_ptr_sb_u32, ptr, buf, safe_selector, uconst(0), idx});
             put(deco, Op_Decorate, {ptr, Dec_NonUniform});
             return ptr;
         }
@@ -2275,11 +2302,12 @@ struct SpirvCompute {
     uint32_t cbuf_load_impl(uint32_t idx, uint32_t binding, bool coherent_access) {
         uint32_t buf = buf_for_binding(binding);
         if (coherent_access) mark_cbuf_coherent(binding);
-        uint32_t p = cbuf_element_ptr(buf, binding, idx);
+        uint32_t array_valid = 0;
+        uint32_t p = cbuf_element_ptr(buf, binding, idx, &array_valid);
         uint32_t r = id();
         if (coherent_access) put(code, Op_Load, {t_u32, r, p, MemAccess_Volatile});
         else                 put(code, Op_Load, {t_u32, r, p});
-        return r;
+        return array_valid ? sel(array_valid, r, uconst(0)) : r;
     }
     uint32_t cbuf_load(uint32_t idx, uint32_t binding = 2, bool coherent_access = false) {
         cbuf_ordinary_accesses.insert(binding);
@@ -2299,6 +2327,7 @@ struct SpirvCompute {
     void cbuf_store(uint32_t idx, uint32_t value, uint32_t binding, bool predicated,
                     uint32_t pred, bool coherent_access = false) {
         cbuf_ordinary_accesses.insert(binding);
+        if (cbuf_table_arity.count(binding)) invalid_cbuf_array_access = true;
         uint32_t buf = buf_for_binding(binding);
         if (coherent_access) mark_cbuf_coherent(binding);
         auto emit = [&]() {
@@ -2321,6 +2350,7 @@ struct SpirvCompute {
     uint32_t cbuf_atomic_rtn(uint32_t op, uint32_t idx, uint32_t value, uint32_t binding,
                              bool predicated, uint32_t pred, uint32_t fallback) {
         cbuf_ordinary_accesses.insert(binding);
+        if (cbuf_table_arity.count(binding)) invalid_cbuf_array_access = true;
         const uint32_t buf = buf_for_binding(binding);
         auto emit = [&]() {
             uint32_t p = cbuf_element_ptr(buf, binding, idx);
@@ -2403,6 +2433,7 @@ struct SpirvCompute {
                                      bool is_min, bool predicated, uint32_t pred,
                                      uint32_t fallback) {
         cbuf_ordinary_accesses.insert(binding);
+        if (cbuf_table_arity.count(binding)) invalid_cbuf_array_access = true;
         const uint32_t buf = buf_for_binding(binding);
         auto emit = [&]() {
             const uint32_t pointer = cbuf_element_ptr(buf, binding, idx);
@@ -2563,7 +2594,12 @@ struct SpirvCompute {
         return emit_phi_2way(t_u32, result, then_end, fallback, entry);
     }
     // Store to LDS[idx]; EXEC-predicated (conditional store) under a narrowed mask, like cbuf_store.
-    void lds_store(uint32_t idx, uint32_t value, bool predicated, uint32_t pred) {
+    void lds_store(uint32_t idx, uint32_t value, bool predicated, uint32_t pred,
+                   bool atomicize = false) {
+        if (atomicize) {
+            lds_atomic(Op_AtomicExchange, idx, value, predicated, pred);
+            return;
+        }
         if (!predicated) {
             uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_lds_u32, p, lds_var, idx});
             put(code, Op_Store, {p, value}); return;
@@ -2885,6 +2921,13 @@ struct SpirvCompute {
     // format_* read. Called by every shell (compute/vertex/fragment) so cbuf_load works in each.
     // Requires t_u32 to already be declared. Unused by shaders without memory ops.
     void declare_cbufs(const ShaderResourceTable* rt = nullptr) {
+        if (rt)
+            for (const ShaderResource& resource : rt->resources)
+                if (resource.table_index_count != 0u &&
+                    (resource.cls == ResourceClass::ConstantBuffer ||
+                     resource.cls == ResourceClass::VertexBuffer) &&
+                    !valid_shader_buffer_table_contract(resource))
+                    invalid_cbuf_array_access = true;
         uint32_t t_rta_u = id(), t_struct_u = id();
         t_ptr_sb_struct_u = id();
         v_cbuf = id(); v_cbuf1 = id(); t_ptr_sb_u32 = id();
@@ -2926,11 +2969,10 @@ struct SpirvCompute {
         // Declare `binding`'s variable as an array of the Block type, reusing the id already decorated
         // for it, so its set/binding decorations above stay correct.
         auto declare_as_array = [&](uint32_t binding, uint32_t var, uint32_t arity) {
-            constexpr uint32_t kMaxPlausibleArity = 1u << 16;
             declare_descriptor_indexing();
             const uint32_t arr = id();
-            if (arity > kMaxPlausibleArity) put(types, Op_TypeRuntimeArray, {arr, t_struct_u});
-            else                            put(types, Op_TypeArray, {arr, t_struct_u, uconst(arity)});
+            put(types, Op_TypeArray,
+                {arr, t_struct_u, uconst(arity <= 4096u ? arity : 1u)});
             const uint32_t arr_ptr = id();
             put(types, Op_TypePointer, {arr_ptr, SC_StorageBuffer, arr});
             declare_external_storage_buffer(arr_ptr, var);
@@ -2982,14 +3024,11 @@ struct SpirvCompute {
                     // `OpTypeArray %Block 4294967295` would ask the driver for a 4-billion-descriptor
                     // binding. The numeric guard catches that sentinel without this branch having to
                     // depend on #2463 being merged first, and catches any other absurd count on the way.
-                    constexpr uint32_t kMaxPlausibleArity = 1u << 16;
                     declare_descriptor_indexing();
                     const uint32_t arr = id();
-                    if (r.table_index_count > kMaxPlausibleArity) {
-                        put(types, Op_TypeRuntimeArray, {arr, t_struct_u});
-                    } else {
-                        put(types, Op_TypeArray, {arr, t_struct_u, uconst(r.table_index_count)});
-                    }
+                    put(types, Op_TypeArray,
+                        {arr, t_struct_u,
+                         uconst(r.table_index_count <= 4096u ? r.table_index_count : 1u)});
                     const uint32_t arr_ptr = id();
                     put(types, Op_TypePointer, {arr_ptr, SC_StorageBuffer, arr});
                     declare_external_storage_buffer(arr_ptr, v);
@@ -3035,6 +3074,7 @@ struct SpirvCompute {
                uint32_t local_x = 64, uint32_t local_y = 1, uint32_t local_z = 1,
                uint32_t hardware_wave_size = 64, uint32_t push_constant_dwords = 0) {
         stride = input_stride;
+        push_constant_dword_count = push_constant_dwords;
         local_count = local_x * local_y * local_z;
         wave_size = hardware_wave_size;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_v3u = id(); t_bool = id();
@@ -3224,6 +3264,26 @@ struct SpirvCompute {
             iface.push_back(v_fragdepth);
         }
         put(code, Op_Store, {v_fragdepth, bcf(z_bits)});
+    }
+
+    // Fragment sample-coverage export (EXP target 8 / VSRC2). Vulkan exposes this as the first
+    // element of a BuiltIn SampleMask output array, matching RDNA's 32-bit sample-mask payload.
+    uint32_t v_sample_mask = 0;
+    uint32_t t_sample_mask = 0;
+    void export_sample_mask(uint32_t mask_bits) {
+        if (!v_sample_mask) {
+            t_sample_mask = id();
+            put(types, Op_TypeArray, {t_sample_mask, t_u32, uconst(1)});
+            uint32_t t_ptr = id();
+            put(types, Op_TypePointer, {t_ptr, SC_Output, t_sample_mask});
+            v_sample_mask = id();
+            put(types, Op_Variable, {t_ptr, v_sample_mask, SC_Output});
+            put(deco, Op_Decorate, {v_sample_mask, Dec_BuiltIn, BI_SampleMask});
+            iface.push_back(v_sample_mask);
+        }
+        const uint32_t value = id();
+        put(code, Op_CompositeConstruct, {t_sample_mask, value, mask_bits});
+        put(code, Op_Store, {v_sample_mask, value});
     }
 
     // --- Vertex-shader shell: draw inputs + gl_Position (member 0 of a gl_PerVertex Block). ---
@@ -3640,6 +3700,7 @@ struct SpirvCompute {
     }
 
     std::vector<uint32_t> finish() {
+        if (invalid_cbuf_array_access) return {};
         if (invocation_guard_merge) {
             emit_branch(invocation_guard_merge);
             emit_label(invocation_guard_merge);
@@ -4533,7 +4594,7 @@ std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& in
             writes_b32_mask = true;
         } else if (in.fmt == Rdna2Format::SOP1 &&
                    (in.opcode == 0x03 || in.opcode == 0x07 || in.opcode == 0x09 ||
-                    in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) {
+                    sop1_opcode_is_emitted_saveexec_b32(in.opcode))) {
             writes_b32_mask = tracked_mask_source(in.src[0]) && in.dst.value != 127;
             mask_dst = in.dst.value;
         } else if (in.fmt == Rdna2Format::SOP2 &&
@@ -6746,7 +6807,7 @@ void record_scalar_write(RegState& rs, const Rdna2Inst& in,
              (!rs.sreg.contains(base) &&
               ((in.fmt == Rdna2Format::SOP1 &&
                 (in.opcode == 0x03 || in.opcode == 0x07 || in.opcode == 0x09 ||
-                 in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) ||
+                 sop1_opcode_is_emitted_saveexec_b32(in.opcode))) ||
                sop2_b32_mask_domain || vopc_b32_mask || vop3_b32_mask_write)));
         const bool writes_b64_mask = effective_width == 2 && !vopc_b32_mask &&
             scalar_write_is_b64_mask(in, base);
@@ -6972,14 +7033,19 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
             if (mask_base >= 0) {
                 // The Wave64 MUST analysis in the CFG dispatcher is the lifetime tag that proves
                 // this physical word still names the saved B64 predicate rather than recycled
-                // scalar scratch. An exact native subgroup can materialize that word directly;
-                // portable dispatchers handle the same FFBH shape in their synchronized common
-                // phase below.
-                if (b.is_compute && b.wave_size == 64 &&
-                    b.native_subgroup_size == 64) {
-                    const uint32_t half = b.native_wave_ballot_half(
-                        rs.sreg_bool.at(mask_base),
-                        static_cast<uint32_t>(o.value - mask_base));
+                // scalar scratch. An exact fragment-Wave64 contract or native compute subgroup can
+                // materialize that word directly; portable compute dispatchers handle the same
+                // FFBH shape in their synchronized common phase below.
+                if (b.wave_size == 64 &&
+                    (b.is_fragment ||
+                     (b.is_compute && b.native_subgroup_size == 64))) {
+                    const uint32_t half = b.is_fragment
+                        ? b.fragment_wave_ballot_half(
+                              rs.sreg_bool.at(mask_base),
+                              static_cast<uint32_t>(o.value - mask_base))
+                        : b.native_wave_ballot_half(
+                              rs.sreg_bool.at(mask_base),
+                              static_cast<uint32_t>(o.value - mask_base));
                     if (half) return half;
                 }
                 if (ok) *ok = false;
@@ -7474,7 +7540,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             if (b.allow_b32_masks &&
                 (b.is_fragment || (b.is_compute && b.wave_size == 32)) &&
-                (in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) {
+                sop1_opcode_is_emitted_saveexec_b32(in.opcode)) {
                 // s_and_saveexec_b32 / s_orn2_saveexec_b32 / s_andn1_saveexec_b32
                 // Save the previous EXEC_LO into one physical SGPR, then narrow EXEC_LO by the
                 // one-word source mask. Astro uses VCC_HI as the saved-mask destination and restores
@@ -7504,8 +7570,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg.erase(in.dst.value);
                 rs.sreg_srt.erase(in.dst.value);
                 if (in.dst.value == 106) rs.vcc = old_exec;
-                rs.exec = in.opcode == 0x3c ? b.land(old_exec, mask)
-                        : in.opcode == 0x40 ? b.lor(mask, b.logical_not(old_exec))
+                rs.exec = in.opcode == kSop1OpcodeAndSaveexecB32 ? b.land(old_exec, mask)
+                        : in.opcode == kSop1OpcodeOrn2SaveexecB32
+                            ? b.lor(mask, b.logical_not(old_exec))
                                             : b.land(old_exec, b.logical_not(mask));
                 rs.exec_narrowed = true;
                 rs.scc = b.is_fragment ? b.fragment_wave_any(rs.exec) : 0;
@@ -7794,8 +7861,44 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (is_exec(in.dst)) {                  // set/restore EXEC
                         if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
                             rs.exec = b.btrue(); rs.exec_narrowed = false;   // exec = all lanes on
-                        } else { uint32_t m = src_mask(in.src[0]); if (!m) ok = false;
-                                 else { rs.exec = m; rs.exec_narrowed = saved_narrowed(in.src[0]); } }
+                        } else {
+                            uint32_t m = src_mask(in.src[0]);
+                            // A fragment compiler may restore EXEC from two ordinary scalar words,
+                            // notably after round-tripping a saved ballot pair through fixed
+                            // V_WRITELANE/V_READLANE slots. Reconstruct this invocation's mask bit
+                            // from the exact physical half. subgroup_local_id records the required
+                            // guest-Wave64 contract; a missing half or another stage remains
+                            // fail-visible instead of treating an arbitrary scalar as a Bool alias.
+                            if (!m && b.is_fragment && b.wave_size == 64 &&
+                                (in.src[0].kind == OperandKind::SGPR ||
+                                 (in.src[0].kind == OperandKind::Special &&
+                                  in.src[0].value >= 106 && in.src[0].value <= 123))) {
+                                auto scalar_word = [&](int reg) -> uint32_t {
+                                    const auto current = rs.sreg.find(reg);
+                                    if (current != rs.sreg.end()) return current->second;
+                                    const auto input = rs.sreg_input.find(reg);
+                                    return input != rs.sreg_input.end() ? input->second : 0;
+                                };
+                                const uint32_t lo = scalar_word(in.src[0].value);
+                                const uint32_t hi = scalar_word(in.src[0].value + 1);
+                                if (lo && hi) {
+                                    const uint32_t lane = b.ibin(
+                                        Op_BitwiseAnd, b.subgroup_local_id(), b.uconst(63));
+                                    const uint32_t word = b.sel(
+                                        b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)), hi, lo);
+                                    const uint32_t bit = b.ibin(
+                                        Op_BitwiseAnd, lane, b.uconst(31));
+                                    m = b.ucmp(
+                                        Op_INotEqual,
+                                        b.ibin(Op_BitwiseAnd,
+                                               b.ibin(Op_ShiftRightLogical, word, bit),
+                                               b.uconst(1)),
+                                        b.uconst(0));
+                                }
+                            }
+                            if (!m) ok = false;
+                            else { rs.exec = m; rs.exec_narrowed = saved_narrowed(in.src[0]); }
+                        }
                     } else {                                // s_mov_b64 sDST, <mask-or-data> : save a mask / copy a pair
                         uint32_t m = src_mask(in.src[0]);
                         if (m) { rs.sreg_bool[in.dst.value] = m;
@@ -9133,7 +9236,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     uint32_t wrapped = b.ucmp(Op_ULessThan, d, c);
                     rs.scc = b.bsel(shifted_out, b.btrue(), wrapped); break;
                 }
-                case 0x32: { // s_pack_ll_b32_b16: D={S1[15:0],S0[15:0]}
+                case kSop2OpcodePackLlB32B16: { // s_pack_ll_b32_b16: D={S1[15:0],S0[15:0]}
                     const uint32_t lo = b.ibin(Op_BitwiseAnd, a, b.uconst(0xFFFFu));
                     const uint32_t hi = b.ibin(Op_ShiftLeftLogical,
                         b.ibin(Op_BitwiseAnd, c, b.uconst(0xFFFFu)), b.uconst(16));
@@ -10745,7 +10848,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         ok = false; return true;
                     }
                     mask_value = rs.vcc; mask_source = true;
-                } else if (in.src[0].kind == OperandKind::SGPR) {
+                } else if (in.src[0].kind == OperandKind::SGPR &&
+                           !(b.is_fragment && b.wave_size == 64 &&
+                             (rs.sreg_bool.contains(in.src[0].value) ||
+                              (in.src[0].value > 0 &&
+                               rs.sreg_bool.contains(in.src[0].value - 1))))) {
+                    // A Wave64 fragment V_WRITELANE consumes one physical scalar word, not the
+                    // complete Bool alias rooted at the pair's low SGPR. Let val() materialize that
+                    // exact ballot half lazily below. Other stages retain the mask-slot model.
                     auto saved = rs.sreg_bool.find(in.src[0].value);
                     if (saved != rs.sreg_bool.end()) { mask_value = saved->second; mask_source = true; }
                 }
@@ -11865,7 +11975,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (selected_sbuffer->selected_sbuffer_soffset ==
                         kGtaSelectedSbufferZeroChainSoffset ||
                     selected_sbuffer->selected_sbuffer_soffset ==
-                        kGtaSelectedSbufferAllOobSoffset) {
+                        kGtaSelectedSbufferAllOobSoffset ||
+                    selected_sbuffer->selected_sbuffer_soffset ==
+                        kGtaSelectedSbufferNullRecord4Soffset) {
                     for (uint32_t k = 0; k < n; ++k) {
                         rs.sreg[in.dst.value + static_cast<int>(k)] = b.uconst(0u);
                         rs.sreg_srt.erase(in.dst.value + static_cast<int>(k));
@@ -12644,6 +12756,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (raw_subword) {
                 if (raw_bits == 8) fmt = raw_signed ? DataFormat::Sint8 : DataFormat::Uint8;
                 else               fmt = raw_signed ? DataFormat::Sint16 : DataFormat::Uint16;
+            }
+            // The checkpoint array ABI models read-only raw buffer accesses. Typed MUBUF default-fill
+            // and descriptor swizzle semantics need per-selected-entry treatment; stores and atomics
+            // additionally need writeback authority. Reject all three before any helper can form an
+            // access through the array variable.
+            if (resolved_buffer && resolved_buffer->table_index_count != 0u &&
+                (is_format || is_store || is_atomic)) {
+                ok = false;
+                return true;
             }
             if (is_atomic_x2) {
                 const bool zero_soffset =
@@ -14030,7 +14151,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (in.opcode == 0xb0) {
                     auto value = rs.vreg.find(in.src[1].value);
                     b.lds_store(idx, value == rs.vreg.end() ? b.uconst(0) : value->second,
-                                rs.exec_narrowed, rs.exec);
+                                rs.exec_narrowed, rs.exec,
+                                b.atomicized_lds_store_pcs.contains(in.pc));
                 } else {
                     const uint32_t old = vreg_old(b, rs, in.dst.value);
                     rs.vreg[in.dst.value] = b.lds_load(
@@ -14104,34 +14226,39 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             b.declare_lds();
             if (!b.lds_var) { ok = false; return true; }
             auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+            const bool atomicize_store = b.atomicized_lds_store_pcs.contains(in.pc);
             if (in.opcode == 0x0e) {                    // ds_write2_b32: two dwords at offset0/offset1
                 // AMD RDNA2 ISA 12.13: MEM[ADDR + OFFSET0/1 * 4] = DATA0/1. The packed offsets
                 // mirror ds_read2_b32 below; Astro Bot's world-map reduction uses both operations.
                 const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
                 const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst(in.literal & 0xFFu));
                 const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst((in.literal >> 8) & 0xFFu));
-                b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
+                b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec,
+                            atomicize_store);
                 // Equal offsets encode one memory access and use DATA0; DATA1 is ignored.
                 if ((in.literal & 0xFFu) != ((in.literal >> 8) & 0xFFu))
-                    b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec);
+                    b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec,
+                                atomicize_store);
                 return true;
             }
             if (in.opcode == 0x4e) {                    // ds_write2_b64: two VGPR pairs at offset0/offset1
                 const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
                 const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst((in.literal & 0xFFu) * 2u));
                 const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst(((in.literal >> 8) & 0xFFu) * 2u));
-                b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
+                b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec,
+                            atomicize_store);
                 b.lds_store(b.ibin(Op_IAdd, idx0, b.uconst(1)), vread(in.src[1].value + 1),
-                            rs.exec_narrowed, rs.exec);
+                            rs.exec_narrowed, rs.exec, atomicize_store);
                 // OFFSET0 == OFFSET1 selects ONE address: the hardware performs a single write and
                 // uses DATA0 only (RDNA2 ISA 70648 §10.4.3). Writing DATA1 as well leaves the later
                 // store winning, so a subsequent LDS read observes DATA1 where hardware preserves
                 // DATA0 -- silent wrong data rather than a fault. The ds_write2_b32 case above
                 // already guards this; the 64-bit variant did not (#1473).
                 if ((in.literal & 0xFFu) != ((in.literal >> 8) & 0xFFu)) {
-                    b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec);
+                    b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec,
+                                atomicize_store);
                     b.lds_store(b.ibin(Op_IAdd, idx1, b.uconst(1)), vread(in.src[2].value + 1),
-                                rs.exec_narrowed, rs.exec);
+                                rs.exec_narrowed, rs.exec, atomicize_store);
                 }
                 return true;
             }
@@ -14237,14 +14364,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.exec_narrowed, rs.exec, old);
                 predicate_write(b, rs, in.dst.value, old);
             } else if (in.opcode == 0x0d) {             // ds_write_b32: LDS[idx] = DATA0
-                b.lds_store(idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
+                b.lds_store(idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec,
+                            atomicize_store);
             } else if (in.opcode == 0x4d || in.opcode == 0xde || in.opcode == 0xdf) {
                 // ds_write_b64 / ds_write_b96 / ds_write_b128. The wide forms consume consecutive
                 // DATA0 VGPRs and write consecutive LDS dwords from the ordinary byte address.
                 const int dwords = in.opcode == 0x4d ? 2 : in.opcode == 0xde ? 3 : 4;
                 for (int k = 0; k < dwords; ++k) {
                     const uint32_t at = k ? b.ibin(Op_IAdd, idx, b.uconst((uint32_t)k)) : idx;
-                    b.lds_store(at, vread(in.src[1].value + k), rs.exec_narrowed, rs.exec);
+                    b.lds_store(at, vread(in.src[1].value + k), rs.exec_narrowed, rs.exec,
+                                atomicize_store);
                 }
             } else if (in.opcode == 0x76 || in.opcode == 0xfe || in.opcode == 0xff) {
                 // ds_read_b64 / ds_read_b96 / ds_read_b128. RDNA2 ISA 12.13 opcodes 118/254/255;
@@ -14774,6 +14903,28 @@ ShaderConstantValue shader_constant_operand(
             case 0x02: return {true, lhs.value + rhs.value}; // s_add_i32
             case 0x03: return {true, lhs.value - rhs.value}; // s_sub_i32
             case 0x0e: return {true, lhs.value & rhs.value}; // s_and_b32
+            case 0x10: return {true, lhs.value | rhs.value}; // s_or_b32
+            case 0x12: return {true, lhs.value ^ rhs.value}; // s_xor_b32
+            // Shifts take the amount from S1[4:0] -- RDNA2 ISA -- so the `& 31` is required.
+            //
+            // It is deliberately UNTESTED, because on this host it is untestable: x86 `shl` already
+            // masks its count to 5 bits, so an unmasked `lhs.value << rhs.value` yields the SAME
+            // answer here (measured: naive `5u << 32` prints 5). The mask is therefore not fixing a
+            // wrong result on x86; it is removing undefined behaviour that a compiler is entitled to
+            // exploit, and that would diverge on a host whose shift does not wrap. Do not add a
+            // regression arm claiming to prove it -- such an arm passes with the mask removed, which
+            // makes it a control that cannot fail. The arms below cover only what is observable:
+            // that these opcodes fold at all.
+            //
+            // Opcodes verified against llvm-mc (gfx1030), not against this file's own tables: the
+            // decoder that produces the listing you would otherwise check them with is upstream of
+            // them, so it cannot check them. #2481 records a mnemonic error that survived three
+            // internally consistent anchors and inverted a frontier conclusion.
+            case 0x1e: return {true, lhs.value << (rhs.value & 31u)};  // s_lshl_b32
+            case 0x20: return {true, lhs.value >> (rhs.value & 31u)};  // s_lshr_b32
+            case 0x22: return {true, static_cast<uint32_t>(            // s_ashr_i32
+                std::bit_cast<int32_t>(lhs.value) >> (rhs.value & 31u))};
+            case 0x26: return {true, lhs.value * rhs.value}; // s_mul_i32
             default: return {};
         }
     }
@@ -15045,7 +15196,8 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
             const Rdna2Inst& root_index = ins[root_block + 6];
             const Rdna2Inst& root_nop = ins[root_block + 7];
             const bool mask_copy_shape = wave_size == 32
-                ? mask_copy.fmt == Rdna2Format::SOP1 && mask_copy.opcode == 0x3cu &&
+                ? mask_copy.fmt == Rdna2Format::SOP1 &&
+                  mask_copy.opcode == kSop1OpcodeAndSaveexecB32 &&
                   mask_copy.dst.kind == OperandKind::SGPR && mask_copy.dst.value == 106 &&
                   mask_copy.src[0].kind == OperandKind::Special &&
                   mask_copy.src[0].value == 107
@@ -15527,6 +15679,8 @@ bool emit_cfg_state_machine(
     if (b.is_compute &&
         ((b.wave_size != 32 && b.wave_size != 64) || !b.local_count || b.local_count > 1024))
         return false;
+    const bool has_synchronized_lds_store = synchronize_lds_fminmax &&
+        !b.atomicized_lds_store_pcs.empty();
     const bool has_synchronized_lds_fminmax = synchronize_lds_fminmax &&
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::DS && !in.ds_gds &&
@@ -15537,7 +15691,7 @@ bool emit_cfg_state_machine(
     // the first CAS and the final CAS completes before the later gather. Admission below limits this
     // synthesized ordering to one guest wave, so ended/trapped lanes can safely remain participants.
     const bool direct_dispatch = (graphics || b.native_subgroup_size) &&
-        !has_synchronized_lds_fminmax;
+        !has_synchronized_lds_store && !has_synchronized_lds_fminmax;
     const bool proven_wave32_masks = b.allow_b32_masks &&
         (b.is_fragment || (b.is_compute && b.wave_size == 32));
     const bool compute_scalar_vcc_bridge = allows_compute_scalar_vcc_bridge(b);
@@ -15837,6 +15991,7 @@ bool emit_cfg_state_machine(
     std::unordered_set<uint32_t> compute_dpp_add_row_mask_pcs;
     std::unordered_map<uint32_t, uint32_t> portable_mask_ffbh_event_for_pc;
     std::set<int> portable_mask_ffbh_dsts;
+    std::unordered_set<uint32_t> synchronized_lds_store_pcs;
     std::unordered_set<uint32_t> lds_fminmax_pcs;
     for (size_t i = 0; i < ins.size(); ++i) {
         const auto& in = ins[i];
@@ -15911,6 +16066,15 @@ bool emit_cfg_state_machine(
             portable_mask_ffbh_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_mask_ffbh_event_for_pc.size() + 1));
             portable_mask_ffbh_dsts.insert(in.dst.value);
+            start_set.insert(in.pc);
+            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
+                start_set.insert(ins[i + 1].pc);
+        }
+        if (synchronize_lds_fminmax && b.atomicized_lds_store_pcs.contains(in.pc)) {
+            if (!b.is_compute || in.fmt != Rdna2Format::DS || in.ds_gds ||
+                b.local_count > b.wave_size)
+                return reject_cfg(in.pc, "lds-store-common-phase-contract");
+            synchronized_lds_store_pcs.insert(in.pc);
             start_set.insert(in.pc);
             if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
                 start_set.insert(ins[i + 1].pc);
@@ -16254,11 +16418,11 @@ bool emit_cfg_state_machine(
                 };
                 if (in.fmt == Rdna2Format::SOP1 &&
                     (in.opcode == 0x03 || in.opcode == 0x07 || in.opcode == 0x09 ||
-                     in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) {
+                     sop1_opcode_is_emitted_saveexec_b32(in.opcode))) {
                     const bool source_is_mask = register_mask(in.src[0]) ||
                         (in.dst.value == 126 && in.src[0].kind == OperandKind::InlineInt);
                     writes_b32_mask = source_is_mask && in.dst.value != 127 &&
-                        ((in.opcode != 0x3c && in.opcode != 0x40 && in.opcode != 0x44) ||
+                        (!sop1_opcode_is_emitted_saveexec_b32(in.opcode) ||
                          in.dst.value != 126);
                 }
                 if (in.fmt == Rdna2Format::SOP2 &&
@@ -16490,14 +16654,14 @@ bool emit_cfg_state_machine(
                 wave64_b64_mask_in.front().insert(mask.first);
         if (initial.vcc) wave64_b64_mask_in.front().insert(106);
         for (const auto& value : initial.sreg)
-            if (value.first <= 107) wave64_scalar_word_in.front().insert(value.first);
+            if (value.first <= 124) wave64_scalar_word_in.front().insert(value.first);
         for (const auto& value : initial.sreg_input)
-            if (value.first <= 107) wave64_scalar_word_in.front().insert(value.first);
+            if (value.first <= 124) wave64_scalar_word_in.front().insert(value.first);
         // Direct descriptors intentionally live outside RegState's ordinary scalar map, but their
         // entry words are real scalar data until shader code overwrites them. Seed the MUST facts
         // from the same resource-table ranges used by the emitter's direct-descriptor fallback.
         for (int reg : direct_descriptor_sregs)
-            if (reg <= 107) wave64_scalar_word_in.front().insert(reg);
+            if (reg <= 124) wave64_scalar_word_in.front().insert(reg);
         wave64_scalar_scc_valid_in.front() = initial.scc != 0;
         wave64_b64_reachable.front() = true;
 
@@ -17316,11 +17480,22 @@ bool emit_cfg_state_machine(
         if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361 &&
             in.src[1].kind == OperandKind::InlineInt && in.src[1].value >= 0 && in.src[1].value <= 63) {
             const std::pair<int, int> slot{in.dst.value, in.src[1].value};
-            const bool is_mask = in.src[0].value == 106 || in.src[0].value == 107 ||
-                                 in.src[0].value == 126 || in.src[0].value == 127 ||
-                                 (in.src[0].kind == OperandKind::SGPR &&
-                                  (static_mask_keys.count(in.src[0].value) ||
-                                   b.wave64_mask_writelane_alias_pcs.contains(in.pc)));
+            // A fragment Wave64 spill of a saved B64 mask consumes one physical ballot dword.
+            // Persist it in the scalar-data lane domain; the Bool-slot representation cannot
+            // distinguish LO from HI and would reload false at a later dispatcher case. Direct
+            // architectural EXEC/VCC sources and other stages retain their mask-slot treatment.
+            const bool fragment_physical_mask_word =
+                b.is_fragment && b.wave_size == 64 &&
+                in.src[0].kind == OperandKind::SGPR &&
+                (static_mask_keys.count(in.src[0].value) ||
+                 (in.src[0].value > 0 &&
+                  static_mask_keys.count(in.src[0].value - 1)));
+            const bool is_mask = !fragment_physical_mask_word &&
+                (in.src[0].value == 106 || in.src[0].value == 107 ||
+                 in.src[0].value == 126 || in.src[0].value == 127 ||
+                 (in.src[0].kind == OperandKind::SGPR &&
+                  (static_mask_keys.count(in.src[0].value) ||
+                   b.wave64_mask_writelane_alias_pcs.contains(in.pc))));
             (is_mask ? mask_lane_slots : lane_slots).insert(slot);
         }
     }
@@ -17426,6 +17601,21 @@ bool emit_cfg_state_machine(
     const uint32_t append_idx_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t append_dst_var = b.function_var(b.t_u32, ptr_u32);
     const uint32_t append_count_var = b.function_var(b.t_u32, ptr_u32);
+    const bool has_synchronized_lds_store_event = !synchronized_lds_store_pcs.empty();
+    const uint32_t synchronized_lds_store_pending_var = has_synchronized_lds_store_event
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t synchronized_lds_store_active_var = has_synchronized_lds_store_event
+        ? b.function_var(b.t_bool, ptr_bool) : 0;
+    const uint32_t synchronized_lds_store_count_var = has_synchronized_lds_store_event
+        ? b.function_var(b.t_u32, ptr_u32) : 0;
+    std::array<uint32_t, 4> synchronized_lds_store_idx_vars{};
+    std::array<uint32_t, 4> synchronized_lds_store_value_vars{};
+    if (has_synchronized_lds_store_event) {
+        for (uint32_t& var : synchronized_lds_store_idx_vars)
+            var = b.function_var(b.t_u32, ptr_u32);
+        for (uint32_t& var : synchronized_lds_store_value_vars)
+            var = b.function_var(b.t_u32, ptr_u32);
+    }
     const bool has_lds_fminmax_event = !lds_fminmax_pcs.empty();
     const uint32_t lds_fminmax_pending_var = has_lds_fminmax_event
         ? b.function_var(b.t_bool, ptr_bool) : 0;
@@ -17559,6 +17749,13 @@ bool emit_cfg_state_machine(
     b.store_function(exec_var, initial.exec);
     b.store_function(pc_var, b.uconst(0));
     b.store_function(active_var, initial_active ? initial_active : yes);
+    if (has_synchronized_lds_store_event) {
+        b.store_function(synchronized_lds_store_count_var, zero);
+        for (uint32_t var : synchronized_lds_store_idx_vars)
+            b.store_function(var, zero);
+        for (uint32_t var : synchronized_lds_store_value_vars)
+            b.store_function(var, zero);
+    }
     if (has_lds_fminmax_event) {
         b.store_function(lds_fminmax_min_var, no);
         b.store_function(lds_fminmax_idx_var, zero);
@@ -17719,6 +17916,24 @@ bool emit_cfg_state_machine(
                 }
             }
         }
+        // Every referenced scalar has a Function variable, initialized to zero even when the
+        // architectural word has no value on this path. The Wave64 MUST analysis is its separate
+        // validity tag: remove all absent ordinary/special scalar words before emitting a case so
+        // an uninitialized M0/SGPR cannot become a valid zero merely by crossing the dispatcher.
+        if (entry_wave64_scalar_words) {
+            for (auto it = state.sreg.begin(); it != state.sreg.end();) {
+                if (it->first <= 124 && !entry_wave64_scalar_words->contains(it->first))
+                    it = state.sreg.erase(it);
+                else
+                    ++it;
+            }
+            for (auto it = state.sreg_input.begin(); it != state.sreg_input.end();) {
+                if (it->first <= 124 && !entry_wave64_scalar_words->contains(it->first))
+                    it = state.sreg_input.erase(it);
+                else
+                    ++it;
+            }
+        }
         if (entry_b32) {
             for (int reg : *entry_b32) {
                 state.sreg.erase(reg);
@@ -17834,6 +18049,11 @@ bool emit_cfg_state_machine(
         b.store_function(lds_fminmax_pending_var, no);
         b.store_function(lds_fminmax_active_var, no);
     }
+    if (has_synchronized_lds_store_event) {
+        b.store_function(synchronized_lds_store_pending_var, no);
+        b.store_function(synchronized_lds_store_active_var, no);
+        b.store_function(synchronized_lds_store_count_var, zero);
+    }
     b.store_function(swizzle_pending_var, no);
     b.store_function(swizzle_active_var, no);
     if (has_bpermute) {
@@ -17915,6 +18135,7 @@ bool emit_cfg_state_machine(
         const Rdna2Inst* terminator = nullptr;
         const Rdna2Inst* mbcnt = nullptr;
         const Rdna2Inst* append = nullptr;
+        const Rdna2Inst* synchronized_lds_store = nullptr;
         const Rdna2Inst* lds_fminmax = nullptr;
         const Rdna2Inst* swizzle = nullptr;
         const Rdna2Inst* bpermute = nullptr;
@@ -17938,6 +18159,7 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_terminator = nullptr;
             const Rdna2Inst* block_mbcnt = nullptr;
             const Rdna2Inst* block_append = nullptr;
+            const Rdna2Inst* block_synchronized_lds_store = nullptr;
             const Rdna2Inst* block_lds_fminmax = nullptr;
             const Rdna2Inst* block_swizzle = nullptr;
             const Rdna2Inst* block_bpermute = nullptr;
@@ -17964,6 +18186,10 @@ bool emit_cfg_state_machine(
                 }
                 if (in.fmt == Rdna2Format::DS && (in.opcode == 0x3d || in.opcode == 0x3e)) {
                     block_append = &in;
+                    break;
+                }
+                if (synchronized_lds_store_pcs.contains(in.pc)) {
+                    block_synchronized_lds_store = &in;
                     break;
                 }
                 if (lds_fminmax_pcs.contains(in.pc)) {
@@ -18164,7 +18390,8 @@ bool emit_cfg_state_machine(
             const bool last = member + 1 == dispatch_blocks[dispatch].size();
             if (!last) {
                 // Group construction admits only one-successor plain blocks before the tail.
-                if (block_mbcnt || block_append || block_lds_fminmax ||
+                if (block_mbcnt || block_append || block_synchronized_lds_store ||
+                    block_lds_fminmax ||
                     block_swizzle || block_bpermute ||
                     block_dpp_min_row_shr || block_dpp_add_row_shr ||
                     block_dpp_row_ror8 ||
@@ -18180,6 +18407,7 @@ bool emit_cfg_state_machine(
             terminator = block_terminator;
             mbcnt = block_mbcnt;
             append = block_append;
+            synchronized_lds_store = block_synchronized_lds_store;
             lds_fminmax = block_lds_fminmax;
             swizzle = block_swizzle;
             bpermute = block_bpermute;
@@ -18304,6 +18532,78 @@ bool emit_cfg_state_machine(
                 b.store_function(append_idx_var, idx);
                 b.store_function(append_dst_var,
                     b.uconst(static_cast<uint32_t>(append->dst.value)));
+            }
+        }
+        if (synchronized_lds_store) {
+            if (!synchronized_lds_store_pcs.contains(synchronized_lds_store->pc) ||
+                synchronized_lds_store->fmt != Rdna2Format::DS ||
+                synchronized_lds_store->ds_gds)
+                return reject_cfg(synchronized_lds_store->pc,
+                                  "lds-store-common-phase-contract");
+            b.declare_lds();
+            if (!b.lds_var)
+                return reject_cfg(synchronized_lds_store->pc, "lds-store-common-phase-lds");
+            auto vread = [&](int reg) {
+                const auto value = state.vreg.find(reg);
+                return value == state.vreg.end() ? zero : value->second;
+            };
+            std::vector<std::pair<uint32_t, uint32_t>> writes;
+            auto append_write = [&](uint32_t idx, int value_reg) {
+                writes.emplace_back(idx, vread(value_reg));
+            };
+            const Rdna2Inst& store = *synchronized_lds_store;
+            if (store.opcode == 0xb0) {
+                const auto m0 = state.sreg.find(124);
+                if (m0 == state.sreg.end())
+                    return reject_cfg(store.pc, "lds-store-common-phase-m0");
+                const uint32_t base = b.ibin(
+                    Op_BitwiseAnd, m0->second, b.uconst(0xffffu));
+                const uint32_t tid = b.ibin(
+                    Op_BitwiseAnd, b.linear_localid, b.uconst(b.wave_size - 1u));
+                const uint32_t byte_address = b.ibin(
+                    Op_IAdd, b.ibin(Op_IAdd, base, b.uconst(store.literal)),
+                    b.ibin(Op_ShiftLeftLogical, tid, b.uconst(2)));
+                append_write(
+                    b.ibin(Op_ShiftRightLogical, byte_address, b.uconst(2)),
+                    store.src[1].value);
+            } else if (store.opcode == 0x0e || store.opcode == 0x4e) {
+                const uint32_t base = b.ibin(
+                    Op_ShiftRightLogical, vread(store.src[0].value), b.uconst(2));
+                const uint32_t width = store.opcode == 0x4e ? 2u : 1u;
+                const uint32_t offset0 = (store.literal & 0xffu) * width;
+                const uint32_t offset1 = ((store.literal >> 8u) & 0xffu) * width;
+                const uint32_t idx0 = offset0
+                    ? b.ibin(Op_IAdd, base, b.uconst(offset0)) : base;
+                const uint32_t idx1 = offset1
+                    ? b.ibin(Op_IAdd, base, b.uconst(offset1)) : base;
+                for (uint32_t word = 0; word < width; ++word)
+                    append_write(word ? b.ibin(Op_IAdd, idx0, b.uconst(word)) : idx0,
+                                 store.src[1].value + static_cast<int>(word));
+                if ((store.literal & 0xffu) != ((store.literal >> 8u) & 0xffu))
+                    for (uint32_t word = 0; word < width; ++word)
+                        append_write(word ? b.ibin(Op_IAdd, idx1, b.uconst(word)) : idx1,
+                                     store.src[2].value + static_cast<int>(word));
+            } else if (store.opcode == 0x0d || store.opcode == 0x4d ||
+                       store.opcode == 0xde || store.opcode == 0xdf) {
+                const uint32_t byte_address = b.ibin(
+                    Op_IAdd, vread(store.src[0].value), b.uconst(store.literal));
+                const uint32_t base = b.ibin(
+                    Op_ShiftRightLogical, byte_address, b.uconst(2));
+                const uint32_t width = store.opcode == 0x0d ? 1u :
+                    store.opcode == 0x4d ? 2u : store.opcode == 0xde ? 3u : 4u;
+                for (uint32_t word = 0; word < width; ++word)
+                    append_write(word ? b.ibin(Op_IAdd, base, b.uconst(word)) : base,
+                                 store.src[1].value + static_cast<int>(word));
+            }
+            if (writes.empty() || writes.size() > synchronized_lds_store_idx_vars.size())
+                return reject_cfg(store.pc, "lds-store-common-phase-shape");
+            b.store_function(synchronized_lds_store_pending_var, yes);
+            b.store_function(synchronized_lds_store_active_var, state.exec);
+            b.store_function(synchronized_lds_store_count_var,
+                             b.uconst(static_cast<uint32_t>(writes.size())));
+            for (size_t word = 0; word < writes.size(); ++word) {
+                b.store_function(synchronized_lds_store_idx_vars[word], writes[word].first);
+                b.store_function(synchronized_lds_store_value_vars[word], writes[word].second);
             }
         }
         if (lds_fminmax) {
@@ -18647,6 +18947,11 @@ bool emit_cfg_state_machine(
         } else if (append) {
             if (!set_next(append->pc + append->len_dwords))
                 return reject_cfg(append->pc, "append-successor");
+        } else if (synchronized_lds_store) {
+            if (!set_next(synchronized_lds_store->pc +
+                          synchronized_lds_store->len_dwords))
+                return reject_cfg(synchronized_lds_store->pc,
+                                  "lds-store-successor");
         } else if (lds_fminmax) {
             if (!set_next(lds_fminmax->pc + lds_fminmax->len_dwords))
                 return reject_cfg(lds_fminmax->pc, "lds-fminmax-successor");
@@ -18946,6 +19251,38 @@ bool emit_cfg_state_machine(
         b.emit_condbranch(b.load_function(b.t_bool, active_var),
                           loop_header, loop_merge);
     } else {
+    // Atomicized LDS-store common phase. Each guest DS_WRITE packet is one dispatcher event. The
+    // trailing barrier completes every lane's complete packet before another guest store packet can
+    // begin, preserving RDNA wave instruction order even when two packets' address footprints alias.
+    if (has_synchronized_lds_store_event) {
+        b.barrier();
+        const uint32_t pending_and_active = b.land(
+            b.load_function(b.t_bool, synchronized_lds_store_pending_var),
+            b.load_function(b.t_bool, synchronized_lds_store_active_var));
+        const uint32_t count = b.load_function(
+            b.t_u32, synchronized_lds_store_count_var);
+        for (uint32_t word = 0; word < synchronized_lds_store_idx_vars.size(); ++word) {
+            const uint32_t word_block = b.id(), word_merge = b.id();
+            const uint32_t perform_word = b.land(
+                pending_and_active,
+                b.ucmp(Op_UGreaterThan, count, b.uconst(word)));
+            b.emit_selmerge(word_merge);
+            b.emit_condbranch(perform_word, word_block, word_merge);
+            b.emit_label(word_block);
+            b.lds_atomic(
+                Op_AtomicExchange,
+                b.load_function(b.t_u32, synchronized_lds_store_idx_vars[word]),
+                b.load_function(b.t_u32, synchronized_lds_store_value_vars[word]),
+                false, yes);
+            b.emit_branch(word_merge);
+            b.emit_label(word_merge);
+            // Wide/write2 DS instructions have ordered component effects. Keep each component's
+            // exchange globally complete before the following one can begin; the barrier remains
+            // outside the conditional so every workgroup invocation participates.
+            b.barrier();
+        }
+    }
+
     // DS_MIN/MAX_F32 common phase. Dispatcher cases publish one lane-local atomic request without
     // touching LDS. Every invocation, including lanes whose guest wave trapped or ended, reaches the
     // publication barrier here. The trailing barrier completes this event before the next dispatcher
@@ -19814,19 +20151,25 @@ BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdna2Inst>
 // EXEC=-1, set vaddr=0, then issue three DS_MIN_F32 and three DS_MAX_F32 operations.
 //
 // Preserve the original byte-exact adjacent packet as a fast path: insert emitter-only S_BARRIERs
-// before and after its six atomics. For a separated packet, admit only a proved lane-zero initializer
-// in a single guest wave and ask emit_body to route every float atomic through the dispatcher's
-// synchronized common phase. The first common-phase barrier publishes the ordinary stores; each
-// trailing barrier completes that atomic before the next dispatcher iteration or later gather.
-// AcquireRelease on an individual atomic orders memory but is not an arrival barrier, so neither edge
-// can be omitted. Every unproved initializer and every multi-wave separated shape rejects visibly. A
-// real guest barrier, or an atomic with no preceding ordinary store in its phase, remains architectural
-// and needs no synthesized edge.
+// before and after its six atomics. For a separated packet in one guest wave, ask emit_body to route
+// every float atomic through the dispatcher's synchronized common phase. A proved lane-zero writer can
+// retain ordinary stores; otherwise each preceding store becomes an atomic exchange, matching RDNA's
+// serialized indexed bank conflicts without introducing a Vulkan write/write data race. The first
+// common-phase barrier publishes those writes; each trailing barrier completes that atomic before the
+// next dispatcher iteration or later gather. AcquireRelease on an individual atomic orders memory but
+// is not an arrival barrier, so neither edge can be omitted. Every multi-wave separated shape rejects
+// visibly. A real guest barrier, or an atomic with no preceding ordinary store in its phase, remains
+// architectural and needs no synthesized edge.
+struct LdsFminmaxSynchronization {
+    bool needs_dispatcher = false;
+    std::unordered_set<uint32_t> atomicized_store_pcs;
+};
+
 bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
                                          RecompileDiagnosticContext diagnostic,
                                          bool at_most_one_guest_wave,
-                                         bool* needs_dispatcher = nullptr) {
-    if (needs_dispatcher) *needs_dispatcher = false;
+                                         LdsFminmaxSynchronization* synchronization = nullptr) {
+    if (synchronization) *synchronization = {};
     auto ordinary_lds_store = [](const Rdna2Inst& in) {
         if (in.fmt != Rdna2Format::DS || in.ds_gds) return false;
         return in.opcode == 0x0d || in.opcode == 0x0e || in.opcode == 0x4d ||
@@ -19836,6 +20179,75 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
     auto float_lds_atomic = [](const Rdna2Inst& in) {
         return in.fmt == Rdna2Format::DS && !in.ds_gds &&
                (in.opcode == kDsOpcodeMinF32 || in.opcode == kDsOpcodeMaxF32);
+    };
+    auto store_data_registers = [](const Rdna2Inst& in) {
+        std::vector<int> registers;
+        auto append = [&](int first, uint32_t count) {
+            for (uint32_t word = 0; word < count; ++word)
+                registers.push_back(first + static_cast<int>(word));
+        };
+        switch (in.opcode) {
+            case 0x0d: case 0xb0: append(in.src[1].value, 1); break;
+            case 0x0e:
+                append(in.src[1].value, 1);
+                if ((in.literal & 0xffu) != ((in.literal >> 8u) & 0xffu))
+                    append(in.src[2].value, 1);
+                break;
+            case 0x4d: append(in.src[1].value, 2); break;
+            case 0x4e:
+                append(in.src[1].value, 2);
+                if ((in.literal & 0xffu) != ((in.literal >> 8u) & 0xffu))
+                    append(in.src[2].value, 2);
+                break;
+            case 0xde: append(in.src[1].value, 3); break;
+            case 0xdf: append(in.src[1].value, 4); break;
+            default: break;
+        }
+        return registers;
+    };
+    // Atomic exchange is equivalent to RDNA's indexed-bank serialization only when colliding lanes
+    // write the same bits. Prove the narrow but generic form this family needs: every stored dword's
+    // last writer is a plain v_mov from a scalar/literal source, and no control/EXEC edge can let a
+    // store lane bypass that writer. Different addresses remain independent; equal addresses then
+    // have identical candidate values, so the exchange winner is immaterial.
+    auto store_data_are_wave_uniform = [&](size_t store_index) {
+        const Rdna2Inst& store = ins[store_index];
+        for (int reg : store_data_registers(store)) {
+            size_t writer_index = ins.size();
+            for (size_t j = store_index; j-- > 0;) {
+                if (writes_vgpr(ins[j], reg)) {
+                    writer_index = j;
+                    break;
+                }
+            }
+            if (writer_index == ins.size()) return false;
+            const Rdna2Inst& writer = ins[writer_index];
+            if (writer.fmt != Rdna2Format::VOP1 || writer.opcode != 0x01 ||
+                writer.has_modifier || writer.has_sdwa || writer.has_dpp ||
+                writer.src[0].kind == OperandKind::VGPR)
+                return false;
+            for (size_t j = writer_index + 1; j < store_index; ++j) {
+                const Rdna2Inst& between = ins[j];
+                if (rdna2_instruction_may_change_exec(between) ||
+                    (between.fmt == Rdna2Format::SOPP && between.opcode >= 0x02u &&
+                     between.opcode <= 0x12u && between.opcode != 0x03u &&
+                     between.opcode != 0x0cu))
+                    return false;
+            }
+            for (const Rdna2Inst& edge : ins) {
+                if (edge.fmt == Rdna2Format::SOP1 && edge.opcode >= 0x20u &&
+                    edge.opcode <= 0x22u)
+                    return false;
+                if (edge.fmt != Rdna2Format::SOPP || edge.opcode < 0x02u ||
+                    edge.opcode > 0x09u || edge.opcode == 0x03u)
+                    continue;
+                const uint32_t target = branch_target(edge);
+                const bool source_outside = edge.pc < writer.pc || edge.pc >= store.pc;
+                if (source_outside && target > writer.pc && target <= store.pc)
+                    return false;
+            }
+        }
+        return true;
     };
     auto words_are = [](const Rdna2Inst& in, uint32_t word0, uint32_t word1) {
         return in.words[0] == word0 && in.words[1] == word1;
@@ -19975,15 +20387,29 @@ bool prepare_lds_fminmax_synchronization(std::vector<Rdna2Inst>& ins,
                     }
                 }
             }
-            if (needs_dispatcher && phase_stores_are_single_lane &&
-                dispatcher_initializer_dominates) {
+            if (synchronization) {
                 if (!at_most_one_guest_wave) {
                     log_recompile_diagnostic(
                         diagnostic, "compute-recompile-reject", "terminal",
                         "pc=%u reason=multiwave-lds-fminmax-dispatcher", in.pc);
                     return false;
                 }
-                *needs_dispatcher = true;
+                synchronization->needs_dispatcher = true;
+                // A proven lane-zero initializer has one writer and can retain ordinary OpStores.
+                // For a general one-wave initializer whose data is identical across active lanes,
+                // make each exact preceding DS write an atomic exchange. RDNA serializes indexed
+                // bank conflicts; equal colliding values make Vulkan's exchange winner immaterial.
+                if (!phase_stores_are_single_lane || !dispatcher_initializer_dominates) {
+                    if (!std::all_of(phase_stores.begin(), phase_stores.end(),
+                                     store_data_are_wave_uniform)) {
+                        log_recompile_diagnostic(
+                            diagnostic, "compute-recompile-reject", "terminal",
+                            "pc=%u reason=nonuniform-lds-store-before-ds-fminmax", in.pc);
+                        return false;
+                    }
+                    for (size_t store : phase_stores)
+                        synchronization->atomicized_store_pcs.insert(ins[store].pc);
+                }
                 phase_stores.clear();
                 phase_stores_are_single_lane = true;
                 phase_dispatcher_initializer_pc = UINT32_MAX;
@@ -21375,12 +21801,13 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     // separate side-effect bookkeeping and remain on the conservative reject path for this shape.
     (void)extend_terminating_if_else(code, dwords, ins);
     // The synthetic test shell is one Wave64 workgroup, matching the live GTA dispatch.
-    bool synchronize_lds_fminmax = false;
+    LdsFminmaxSynchronization lds_fminmax_synchronization;
     if (!prepare_lds_fminmax_synchronization(
-            ins, {}, true, &synchronize_lds_fminmax))
+            ins, {}, true, &lds_fminmax_synchronization))
         return {};
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
     SpirvCompute b;
+    b.atomicized_lds_store_pcs = lds_fminmax_synchronization.atomicized_store_pcs;
     b.compute_pgm_rsrc1 = compute_pgm_rsrc1;
     // Size the LDS array from the shader's real allocation when known (#130): bytes -> dwords, at
     // least the ds ops need, clamped to the RDNA2 64 KB (16384-dword) max. 0 keeps the 16 KB default.
@@ -21397,7 +21824,7 @@ std::vector<uint32_t> recompile_valu(const uint32_t* code, size_t dwords,
     // Compute kernels have no EXP output; reject if one appears.
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/true,
                    [](RegState&, const Rdna2Inst&){ return false; }, code, dwords,
-                   nullptr, true, 0, false, synchronize_lds_fminmax)) return {};
+                   nullptr, true, 0, false, lds_fminmax_synchronization.needs_dispatcher)) return {};
     auto it = rs.vreg.find((int)out_vgpr);
     uint32_t outbits = it == rs.vreg.end() ? b.uconst(0) : it->second;
     // If EXEC is still narrowed (a v_cmpx with no restore), masked-off lanes keep the output slot's prior
@@ -21464,12 +21891,13 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // See recompile_valu: compute has no branch-external EXP state, so the common host-shell merge is
     // only a place to finish the invocation after either guest arm has terminated.
     (void)extend_terminating_if_else(code, dwords, ins);
-    bool synchronize_lds_fminmax = false;
+    LdsFminmaxSynchronization lds_fminmax_synchronization;
     if (!prepare_lds_fminmax_synchronization(
-            ins, diagnostic, local_count <= wave_size, &synchronize_lds_fminmax))
+            ins, diagnostic, local_count <= wave_size, &lds_fminmax_synchronization))
         return {};
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
     SpirvCompute b;
+    b.atomicized_lds_store_pcs = lds_fminmax_synchronization.atomicized_store_pcs;
     b.diagnostic = diagnostic;
     b.gta5_selected_sbuffer_dispatch_validated = has_selected_sbuffer_descriptor;
     if (selected_sbuffer_descriptor && has_selected_sbuffer_descriptor)
@@ -21639,7 +22067,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true,
                    /*allow_smem*/true, [](RegState&, const Rdna2Inst&) { return false; },
                    code, dwords, nullptr, true, initial_dispatch_active, false,
-                   synchronize_lds_fminmax))
+                   lds_fminmax_synchronization.needs_dispatcher))
         return {};
     // Both exact GTA contracts execute their partial final wave through the CFG dispatcher's ACTIVE
     // bit. Padded Vulkan lanes stay in the dispatcher and its synthesized workgroup barriers, but
@@ -22089,21 +22517,29 @@ static std::vector<uint32_t> recompile_fragment_impl(
 
     // Preserve hardware target locations. MRT0 and MRT1 are backed by real Vulkan attachments; later
     // targets remain unsupported and must never be silently remapped to location 0 (#635).
+    constexpr uint32_t kMrtzDepth = 1u << 0;
+    constexpr uint32_t kMrtzStencil = 1u << 1;
+    constexpr uint32_t kMrtzSampleMask = 1u << 2;
+    constexpr uint32_t kMrtzAlpha = 1u << 3;
+    constexpr uint32_t kUnsupportedMrtz = kMrtzStencil | kMrtzAlpha;
     uint32_t color_mask = 0;
     bool has_null_export = false;
     bool has_depth_export = false;
+    bool has_sample_mask_export = false;
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::EXP) continue;
         if (in.exp_target < 2) color_mask |= 1u << in.exp_target;
-        else if (in.exp_target == 8 && !in.exp_compr && (in.exp_en & 1u))
-            has_depth_export = true;
+        else if (in.exp_target == 8 && !in.exp_compr) {
+            has_depth_export |= (in.exp_en & kMrtzDepth) != 0;
+            has_sample_mask_export |= (in.exp_en & kMrtzSampleMask) != 0;
+        }
         else if (in.exp_target == 9) has_null_export = true;
     }
     // A NULL export is a real fragment-shader terminator. Depth/stencil-only draws use it after
     // narrowing EXEC to the surviving samples, so the module intentionally has no color outputs.
     // Keep other unsupported MRT-only programs fail-visible instead of accepting every no-color PS.
-    if (!color_mask && !has_null_export && !has_depth_export) {
+    if (!color_mask && !has_null_export && !has_depth_export && !has_sample_mask_export) {
         if (pcrel_dispatch_target != UINT32_MAX)
             log_recompile_diagnostic(
                 diagnostic, "recompile-reject", "terminal",
@@ -22211,15 +22647,22 @@ static std::vector<uint32_t> recompile_fragment_impl(
             state.exec = b.btrue();
             state.exec_narrowed = false;
         }
-        // MRTZ (target 8): the shader-exported depth. EN bit 0 enables the Z VGPR (compilers emit
-        // EN=0x1); COMPR depth is unmodeled. Previously this export was silently DROPPED, leaving
-        // fixed-function interpolated Z where hardware uses the shader's value (#883).
+        // MRTZ (target 8): EN bit 0 exports depth from VSRC0 and bit 2 exports sample coverage from
+        // VSRC2. Vulkan represents those as FragDepth and SampleMask[0], respectively. Stencil
+        // reference (bit 1) needs a separate extension-backed path and remains fail-visible; COMPR
+        // MRTZ and the bit-3 alpha-to-coverage payload are likewise unmodeled.
         if (in.exp_target == 8) {
-            if (in.exp_compr || !(in.exp_en & 1u)) return false;
+            if (in.exp_compr || !in.exp_en || (in.exp_en & kUnsupportedMrtz)) return false;
+            const bool exports_depth = (in.exp_en & kMrtzDepth) != 0;
+            const bool exports_sample_mask = (in.exp_en & kMrtzSampleMask) != 0;
             bool eok = true;
-            const uint32_t z = operand_bits(b, state, in, in.src[0], &eok);
+            const uint32_t z = exports_depth
+                ? operand_bits(b, state, in, in.src[0], &eok) : 0;
+            const uint32_t sample_mask = exports_sample_mask
+                ? operand_bits(b, state, in, in.src[2], &eok) : 0;
             if (!eok) return false;
-            b.export_depth(z);
+            if (exports_depth) b.export_depth(z);
+            if (exports_sample_mask) b.export_sample_mask(sample_mask);
             return true;
         }
         if (in.exp_target < exported.size()) {
@@ -22261,7 +22704,8 @@ static std::vector<uint32_t> recompile_fragment_impl(
                                      "pcrel target=%u body failed", pcrel_dispatch_target);
         return {};
     }
-    if (!exported[0] && !exported[1] && !has_null_export && !has_depth_export) {
+    if (!exported[0] && !exported[1] && !has_null_export && !has_depth_export &&
+        !has_sample_mask_export) {
         if (pcrel_dispatch_target != UINT32_MAX)
             log_recompile_diagnostic(diagnostic, "recompile-reject", "terminal",
                                      "emitted no fragment color pcrel-target=%u",
@@ -22400,6 +22844,8 @@ uint32_t fragment_spirv_required_subgroup_features(const std::vector<uint32_t>& 
                 features |= kFragmentSubgroupArithmetic;
             else if (spirv[offset + 1] == Cap_GroupNonUniformShuffle)
                 features |= kFragmentSubgroupShuffle;
+            else if (spirv[offset + 1] == Cap_GroupNonUniformBallot)
+                features |= kFragmentSubgroupBallot;
         }
         offset += words;
     }
