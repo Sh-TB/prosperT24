@@ -4553,7 +4553,7 @@ std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& in
             writes_b32_mask = true;
         } else if (in.fmt == Rdna2Format::SOP1 &&
                    (in.opcode == 0x03 || in.opcode == 0x07 || in.opcode == 0x09 ||
-                    in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) {
+                    sop1_opcode_is_emitted_saveexec_b32(in.opcode))) {
             writes_b32_mask = tracked_mask_source(in.src[0]) && in.dst.value != 127;
             mask_dst = in.dst.value;
         } else if (in.fmt == Rdna2Format::SOP2 &&
@@ -6766,7 +6766,7 @@ void record_scalar_write(RegState& rs, const Rdna2Inst& in,
              (!rs.sreg.contains(base) &&
               ((in.fmt == Rdna2Format::SOP1 &&
                 (in.opcode == 0x03 || in.opcode == 0x07 || in.opcode == 0x09 ||
-                 in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) ||
+                 sop1_opcode_is_emitted_saveexec_b32(in.opcode))) ||
                sop2_b32_mask_domain || vopc_b32_mask || vop3_b32_mask_write)));
         const bool writes_b64_mask = effective_width == 2 && !vopc_b32_mask &&
             scalar_write_is_b64_mask(in, base);
@@ -7499,7 +7499,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             if (b.allow_b32_masks &&
                 (b.is_fragment || (b.is_compute && b.wave_size == 32)) &&
-                (in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) {
+                sop1_opcode_is_emitted_saveexec_b32(in.opcode)) {
                 // s_and_saveexec_b32 / s_orn2_saveexec_b32 / s_andn1_saveexec_b32
                 // Save the previous EXEC_LO into one physical SGPR, then narrow EXEC_LO by the
                 // one-word source mask. Astro uses VCC_HI as the saved-mask destination and restores
@@ -7529,8 +7529,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.sreg.erase(in.dst.value);
                 rs.sreg_srt.erase(in.dst.value);
                 if (in.dst.value == 106) rs.vcc = old_exec;
-                rs.exec = in.opcode == 0x3c ? b.land(old_exec, mask)
-                        : in.opcode == 0x40 ? b.lor(mask, b.logical_not(old_exec))
+                rs.exec = in.opcode == kSop1OpcodeAndSaveexecB32 ? b.land(old_exec, mask)
+                        : in.opcode == kSop1OpcodeOrn2SaveexecB32
+                            ? b.lor(mask, b.logical_not(old_exec))
                                             : b.land(old_exec, b.logical_not(mask));
                 rs.exec_narrowed = true;
                 rs.scc = b.is_fragment ? b.fragment_wave_any(rs.exec) : 0;
@@ -15137,7 +15138,8 @@ size_t specialize_proven_null_bvh_exits(std::vector<Rdna2Inst>& ins,
             const Rdna2Inst& root_index = ins[root_block + 6];
             const Rdna2Inst& root_nop = ins[root_block + 7];
             const bool mask_copy_shape = wave_size == 32
-                ? mask_copy.fmt == Rdna2Format::SOP1 && mask_copy.opcode == 0x3cu &&
+                ? mask_copy.fmt == Rdna2Format::SOP1 &&
+                  mask_copy.opcode == kSop1OpcodeAndSaveexecB32 &&
                   mask_copy.dst.kind == OperandKind::SGPR && mask_copy.dst.value == 106 &&
                   mask_copy.src[0].kind == OperandKind::Special &&
                   mask_copy.src[0].value == 107
@@ -16346,11 +16348,11 @@ bool emit_cfg_state_machine(
                 };
                 if (in.fmt == Rdna2Format::SOP1 &&
                     (in.opcode == 0x03 || in.opcode == 0x07 || in.opcode == 0x09 ||
-                     in.opcode == 0x3c || in.opcode == 0x40 || in.opcode == 0x44)) {
+                     sop1_opcode_is_emitted_saveexec_b32(in.opcode))) {
                     const bool source_is_mask = register_mask(in.src[0]) ||
                         (in.dst.value == 126 && in.src[0].kind == OperandKind::InlineInt);
                     writes_b32_mask = source_is_mask && in.dst.value != 127 &&
-                        ((in.opcode != 0x3c && in.opcode != 0x40 && in.opcode != 0x44) ||
+                        (!sop1_opcode_is_emitted_saveexec_b32(in.opcode) ||
                          in.dst.value != 126);
                 }
                 if (in.fmt == Rdna2Format::SOP2 &&
