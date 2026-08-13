@@ -4296,6 +4296,19 @@ inline bool sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t targe
                      in.src[2].kind == OperandKind::Special) && in.src[2].value == R)
                     return false;
                 break;
+            case Rdna2Format::FLAT:
+                // FLAT/GLOBAL/SCRATCH packets keep every data/address operand in VGPRs except
+                // SADDR, the optional scalar address pair at src[1]. NULL/off (125) reads no
+                // scalar register. An LDS transfer also observes M0 implicitly, so keep that
+                // uncommon form fail-closed. Account for the complete SADDR pair conservatively;
+                // this liveness proof does not imply that the memory operation is translatable.
+                if (in.flat_lds) return false;
+                if ((in.src[1].kind == OperandKind::SGPR ||
+                     in.src[1].kind == OperandKind::Special) &&
+                    in.src[1].value != 125 &&
+                    (in.src[1].value == R || in.src[1].value + 1 == R))
+                    return false;
+                break;
             default:
                 return false;   // memory/branch/interp/unknown: can't bound reads of R -> assume live
         }
