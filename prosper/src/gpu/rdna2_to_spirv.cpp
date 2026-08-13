@@ -210,7 +210,7 @@ enum : uint32_t {
     Dec_DescriptorSet=34, Dec_Offset=35, Dec_XfbBuffer=36, Dec_XfbStride=37,
     // Decoration 5300 -- descriptor indexing's NonUniform, unrelated to the GroupNonUniform ops.
     Dec_NonUniform=5300,
-    BI_Position=0, BI_FragCoord=15, BI_FragDepth=22, BI_HelperInvocation=23,
+    BI_Position=0, BI_FragCoord=15, BI_SampleMask=20, BI_FragDepth=22, BI_HelperInvocation=23,
     BI_WorkgroupId=26, BI_LocalInvocationId=27,
     BI_GlobalInvocationId=28, BI_SubgroupId=40, BI_SubgroupLocalInvocationId=41,
     BI_VertexIndex=42, BI_InstanceIndex=43,
@@ -3224,6 +3224,26 @@ struct SpirvCompute {
             iface.push_back(v_fragdepth);
         }
         put(code, Op_Store, {v_fragdepth, bcf(z_bits)});
+    }
+
+    // Fragment sample-coverage export (EXP target 8 / VSRC2). Vulkan exposes this as the first
+    // element of a BuiltIn SampleMask output array, matching RDNA's 32-bit sample-mask payload.
+    uint32_t v_sample_mask = 0;
+    uint32_t t_sample_mask = 0;
+    void export_sample_mask(uint32_t mask_bits) {
+        if (!v_sample_mask) {
+            t_sample_mask = id();
+            put(types, Op_TypeArray, {t_sample_mask, t_u32, uconst(1)});
+            uint32_t t_ptr = id();
+            put(types, Op_TypePointer, {t_ptr, SC_Output, t_sample_mask});
+            v_sample_mask = id();
+            put(types, Op_Variable, {t_ptr, v_sample_mask, SC_Output});
+            put(deco, Op_Decorate, {v_sample_mask, Dec_BuiltIn, BI_SampleMask});
+            iface.push_back(v_sample_mask);
+        }
+        const uint32_t value = id();
+        put(code, Op_CompositeConstruct, {t_sample_mask, value, mask_bits});
+        put(code, Op_Store, {v_sample_mask, value});
     }
 
     // --- Vertex-shader shell: draw inputs + gl_Position (member 0 of a gl_PerVertex Block). ---
@@ -22188,21 +22208,29 @@ static std::vector<uint32_t> recompile_fragment_impl(
 
     // Preserve hardware target locations. MRT0 and MRT1 are backed by real Vulkan attachments; later
     // targets remain unsupported and must never be silently remapped to location 0 (#635).
+    constexpr uint32_t kMrtzDepth = 1u << 0;
+    constexpr uint32_t kMrtzStencil = 1u << 1;
+    constexpr uint32_t kMrtzSampleMask = 1u << 2;
+    constexpr uint32_t kMrtzAlpha = 1u << 3;
+    constexpr uint32_t kUnsupportedMrtz = kMrtzStencil | kMrtzAlpha;
     uint32_t color_mask = 0;
     bool has_null_export = false;
     bool has_depth_export = false;
+    bool has_sample_mask_export = false;
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::EXP) continue;
         if (in.exp_target < 2) color_mask |= 1u << in.exp_target;
-        else if (in.exp_target == 8 && !in.exp_compr && (in.exp_en & 1u))
-            has_depth_export = true;
+        else if (in.exp_target == 8 && !in.exp_compr) {
+            has_depth_export |= (in.exp_en & kMrtzDepth) != 0;
+            has_sample_mask_export |= (in.exp_en & kMrtzSampleMask) != 0;
+        }
         else if (in.exp_target == 9) has_null_export = true;
     }
     // A NULL export is a real fragment-shader terminator. Depth/stencil-only draws use it after
     // narrowing EXEC to the surviving samples, so the module intentionally has no color outputs.
     // Keep other unsupported MRT-only programs fail-visible instead of accepting every no-color PS.
-    if (!color_mask && !has_null_export && !has_depth_export) {
+    if (!color_mask && !has_null_export && !has_depth_export && !has_sample_mask_export) {
         if (pcrel_dispatch_target != UINT32_MAX)
             log_recompile_diagnostic(
                 diagnostic, "recompile-reject", "terminal",
@@ -22310,15 +22338,22 @@ static std::vector<uint32_t> recompile_fragment_impl(
             state.exec = b.btrue();
             state.exec_narrowed = false;
         }
-        // MRTZ (target 8): the shader-exported depth. EN bit 0 enables the Z VGPR (compilers emit
-        // EN=0x1); COMPR depth is unmodeled. Previously this export was silently DROPPED, leaving
-        // fixed-function interpolated Z where hardware uses the shader's value (#883).
+        // MRTZ (target 8): EN bit 0 exports depth from VSRC0 and bit 2 exports sample coverage from
+        // VSRC2. Vulkan represents those as FragDepth and SampleMask[0], respectively. Stencil
+        // reference (bit 1) needs a separate extension-backed path and remains fail-visible; COMPR
+        // MRTZ and the bit-3 alpha-to-coverage payload are likewise unmodeled.
         if (in.exp_target == 8) {
-            if (in.exp_compr || !(in.exp_en & 1u)) return false;
+            if (in.exp_compr || !in.exp_en || (in.exp_en & kUnsupportedMrtz)) return false;
+            const bool exports_depth = (in.exp_en & kMrtzDepth) != 0;
+            const bool exports_sample_mask = (in.exp_en & kMrtzSampleMask) != 0;
             bool eok = true;
-            const uint32_t z = operand_bits(b, state, in, in.src[0], &eok);
+            const uint32_t z = exports_depth
+                ? operand_bits(b, state, in, in.src[0], &eok) : 0;
+            const uint32_t sample_mask = exports_sample_mask
+                ? operand_bits(b, state, in, in.src[2], &eok) : 0;
             if (!eok) return false;
-            b.export_depth(z);
+            if (exports_depth) b.export_depth(z);
+            if (exports_sample_mask) b.export_sample_mask(sample_mask);
             return true;
         }
         if (in.exp_target < exported.size()) {
@@ -22360,7 +22395,8 @@ static std::vector<uint32_t> recompile_fragment_impl(
                                      "pcrel target=%u body failed", pcrel_dispatch_target);
         return {};
     }
-    if (!exported[0] && !exported[1] && !has_null_export && !has_depth_export) {
+    if (!exported[0] && !exported[1] && !has_null_export && !has_depth_export &&
+        !has_sample_mask_export) {
         if (pcrel_dispatch_target != UINT32_MAX)
             log_recompile_diagnostic(diagnostic, "recompile-reject", "terminal",
                                      "emitted no fragment color pcrel-target=%u",
