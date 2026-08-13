@@ -9194,7 +9194,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     uint32_t wrapped = b.ucmp(Op_ULessThan, d, c);
                     rs.scc = b.bsel(shifted_out, b.btrue(), wrapped); break;
                 }
-                case 0x32: { // s_pack_ll_b32_b16: D={S1[15:0],S0[15:0]}
+                case kSop2OpcodePackLlB32B16: { // s_pack_ll_b32_b16: D={S1[15:0],S0[15:0]}
                     const uint32_t lo = b.ibin(Op_BitwiseAnd, a, b.uconst(0xFFFFu));
                     const uint32_t hi = b.ibin(Op_ShiftLeftLogical,
                         b.ibin(Op_BitwiseAnd, c, b.uconst(0xFFFFu)), b.uconst(16));
