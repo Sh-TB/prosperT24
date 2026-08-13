@@ -6972,14 +6972,19 @@ uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const 
             if (mask_base >= 0) {
                 // The Wave64 MUST analysis in the CFG dispatcher is the lifetime tag that proves
                 // this physical word still names the saved B64 predicate rather than recycled
-                // scalar scratch. An exact native subgroup can materialize that word directly;
-                // portable dispatchers handle the same FFBH shape in their synchronized common
-                // phase below.
-                if (b.is_compute && b.wave_size == 64 &&
-                    b.native_subgroup_size == 64) {
-                    const uint32_t half = b.native_wave_ballot_half(
-                        rs.sreg_bool.at(mask_base),
-                        static_cast<uint32_t>(o.value - mask_base));
+                // scalar scratch. An exact fragment-Wave64 contract or native compute subgroup can
+                // materialize that word directly; portable compute dispatchers handle the same
+                // FFBH shape in their synchronized common phase below.
+                if (b.wave_size == 64 &&
+                    (b.is_fragment ||
+                     (b.is_compute && b.native_subgroup_size == 64))) {
+                    const uint32_t half = b.is_fragment
+                        ? b.fragment_wave_ballot_half(
+                              rs.sreg_bool.at(mask_base),
+                              static_cast<uint32_t>(o.value - mask_base))
+                        : b.native_wave_ballot_half(
+                              rs.sreg_bool.at(mask_base),
+                              static_cast<uint32_t>(o.value - mask_base));
                     if (half) return half;
                 }
                 if (ok) *ok = false;
@@ -7794,8 +7799,44 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (is_exec(in.dst)) {                  // set/restore EXEC
                         if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
                             rs.exec = b.btrue(); rs.exec_narrowed = false;   // exec = all lanes on
-                        } else { uint32_t m = src_mask(in.src[0]); if (!m) ok = false;
-                                 else { rs.exec = m; rs.exec_narrowed = saved_narrowed(in.src[0]); } }
+                        } else {
+                            uint32_t m = src_mask(in.src[0]);
+                            // A fragment compiler may restore EXEC from two ordinary scalar words,
+                            // notably after round-tripping a saved ballot pair through fixed
+                            // V_WRITELANE/V_READLANE slots. Reconstruct this invocation's mask bit
+                            // from the exact physical half. subgroup_local_id records the required
+                            // guest-Wave64 contract; a missing half or another stage remains
+                            // fail-visible instead of treating an arbitrary scalar as a Bool alias.
+                            if (!m && b.is_fragment && b.wave_size == 64 &&
+                                (in.src[0].kind == OperandKind::SGPR ||
+                                 (in.src[0].kind == OperandKind::Special &&
+                                  in.src[0].value >= 106 && in.src[0].value <= 123))) {
+                                auto scalar_word = [&](int reg) -> uint32_t {
+                                    const auto current = rs.sreg.find(reg);
+                                    if (current != rs.sreg.end()) return current->second;
+                                    const auto input = rs.sreg_input.find(reg);
+                                    return input != rs.sreg_input.end() ? input->second : 0;
+                                };
+                                const uint32_t lo = scalar_word(in.src[0].value);
+                                const uint32_t hi = scalar_word(in.src[0].value + 1);
+                                if (lo && hi) {
+                                    const uint32_t lane = b.ibin(
+                                        Op_BitwiseAnd, b.subgroup_local_id(), b.uconst(63));
+                                    const uint32_t word = b.sel(
+                                        b.ucmp(Op_UGreaterThanEqual, lane, b.uconst(32)), hi, lo);
+                                    const uint32_t bit = b.ibin(
+                                        Op_BitwiseAnd, lane, b.uconst(31));
+                                    m = b.ucmp(
+                                        Op_INotEqual,
+                                        b.ibin(Op_BitwiseAnd,
+                                               b.ibin(Op_ShiftRightLogical, word, bit),
+                                               b.uconst(1)),
+                                        b.uconst(0));
+                                }
+                            }
+                            if (!m) ok = false;
+                            else { rs.exec = m; rs.exec_narrowed = saved_narrowed(in.src[0]); }
+                        }
                     } else {                                // s_mov_b64 sDST, <mask-or-data> : save a mask / copy a pair
                         uint32_t m = src_mask(in.src[0]);
                         if (m) { rs.sreg_bool[in.dst.value] = m;
@@ -10745,7 +10786,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         ok = false; return true;
                     }
                     mask_value = rs.vcc; mask_source = true;
-                } else if (in.src[0].kind == OperandKind::SGPR) {
+                } else if (in.src[0].kind == OperandKind::SGPR &&
+                           !(b.is_fragment && b.wave_size == 64 &&
+                             (rs.sreg_bool.contains(in.src[0].value) ||
+                              (in.src[0].value > 0 &&
+                               rs.sreg_bool.contains(in.src[0].value - 1))))) {
+                    // A Wave64 fragment V_WRITELANE consumes one physical scalar word, not the
+                    // complete Bool alias rooted at the pair's low SGPR. Let val() materialize that
+                    // exact ballot half lazily below. Other stages retain the mask-slot model.
                     auto saved = rs.sreg_bool.find(in.src[0].value);
                     if (saved != rs.sreg_bool.end()) { mask_value = saved->second; mask_source = true; }
                 }
@@ -16512,14 +16560,14 @@ bool emit_cfg_state_machine(
                 wave64_b64_mask_in.front().insert(mask.first);
         if (initial.vcc) wave64_b64_mask_in.front().insert(106);
         for (const auto& value : initial.sreg)
-            if (value.first <= 107) wave64_scalar_word_in.front().insert(value.first);
+            if (value.first <= 124) wave64_scalar_word_in.front().insert(value.first);
         for (const auto& value : initial.sreg_input)
-            if (value.first <= 107) wave64_scalar_word_in.front().insert(value.first);
+            if (value.first <= 124) wave64_scalar_word_in.front().insert(value.first);
         // Direct descriptors intentionally live outside RegState's ordinary scalar map, but their
         // entry words are real scalar data until shader code overwrites them. Seed the MUST facts
         // from the same resource-table ranges used by the emitter's direct-descriptor fallback.
         for (int reg : direct_descriptor_sregs)
-            if (reg <= 107) wave64_scalar_word_in.front().insert(reg);
+            if (reg <= 124) wave64_scalar_word_in.front().insert(reg);
         wave64_scalar_scc_valid_in.front() = initial.scc != 0;
         wave64_b64_reachable.front() = true;
 
@@ -17338,11 +17386,22 @@ bool emit_cfg_state_machine(
         if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361 &&
             in.src[1].kind == OperandKind::InlineInt && in.src[1].value >= 0 && in.src[1].value <= 63) {
             const std::pair<int, int> slot{in.dst.value, in.src[1].value};
-            const bool is_mask = in.src[0].value == 106 || in.src[0].value == 107 ||
-                                 in.src[0].value == 126 || in.src[0].value == 127 ||
-                                 (in.src[0].kind == OperandKind::SGPR &&
-                                  (static_mask_keys.count(in.src[0].value) ||
-                                   b.wave64_mask_writelane_alias_pcs.contains(in.pc)));
+            // A fragment Wave64 spill of a saved B64 mask consumes one physical ballot dword.
+            // Persist it in the scalar-data lane domain; the Bool-slot representation cannot
+            // distinguish LO from HI and would reload false at a later dispatcher case. Direct
+            // architectural EXEC/VCC sources and other stages retain their mask-slot treatment.
+            const bool fragment_physical_mask_word =
+                b.is_fragment && b.wave_size == 64 &&
+                in.src[0].kind == OperandKind::SGPR &&
+                (static_mask_keys.count(in.src[0].value) ||
+                 (in.src[0].value > 0 &&
+                  static_mask_keys.count(in.src[0].value - 1)));
+            const bool is_mask = !fragment_physical_mask_word &&
+                (in.src[0].value == 106 || in.src[0].value == 107 ||
+                 in.src[0].value == 126 || in.src[0].value == 127 ||
+                 (in.src[0].kind == OperandKind::SGPR &&
+                  (static_mask_keys.count(in.src[0].value) ||
+                   b.wave64_mask_writelane_alias_pcs.contains(in.pc))));
             (is_mask ? mask_lane_slots : lane_slots).insert(slot);
         }
     }
@@ -17739,6 +17798,24 @@ bool emit_cfg_state_machine(
                     state.sreg.erase(word);
                     state.sreg_input.erase(word);
                 }
+            }
+        }
+        // Every referenced scalar has a Function variable, initialized to zero even when the
+        // architectural word has no value on this path. The Wave64 MUST analysis is its separate
+        // validity tag: remove all absent ordinary/special scalar words before emitting a case so
+        // an uninitialized M0/SGPR cannot become a valid zero merely by crossing the dispatcher.
+        if (entry_wave64_scalar_words) {
+            for (auto it = state.sreg.begin(); it != state.sreg.end();) {
+                if (it->first <= 124 && !entry_wave64_scalar_words->contains(it->first))
+                    it = state.sreg.erase(it);
+                else
+                    ++it;
+            }
+            for (auto it = state.sreg_input.begin(); it != state.sreg_input.end();) {
+                if (it->first <= 124 && !entry_wave64_scalar_words->contains(it->first))
+                    it = state.sreg_input.erase(it);
+                else
+                    ++it;
             }
         }
         if (entry_b32) {
@@ -22422,6 +22499,8 @@ uint32_t fragment_spirv_required_subgroup_features(const std::vector<uint32_t>& 
                 features |= kFragmentSubgroupArithmetic;
             else if (spirv[offset + 1] == Cap_GroupNonUniformShuffle)
                 features |= kFragmentSubgroupShuffle;
+            else if (spirv[offset + 1] == Cap_GroupNonUniformBallot)
+                features |= kFragmentSubgroupBallot;
         }
         offset += words;
     }
