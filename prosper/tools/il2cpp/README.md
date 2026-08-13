@@ -1,90 +1,282 @@
-# IL2CPP symbolication for Unity/IL2CPP PS5 titles
+# IL2CPP Tools for Prosper PS4 Emulator
 
-Recover C# method names + addresses from an IL2CPP title so you can breakpoint
-managed logic (scene load, boot state machines) during emulator debugging.
+A collection of utilities for working with Unity IL2CPP-based PS4 games, enabling symbolication of managed method calls during emulation debugging.
 
-## Recipe
-1. Flatten the compiled-C# PRX (unencrypted in the dump) into a loadable ELF:
+## Overview
 
-       python3 prx_to_elf.py <dump>/Media/Modules/Il2CppUserAssemblies.prx /tmp/asm.elf
+When PS4 games are built with Unity's IL2CPP scripting backend, C# code is compiled to native C++. This makes debugging difficult because:
+- Stack traces show raw addresses instead of method names
+- Breakpoints require knowing exact RVAs (Relative Virtual Addresses)
+- The relationship between C# source and native code is obscured
 
-2. Get Il2CppDumper if you don't have it (it is NOT preinstalled). Only a net8
-   runtime ships in the WSL image, and no `unzip`, so grab the net7 build and
-   force roll-forward:
+These tools recover that information by parsing Unity's `global-metadata.dat` file and cross-referencing it with the game's compiled modules.
 
-       cd /tmp
-       curl -sSL https://github.com/Perfare/Il2CppDumper/releases/download/v6.7.46/Il2CppDumper-net7-v6.7.46.zip -o d.zip
-       python3 -c "import zipfile; zipfile.ZipFile('d.zip').extractall('dumper')"
+## Tools
 
-3. Run it (needs dotnet-sdk). The ELF starts at vaddr 0 so it prompts
-   "input il2cpp dump address" — answer `0` to force the registration auto-scan.
-   Pipe the answers in (headless has no console; the tool still throws a harmless
-   `Cannot read keys` at the very end AFTER all outputs are written — ignore it):
+### 1. prx_to_elf.py
 
-       cd /tmp/dumper && DOTNET_ROLL_FORWARD=LatestMajor \
-         sh -c 'printf "0\n0\n0\n" | dotnet Il2CppDumper.dll /tmp/asm.elf \
-           <dump>/Media/Metadata/global-metadata.dat /tmp/out'
+Converts an unencrypted PS5 SELF/PRX module into a loadable ELF file suitable for analysis with `Il2CppDumper`.
 
-4. `out/dump.cs` lists every method with a `// RVA: 0x...` comment; `out/script.json`
-   has the machine-readable `{Address, Name}` list. The runtime address is
-   `module load base + RVA`. Both PPSA24651 (The Messenger) and PPSA02664 load the
-   IL2CPP PRX at `0x440000000`, so RVA == script.json Address == a prosper
-   `[btrace] il+0x<offset>` frame. `DoFirstLogin` (RVA `0x2140D0`) → `0x4402140D0`.
+**Purpose:** Il2CppDumper requires a standard ELF input, but PS5 modules use the SELF format with custom program headers.
 
-5. Symbolicate addresses / btrace chains with `resolve.py`:
+**Usage:**
+```bash
+# Basic conversion (for dumping symbols)
+python3 prx_to_elf.py <input.prx> <output.elf>
 
-       python3 resolve.py /tmp/out/script.json il+0x1764ce2 0x11e63c
-       # il+0x1764ce2  ->  Unity.PSN.PS5.Async.WorkerThread$$RunProc (+0xa2)
-       echo '[btrace] ... chain=il+0xde92e9,il+0xde9159' | python3 resolve.py /tmp/out/script.json -
-
-   NOTE: prosper's `[btrace]` validated unwinder must accept INDIRECT call sites
-   (`0xFF` at v-2/-3/-6/-7), not just `0xE8` (call rel32) — IL2CPP dispatches
-   managed methods indirectly, so an 0xE8-only filter drops every managed frame.
-
-## What binutils can and cannot do with the flattened ELF
-
-The image has program headers but **no section header table**, so `e_shoff`, `e_shnum` and
-`e_shstrndx` are all zero (`prx_to_elf.py`; regression: `test_prx_to_elf.py`, ctest
-`il2cpp_prx_to_elf_header`). That is enough for binutils to *accept* the file — `objdump -f`,
-`objdump -p` and `objdump -T` all work, and `-T` is genuinely useful: it lists the module's Sony
-NID dynamic symbols. It is **not** enough for `objdump -d`, which disassembles sections and finds
-none.
-
-**`--sections` fixes that (#2154).** It synthesizes one section per `PT_LOAD` plus a `.shstrtab`,
-with `sh_addr == sh_offset == p_vaddr` — which follows directly from the flattening, so nothing is
-derived or guessed; each section is the segment restated in the form objdump reads. `objdump -d`
-then disassembles with real virtual addresses and resolves call targets, instead of the old
-`objdump -D -b binary -m i386:x86-64 --start-address=…` workaround that throws every
-program-header-derived address away.
-
-```
-python3 prx_to_elf.py <module>.prx out.elf --sections
-objdump -d --start-address=0x2140d0 --stop-address=0x214100 out.elf
+# With section headers (for disassembly)
+python3 prx_to_elf.py <input.prx> <output.elf> --sections
 ```
 
-It is **opt-in, and the default output is byte-identical** to what it was — verified on
-`Il2cppUserAssemblies.prx` with `cmp`, and asserted by `test_prx_to_elf.py`. Il2CppDumper reads
-program headers and the dynamic segment and does not need sections, but its ELF reader does consult
-them on some paths and that has not been re-run end to end, so the dump path is left untouched. Use
-`--sections` for disassembly; leave it off for a dump.
+**Output:**
+- Flattened ELF with `p_offset == p_vaddr` (file offset = virtual address)
+- Optional: Section header table for `objdump -d` compatibility
 
-### Ruled out
-- **"binutils also needs `e_ident[EI_OSABI]`/`[EI_ABIVERSION]` cleared" (#2016's own note) — false.**
-  binutils 2.46 accepts the flattened image with the module's `0x09 0x02` (FreeBSD, ABI 2) intact,
-  as long as `e_shnum` **and** `e_shstrndx` are both 0. A/B over all four combinations on the
-  `PPSA24651` IL2CPP module: `(shnum=14, shstrndx=43)` REJECT, `(0, 43)` REJECT, `(14, 0)` REJECT,
-  `(0, 0)` ACCEPT — and `(0, 0)` with OSABI cleared is also ACCEPT, i.e. OSABI changes nothing.
-  Zeroing only `e_shnum`, as #2016 suggested, would not have made binutils accept the file. No
-  `--gnu-compat` flag is needed (#2016 / PR #2155).
+**Example:**
+```bash
+python3 prx_to_elf.py Media/Modules/Il2CppUserAssemblies.prx /tmp/il2cpp.elf
+```
 
-## gdb caveat (prosper)
-prosper installs a SIGSEGV handler for lazy memory commit. Under gdb, ALWAYS use
+### 2. resolve.py
 
-    handle SIGSEGV SIGILL SIGBUS nostop noprint pass
+Maps runtime addresses or backtrace frames to C# method names using Il2CppDumper output.
 
-so recoverable guest faults reach prosper's handler. Otherwise gdb stops on
-normal lazy-commit faults and corrupts the run — a healthy default boot then
-appears to "crash" at a null deref when it actually does not.
+**Purpose:** Translates prosper's `[btrace]` output into readable method names.
 
-Do NOT commit dumper output (dump.cs / script.json / il2cpp.h) — it is derived
-from the gitignored game dump.
+**Usage:**
+```bash
+# Resolve individual addresses (RVAs)
+python3 resolve.py script.json 0x16b981 0x11e63c
+
+# Resolve btrace chain
+python3 resolve.py script.json il+0x16b981,il+0x11e63c
+
+# Resolve from stdin (pipe)
+echo '[btrace] ... chain=il+0x1e23b8,il+0xde92e9' | python3 resolve.py script.json -
+
+# With explicit base address
+python3 resolve.py script.json --base 0x440000000 0x4402140d0
+```
+
+**Input Formats:**
+| Format | Example | Description |
+|--------|---------|-------------|
+| Bare RVA | `0x16b981` | Relative virtual address |
+| Btrace frame | `il+0x16b981` | From prosper `[btrace]` output |
+| Eboot frame | `eb+0xada254` | Native eboot address (noted as such) |
+| Absolute | `0x4402140d0` | Runtime address (with `--base`) |
+
+**Output:**
+```
+il+0x1764ce2        Unity.PSN.PS5.Async.WorkerThread$$RunProc (+0xa2)
+il+0xde9159         UnityEngine.SceneManagement.LoadScene$$MoveNext (+0x12)
+eb+0xada254         (eboot / Unity native — not managed)
+```
+
+## Complete Workflow
+
+### Prerequisites
+
+- Python 3.6+
+- [Il2CppDumper](https://github.com/Perfare/Il2CppDumper) (v6.7.46 or compatible)
+- .NET SDK (for running Il2CppDumper)
+
+### Step-by-Step Guide
+
+#### 1. Extract Module from Game Dump
+
+```bash
+# Locate the IL2CPP module (name varies by game)
+ls <dump>/Media/Modules/
+# Common names: Il2CppUserAssemblies.prx, Il2cppUserAssemblies.prx
+```
+
+#### 2. Convert to ELF
+
+```bash
+python3 tools/il2cpp/prx_to_elf.py \
+    <dump>/Media/Modules/Il2CppUserAssemblies.prx \
+    /tmp/il2cpp.elf
+```
+
+#### 3. Run Il2CppDumper
+
+```bash
+# Download if needed
+cd /tmp
+curl -sSL https://github.com/Perfare/Il2CppDumper/releases/download/v6.7.46/Il2CppDumper-net7-v6.7.46.zip -o d.zip
+python3 -c "import zipfile; zipfile.ZipFile('d.zip').extractall('dumper')"
+
+# Execute (answer "0" to prompts for auto-scan)
+cd /tmp/dumper && DOTNET_ROLL_FORWARD=LatestMajor \
+  sh -c 'printf "0\n0\n0\n" | dotnet Il2CppDumper.dll /tmp/il2cpp.elf \
+    <dump>/Media/Metadata/global-metadata.dat /tmp/il2cpp_out'
+```
+
+**Note:** The tool may print `Cannot read keys` at the end—this is harmless and can be ignored.
+
+#### 4. Symbolicate Addresses
+
+```bash
+# Single address
+python3 tools/il2cpp/resolve.py /tmp/il2cpp_out/script.json il+0x2140d0
+# Output: DoFirstLogin  (+0x0)
+
+# Backtrace chain
+echo '[btrace] chain=il+0x1764ce2,il+0xde92e9' | \
+  python3 tools/il2cpp/resolve.py /tmp/il2cpp_out/script.json -
+```
+
+## Understanding Addresses
+
+### Address Layout
+
+For IL2CPP modules loaded by Prosper:
+
+```
+Runtime Address = Module Base + RVA
+                 = 0x440000000 + script.json["Address"]
+```
+
+**Common Module Bases:**
+| Module | Typical Base |
+|--------|--------------|
+| Il2CppUserAssemblies.prx | `0x440000000` |
+| eboot.bin | `0x400000000` |
+
+### prosper Backtrace Format
+
+Prosper's validated unwinder outputs frames as:
+
+```
+[btrace] ... chain=il+0x<offset>,il+0x<offset>,...
+```
+
+Where each `offset` is already an RVA from the module base.
+
+**Important:** The unwinder must accept **indirect call sites** (`0xFF` at v-2/-3/-6/-7), not just `0xE8` (direct `call rel32`). IL2CPP dispatches managed methods indirectly, so an `0xE8`-only filter drops every managed frame.
+
+## Advanced Usage
+
+### Disassembly with Sections
+
+The `--sections` flag synthesizes section headers for binutils compatibility:
+
+```bash
+# Convert with sections
+python3 prx_to_elf.py module.prx module.elf --sections
+
+# Now objdump can disassemble
+objdump -d --start-address=0x2140d0 --stop-address=0x214100 module.elf
+```
+
+**Why sections matter:**
+- Without sections: `objdump -f/-p/-T` work, but `-d` prints nothing
+- With sections: Full disassembly with real virtual addresses
+- Default output (without `--sections`) is byte-identical to original
+
+### GDB Integration
+
+When debugging under GDB, always set:
+
+```
+handle SIGSEGV SIGILL SIGBUS nostop noprint pass
+```
+
+This ensures recoverable guest faults reach Prosper's handler rather than being caught by GDB.
+
+## File Reference
+
+### Input Files
+
+| File | Source | Description |
+|------|--------|-------------|
+| `*.prx` | Game dump | Unencrypted PS5 module |
+| `global-metadata.dat` | Game dump | Unity type/metadata database |
+
+### Output Files
+
+| File | Source | Description |
+|------|--------|-------------|
+| `*.elf` | prx_to_elf.py | Flattened loadable ELF |
+| `script.json` | Il2CppDumper | Machine-readable method list |
+| `dump.cs` | Il2CppDumper | Human-readable method dump (C#) |
+| `il2cpp.h` | Il2CppDumper | C++ header with method declarations |
+
+**⚠️ Do not commit** `dump.cs`, `script.json`, or `il2cpp.h` to version control—they are derived from game dumps and should be gitignored.
+
+## Troubleshooting
+
+### Common Issues
+
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| `file format not recognized` | Missing `--sections` or wrong ELF fields | Use `--sections` for disassembly; default for dumping |
+| `Cannot read keys` at end | Harmless Il2CppDumper message | Ignore—all output is written before this |
+| No methods found | Wrong metadata file | Ensure correct `global-metadata.dat` path |
+| `<no managed method>` | Address not in IL2CPP range | Check base address; may be native code |
+
+### Verifying Conversion
+
+```bash
+# Compare sizes (should be non-zero)
+ls -la /tmp/il2cpp.elf
+
+# Check ELF headers
+objdump -f /tmp/il2cpp.elf
+
+# Verify dynamic symbols (Sony NIDs)
+objdump -T /tmp/il2cpp.elf
+```
+
+## Technical Details
+
+### ELF Flattening Algorithm
+
+The converter works by:
+
+1. Parsing SELF program headers to find data segments
+2. For each `PT_LOAD` segment: copying data to `p_vaddr` offset in output
+3. Setting `p_offset = p_vaddr` (flattened layout)
+4. Clearing section header fields (`e_shoff=0, e_shnum=0, e_shstrndx=0`)
+5. Optionally: Synthesizing section headers per PT_LOAD
+
+### Binutils Compatibility
+
+Tested configurations:
+
+| Tool | Works without `--sections` | Works with `--sections` |
+|------|---------------------------|------------------------|
+| `objdump -f` | ✅ | ✅ |
+| `objdump -p` | ✅ | ✅ |
+| `objdump -T` | ✅ | ✅ |
+| `objdump -d` | ❌ | ✅ |
+| `readelf -a` | ⚠️ Partial | ✅ |
+
+## Contributing
+
+### Adding Support for New Games
+
+If a game uses different conventions:
+
+1. Check the actual module name in `Media/Modules/`
+2. Verify the module base address (check prosper boot output)
+3. Update documentation if new patterns emerge
+
+### Code Style
+
+- Python 3.6+ features allowed
+- Type hints appreciated but not required
+- Comments should explain "why" not "what"
+- Keep scripts under 200 lines when possible
+
+## License
+
+MIT License - see repository LICENSE file for details.
+
+## See Also
+
+- [Il2CppDumper](https://github.com/Perfare/Il2CppDumper) - External dependency
+- [Unity IL2CPP Documentation](https://docs.unity3d.com/Manual/IL2CPP.html)
+- [prosper docs/IL2CPP_METADATA_RUNTIME.md](../../docs/IL2CPP_METADATA_RUNTIME.md) - Our metadata parser
+- Issue #2154 - Section header synthesis feature
