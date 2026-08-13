@@ -179,8 +179,8 @@ enum : uint32_t {
     // operations that merely share the word; `grep -c NonUniform` on this file returns 45 hits and every
     // one of them is a GroupNonUniform op, which reads exactly like descriptor indexing is already
     // supported. It was not.
-    Cap_ShaderNonUniform=5301, Cap_RuntimeDescriptorArray=5302,
-    Cap_StorageBufferArrayNonUniformIndexing=5306,
+    Cap_ShaderNonUniform=5301,
+    Cap_StorageBufferArrayNonUniformIndexing=5308,
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
     EM_OutputVertices=26, EM_OutputTriangleStrip=29, EM_Xfb=11,   // transform-feedback execution mode
@@ -368,7 +368,6 @@ struct SpirvCompute {
         if (descriptor_indexing_declared) return;
         descriptor_indexing_declared = true;
         put(caps, Op_Capability, {Cap_ShaderNonUniform});
-        put(caps, Op_Capability, {Cap_RuntimeDescriptorArray});
         put(caps, Op_Capability, {Cap_StorageBufferArrayNonUniformIndexing});
         std::vector<uint32_t> o; pstr(o, "SPV_EXT_descriptor_indexing");
         putv(exts, Op_Extension, o);
@@ -387,6 +386,7 @@ struct SpirvCompute {
     // entry guard, which is never legal around a workgroup barrier.
     bool partial_barrier_phases_emitted = false;
     uint32_t v_push_constants = 0, t_ptr_push_u32 = 0;
+    uint32_t push_constant_dword_count = 0;
     uint32_t linear_localid = 0, local_count = 64, wave_size = 64;
     uint32_t v_cbuf=0, v_cbuf1=0, t_ptr_sb_u32=0;   // scalar-memory constant buffers (bindings 2 and 3)
     uint32_t t_ptr_sb_struct_u=0;                    // shared runtime-u32 Block pointer type
@@ -403,6 +403,10 @@ struct SpirvCompute {
     std::map<uint32_t, uint32_t> cbuf_table_arity;
     // binding -> user SGPR holding the descriptor index, when one is available.
     std::map<uint32_t, uint32_t> cbuf_table_index_sgpr;
+    // Set when an array access cannot be represented exactly. The backend already refuses writable
+    // arrays; keeping the same boundary in the emitter prevents a caller that bypasses reflection
+    // from receiving a module that redirects an invalid store/atomic to descriptor zero.
+    bool invalid_cbuf_array_access = false;
     // A two-byte guest V# can only back our u32 SSBO ABI when every use of that binding is the exact
     // one-record Uint16/Float16 path. Ordinary load/store/atomic helpers blacklist their bindings;
     // finish() emits the explicit typed zero-pad contract only for candidates with no competing use.
@@ -2258,20 +2262,37 @@ struct SpirvCompute {
     //
     // Hence one function: the sites cannot drift apart again, and a fifth caller inherits the selector
     // rather than a stale comment promising there is only one.
-    uint32_t cbuf_element_ptr(uint32_t buf, uint32_t binding, uint32_t idx) {
+    uint32_t cbuf_element_ptr(uint32_t buf, uint32_t binding, uint32_t idx,
+                              uint32_t* array_valid = nullptr) {
+        if (array_valid) *array_valid = 0;
         auto arity = cbuf_table_arity.find(binding);
         auto index_sgpr = cbuf_table_index_sgpr.find(binding);
         uint32_t ptr = id();
-        if (arity != cbuf_table_arity.end() && index_sgpr != cbuf_table_index_sgpr.end()) {
-            const uint32_t sel = load_push_constant(index_sgpr->second);
+        if (arity != cbuf_table_arity.end()) {
+            // Only the compute shell declares the user-SGPR push-constant block. Graphics paths do
+            // not currently have a runtime source for this selector, so emitting an access there
+            // would manufacture type/variable id zero and an invalid module.
+            if (!is_compute || arity->second > 4096u ||
+                index_sgpr == cbuf_table_index_sgpr.end() ||
+                index_sgpr->second >= push_constant_dword_count) {
+                invalid_cbuf_array_access = true;
+                putv(code, Op_AccessChain,
+                     {t_ptr_sb_u32, ptr, buf, uconst(0), uconst(0), idx});
+                return ptr;
+            }
+            const uint32_t selector = load_push_constant(index_sgpr->second);
+            const uint32_t valid = ucmp(Op_ULessThan, selector, uconst(arity->second));
+            const uint32_t safe_selector = sel(valid, selector, uconst(0));
+            if (array_valid) *array_valid = valid;
             // NonUniform on both the selector and the pointer, unconditionally. Measured: of
             // PPSA04263's 51 compute launches, 5 are local=256x1x1 -- four waves per workgroup, so four
             // EXECs and four distinct scalar indices, wave-uniform but NOT dynamically uniform across
             // the invocation group. 43 of 51 are one wave per group, which is why the "obviously
             // uniform" reading looks safe and is wrong. `load_push_constant` mints a fresh id per call
             // and does not cache, so these decorations never duplicate onto one id.
-            put(deco, Op_Decorate, {sel, Dec_NonUniform});
-            putv(code, Op_AccessChain, {t_ptr_sb_u32, ptr, buf, sel, uconst(0), idx});
+            put(deco, Op_Decorate, {safe_selector, Dec_NonUniform});
+            putv(code, Op_AccessChain,
+                 {t_ptr_sb_u32, ptr, buf, safe_selector, uconst(0), idx});
             put(deco, Op_Decorate, {ptr, Dec_NonUniform});
             return ptr;
         }
@@ -2281,11 +2302,12 @@ struct SpirvCompute {
     uint32_t cbuf_load_impl(uint32_t idx, uint32_t binding, bool coherent_access) {
         uint32_t buf = buf_for_binding(binding);
         if (coherent_access) mark_cbuf_coherent(binding);
-        uint32_t p = cbuf_element_ptr(buf, binding, idx);
+        uint32_t array_valid = 0;
+        uint32_t p = cbuf_element_ptr(buf, binding, idx, &array_valid);
         uint32_t r = id();
         if (coherent_access) put(code, Op_Load, {t_u32, r, p, MemAccess_Volatile});
         else                 put(code, Op_Load, {t_u32, r, p});
-        return r;
+        return array_valid ? sel(array_valid, r, uconst(0)) : r;
     }
     uint32_t cbuf_load(uint32_t idx, uint32_t binding = 2, bool coherent_access = false) {
         cbuf_ordinary_accesses.insert(binding);
@@ -2305,6 +2327,7 @@ struct SpirvCompute {
     void cbuf_store(uint32_t idx, uint32_t value, uint32_t binding, bool predicated,
                     uint32_t pred, bool coherent_access = false) {
         cbuf_ordinary_accesses.insert(binding);
+        if (cbuf_table_arity.count(binding)) invalid_cbuf_array_access = true;
         uint32_t buf = buf_for_binding(binding);
         if (coherent_access) mark_cbuf_coherent(binding);
         auto emit = [&]() {
@@ -2327,6 +2350,7 @@ struct SpirvCompute {
     uint32_t cbuf_atomic_rtn(uint32_t op, uint32_t idx, uint32_t value, uint32_t binding,
                              bool predicated, uint32_t pred, uint32_t fallback) {
         cbuf_ordinary_accesses.insert(binding);
+        if (cbuf_table_arity.count(binding)) invalid_cbuf_array_access = true;
         const uint32_t buf = buf_for_binding(binding);
         auto emit = [&]() {
             uint32_t p = cbuf_element_ptr(buf, binding, idx);
@@ -2409,6 +2433,7 @@ struct SpirvCompute {
                                      bool is_min, bool predicated, uint32_t pred,
                                      uint32_t fallback) {
         cbuf_ordinary_accesses.insert(binding);
+        if (cbuf_table_arity.count(binding)) invalid_cbuf_array_access = true;
         const uint32_t buf = buf_for_binding(binding);
         auto emit = [&]() {
             const uint32_t pointer = cbuf_element_ptr(buf, binding, idx);
@@ -2896,6 +2921,13 @@ struct SpirvCompute {
     // format_* read. Called by every shell (compute/vertex/fragment) so cbuf_load works in each.
     // Requires t_u32 to already be declared. Unused by shaders without memory ops.
     void declare_cbufs(const ShaderResourceTable* rt = nullptr) {
+        if (rt)
+            for (const ShaderResource& resource : rt->resources)
+                if (resource.table_index_count != 0u &&
+                    (resource.cls == ResourceClass::ConstantBuffer ||
+                     resource.cls == ResourceClass::VertexBuffer) &&
+                    !valid_shader_buffer_table_contract(resource))
+                    invalid_cbuf_array_access = true;
         uint32_t t_rta_u = id(), t_struct_u = id();
         t_ptr_sb_struct_u = id();
         v_cbuf = id(); v_cbuf1 = id(); t_ptr_sb_u32 = id();
@@ -2937,11 +2969,10 @@ struct SpirvCompute {
         // Declare `binding`'s variable as an array of the Block type, reusing the id already decorated
         // for it, so its set/binding decorations above stay correct.
         auto declare_as_array = [&](uint32_t binding, uint32_t var, uint32_t arity) {
-            constexpr uint32_t kMaxPlausibleArity = 1u << 16;
             declare_descriptor_indexing();
             const uint32_t arr = id();
-            if (arity > kMaxPlausibleArity) put(types, Op_TypeRuntimeArray, {arr, t_struct_u});
-            else                            put(types, Op_TypeArray, {arr, t_struct_u, uconst(arity)});
+            put(types, Op_TypeArray,
+                {arr, t_struct_u, uconst(arity <= 4096u ? arity : 1u)});
             const uint32_t arr_ptr = id();
             put(types, Op_TypePointer, {arr_ptr, SC_StorageBuffer, arr});
             declare_external_storage_buffer(arr_ptr, var);
@@ -2993,14 +3024,11 @@ struct SpirvCompute {
                     // `OpTypeArray %Block 4294967295` would ask the driver for a 4-billion-descriptor
                     // binding. The numeric guard catches that sentinel without this branch having to
                     // depend on #2463 being merged first, and catches any other absurd count on the way.
-                    constexpr uint32_t kMaxPlausibleArity = 1u << 16;
                     declare_descriptor_indexing();
                     const uint32_t arr = id();
-                    if (r.table_index_count > kMaxPlausibleArity) {
-                        put(types, Op_TypeRuntimeArray, {arr, t_struct_u});
-                    } else {
-                        put(types, Op_TypeArray, {arr, t_struct_u, uconst(r.table_index_count)});
-                    }
+                    put(types, Op_TypeArray,
+                        {arr, t_struct_u,
+                         uconst(r.table_index_count <= 4096u ? r.table_index_count : 1u)});
                     const uint32_t arr_ptr = id();
                     put(types, Op_TypePointer, {arr_ptr, SC_StorageBuffer, arr});
                     declare_external_storage_buffer(arr_ptr, v);
@@ -3046,6 +3074,7 @@ struct SpirvCompute {
                uint32_t local_x = 64, uint32_t local_y = 1, uint32_t local_z = 1,
                uint32_t hardware_wave_size = 64, uint32_t push_constant_dwords = 0) {
         stride = input_stride;
+        push_constant_dword_count = push_constant_dwords;
         local_count = local_x * local_y * local_z;
         wave_size = hardware_wave_size;
         t_void = id(); t_fn = id(); t_f32 = id(); t_u32 = id(); t_i32 = id(); t_v3u = id(); t_bool = id();
@@ -3671,6 +3700,7 @@ struct SpirvCompute {
     }
 
     std::vector<uint32_t> finish() {
+        if (invalid_cbuf_array_access) return {};
         if (invocation_guard_merge) {
             emit_branch(invocation_guard_merge);
             emit_label(invocation_guard_merge);
@@ -12726,6 +12756,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (raw_subword) {
                 if (raw_bits == 8) fmt = raw_signed ? DataFormat::Sint8 : DataFormat::Uint8;
                 else               fmt = raw_signed ? DataFormat::Sint16 : DataFormat::Uint16;
+            }
+            // The checkpoint array ABI models read-only raw buffer accesses. Typed MUBUF default-fill
+            // and descriptor swizzle semantics need per-selected-entry treatment; stores and atomics
+            // additionally need writeback authority. Reject all three before any helper can form an
+            // access through the array variable.
+            if (resolved_buffer && resolved_buffer->table_index_count != 0u &&
+                (is_format || is_store || is_atomic)) {
+                ok = false;
+                return true;
             }
             if (is_atomic_x2) {
                 const bool zero_soffset =
