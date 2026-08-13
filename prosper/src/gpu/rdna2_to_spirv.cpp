@@ -11933,7 +11933,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (selected_sbuffer->selected_sbuffer_soffset ==
                         kGtaSelectedSbufferZeroChainSoffset ||
                     selected_sbuffer->selected_sbuffer_soffset ==
-                        kGtaSelectedSbufferAllOobSoffset) {
+                        kGtaSelectedSbufferAllOobSoffset ||
+                    selected_sbuffer->selected_sbuffer_soffset ==
+                        kGtaSelectedSbufferNullRecord4Soffset) {
                     for (uint32_t k = 0; k < n; ++k) {
                         rs.sreg[in.dst.value + static_cast<int>(k)] = b.uconst(0u);
                         rs.sreg_srt.erase(in.dst.value + static_cast<int>(k));
