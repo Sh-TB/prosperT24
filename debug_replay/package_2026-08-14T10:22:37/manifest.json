@@ -1,0 +1,15 @@
+{
+  "metadata": {
+  "package_id": "replay_1786702957165127693_1",
+  "title": "Test Package",
+  "description": "Test investigation package",
+  "platform_version": "2.0.0",
+  "created": "2026-08-14T10:22:37Z",
+  "status": "Completed"
+},
+  "files": {
+    "components": ["test_data.json"],
+    "logs": [],
+    "screenshots": []
+  }
+}
