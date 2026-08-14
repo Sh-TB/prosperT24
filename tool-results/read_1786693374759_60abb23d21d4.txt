@@ -1,0 +1,796 @@
+     1→/**
+     2→ * Debug Intelligence Layer for Prosper/SharpEmuT24
+     3→ * 
+     4→ * Evidence Management and Reasoning Assistant for AI-Assisted Debugging
+     5→ * 
+     6→ * DESIGN PRINCIPLES:
+     7→ * - Observer Only: No emulator behavior modifications
+     8→ * - Non-Invasive: No loader/HLE/GPU changes
+     9→ * - Evidence-Backed: All conclusions require supporting data
+    10→ * - AI-Friendly: Structured JSON for LLM consumption
+    11→ * 
+    12→ * @version 1.0.0
+    13→ * @license MIT
+    14→ */
+    15→
+    16→#pragma once
+    17→
+    18→#include <string>
+    19→#include <vector>
+    20→#include <map>
+    21→#include <set>
+    22→#include <optional>
+    23→#include <chrono>
+    24→#include <filesystem>
+    25→#include <fstream>
+    26→#include <sstream>
+    27→#include <algorithm>
+    28→#include <functional>
+    29→#include <memory>
+    30→#include <regex>
+    31→#include <system_error>
+    32→#include <stdexcept>
+    33→#include <array>
+    34→#include <ctime>
+    35→
+    36→namespace fs = std::filesystem;
+    37→
+    38→namespace debug_intelligence {
+    39→
+    40→// ============================================================================
+    41→// Core Types & Constants
+    42→// ============================================================================
+    43→
+    44→constexpr const char* VERSION = "1.0.0";
+    45→constexpr const char* EXP_PACKAGE_EXT = ".exp.json";
+    46→constexpr const char* EVIDENCE_DIR = "evidence";
+    47→constexpr const char* SCREENSHOTS_DIR = "screenshots";
+    48→constexpr const char* LOGS_DIR = "logs";
+    49→
+    50→/**
+    51→ * Severity levels for diagnostics and evidence
+    52→ */
+    53→enum class Severity {
+    54→    Info,
+    55→    Warning,
+    56→    Error,
+    57→    Critical
+    58→};
+    59→
+    60→/**
+    61→ * Status tracking for hypotheses and investigations
+    62→ */
+    63→enum class InvestigationStatus {
+    64→    Open,
+    65→    InProgress,
+    66→    Confirmed,
+    67→    Rejected,
+    68→    NeedsEvidence,
+    69→    Blocked,
+    70→    Superseded
+    71→};
+    72→
+    73→/**
+    74→ * Evidence type classification
+    75→ */
+    76→enum class EvidenceType {
+    77→    LogEntry,
+    78→    Screenshot,
+    79→    CrashDump,
+    80→    MemorySnapshot,
+    81→    Configuration,
+    82→    EnvironmentVariable,
+    83→    BuildInfo,
+    84→    GitCommit,
+    85→    UserObservation,
+    86→    MetricMeasurement,
+    87→    CodeDiff,
+    88→    NetworkCapture,
+    89→    Custom
+    90→};
+    91→
+    92→/**
+    93→ * Timestamp utility
+    94→ */
+    95→class Timestamp {
+    96→public:
+    97→    static std::string now() {
+    98→        auto now = std::chrono::system_clock::now();
+    99→        auto time_t = std::chrono::system_clock::to_time_t(now);
+   100→        std::stringstream ss;
+   101→        ss << std::put_time(std::gmtime(&time_t), "%Y-%m-%dT%H:%M:%SZ");
+   102→        return ss.str();
+   103→    }
+   104→    
+   105→    static std::string fileFriendly() {
+   106→        auto now = std::chrono::system_clock::now();
+   107→        auto time_t = std::chrono::system_clock::to_time_t(now);
+   108→        std::stringstream ss;
+   109→        ss << std::put_time(std::gmtime(&time_t), "%Y%m%d_%H%M%S");
+   110→        return ss.str();
+   111→    }
+   112→};
+   113→
+   114→// ============================================================================
+   115→// Evidence System
+   116→// ============================================================================
+   117→
+   118→/**
+   119→ * Single piece of evidence with metadata
+   120→ */
+   121→struct Evidence {
+   122→    std::string id;
+   123→    EvidenceType type;
+   124→    std::string description;
+   125→    std::string content;           // Text content or base64 encoded binary
+   126→    std::string source_path;       // Original file path (if applicable)
+   127→    std::string timestamp;
+   128→    Severity severity;
+   129→    std::map<std::string, std::string> tags;
+   130→    bool verified;
+   131→    
+   132→    Evidence() : type(EvidenceType::Custom), severity(Severity::Info), verified(false) {
+   133→        id = generateId();
+   134→        timestamp = Timestamp::now();
+   135→    }
+   136→    
+   137→    static std::string generateId() {
+   138→        static uint64_t counter = 0;
+   139→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+   140→        return "evd_" + std::to_string(now) + "_" + std::to_string(++counter);
+   141→    }
+   142→    
+   143→    // Serialization
+   144→    std::map<std::string, std::string> toMap() const {
+   145→        return {
+   146→            {"id", id},
+   147→            {"type", evidenceTypeToString(type)},
+   148→            {"description", description},
+   149→            {"content", content},
+   150→            {"source_path", source_path},
+   151→            {"timestamp", timestamp},
+   152→            {"severity", severityToString(severity)},
+   153→            {"verified", verified ? "true" : "false"}
+   154→        };
+   155→    }
+   156→    
+   157→    static EvidenceType stringToEvidenceType(const std::string& str) {
+   158→        static const std::map<std::string, EvidenceType> map = {
+   159→            {"LogEntry", EvidenceType::LogEntry},
+   160→            {"Screenshot", EvidenceType::Screenshot},
+   161→            {"CrashDump", EvidenceType::CrashDump},
+   162→            {"MemorySnapshot", EvidenceType::MemorySnapshot},
+   163→            {"Configuration", EvidenceType::Configuration},
+   164→            {"EnvironmentVariable", EvidenceType::EnvironmentVariable},
+   165→            {"BuildInfo", EvidenceType::BuildInfo},
+   166→            {"GitCommit", EvidenceType::GitCommit},
+   167→            {"UserObservation", EvidenceType::UserObservation},
+   168→            {"MetricMeasurement", EvidenceType::MetricMeasurement},
+   169→            {"CodeDiff", EvidenceType::CodeDiff},
+   170→            {"NetworkCapture", EvidenceType::NetworkCapture},
+   171→            {"Custom", EvidenceType::Custom}
+   172→        };
+   173→        auto it = map.find(str);
+   174→        return it != map.end() ? it->second : EvidenceType::Custom;
+   175→    }
+   176→    
+   177→    static std::string evidenceTypeToString(EvidenceType type) {
+   178→        switch (type) {
+   179→            case EvidenceType::LogEntry: return "LogEntry";
+   180→            case EvidenceType::Screenshot: return "Screenshot";
+   181→            case EvidenceType::CrashDump: return "CrashDump";
+   182→            case EvidenceType::MemorySnapshot: return "MemorySnapshot";
+   183→            case EvidenceType::Configuration: return "Configuration";
+   184→            case EvidenceType::EnvironmentVariable: return "EnvironmentVariable";
+   185→            case EvidenceType::BuildInfo: return "BuildInfo";
+   186→            case EvidenceType::GitCommit: return "GitCommit";
+   187→            case EvidenceType::UserObservation: return "UserObservation";
+   188→            case EvidenceType::MetricMeasurement: return "MetricMeasurement";
+   189→            case EvidenceType::CodeDiff: return "CodeDiff";
+   190→            case EvidenceType::NetworkCapture: return "NetworkCapture";
+   191→            case EvidenceType::Custom: return "Custom";
+   192→        }
+   193→        return "Custom";
+   194→    }
+   195→    
+   196→    static std::string severityToString(Severity sev) {
+   197→        switch (sev) {
+   198→            case Severity::Info: return "Info";
+   199→            case Severity::Warning: return "Warning";
+   200→            case Severity::Error: return "Error";
+   201→            case Severity::Critical: return "Critical";
+   202→        }
+   203→        return "Info";
+   204→    }
+   205→};
+   206→
+   207→/**
+   208→ * Evidence collection container
+   209→ */
+   210→class EvidenceCollection {
+   211→public:
+   212→    void add(const Evidence& evidence) {
+   213→        m_evidences[evidence.id] = evidence;
+   214→    }
+   215→    
+   216→    bool remove(const std::string& id) {
+   217→        return m_evidences.erase(id) > 0;
+   218→    }
+   219→    
+   220→    std::optional<Evidence> find(const std::string& id) const {
+   221→        auto it = m_evidences.find(id);
+   222→        if (it != m_evidences.end()) {
+   223→            return it->second;
+   224→        }
+   225→        return std::nullopt;
+   226→    }
+   227→    
+   228→    std::vector<Evidence> findByType(EvidenceType type) const {
+   229→        std::vector<Evidence> result;
+   230→        for (const auto& [id, evd] : m_evidences) {
+   231→            if (evd.type == type) {
+   232→                result.push_back(evd);
+   233→            }
+   234→        }
+   235→        return result;
+   236→    }
+   237→    
+   238→    std::vector<Evidence> findByTag(const std::string& tag) const {
+   239→        std::vector<Evidence> result;
+   240→        for (const auto& [id, evd] : m_evidences) {
+   241→            if (evd.tags.count(tag)) {
+   242→                result.push_back(evd);
+   243→            }
+   244→        }
+   245→        return result;
+   246→    }
+   247→    
+   248→    std::vector<Evidence> all() const {
+   249→        std::vector<Evidence> result;
+   250→        for (const auto& [id, evd] : m_evidences) {
+   251→            result.push_back(evd);
+   252→        }
+   253→        return result;
+   254→    }
+   255→    
+   256→    size_t size() const { return m_evidences.size(); }
+   257→    bool empty() const { return m_evidences.empty(); }
+   258→    
+   259→private:
+   260→    std::map<std::string, Evidence> m_evidences;
+   261→};
+   262→
+   263→// ============================================================================
+   264→// Hypothesis System
+   265→// ============================================================================
+   266→
+   267→/**
+   268→ * A hypothesis about the root cause of an issue
+   269→ */
+   270→struct Hypothesis {
+   271→    std::string id;
+   272→    std::string title;
+   273→    std::string description;
+   274→    InvestigationStatus status;
+   275→    std::string created_at;
+   276→    std::string updated_at;
+   277→    std::string confirmed_at;
+   278→    std::string rejected_at;
+   279→    std::vector<std::string> supporting_evidence_ids;
+   280→    std::vector<std::string> refuting_evidence_ids;
+   281→    std::vector<std::string> related_hypothesis_ids;
+   282→    double confidence_score;  // 0.0 to 1.0
+   283→    std::string notes;
+   284→    
+   285→    Hypothesis() : status(InvestigationStatus::Open), confidence_score(0.0) {
+   286→        id = generateId();
+   287→        created_at = Timestamp::now();
+   288→        updated_at = created_at;
+   289→    }
+   290→    
+   291→    static std::string generateId() {
+   292→        static uint64_t counter = 0;
+   293→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+   294→        return "hyp_" + std::to_string(now) + "_" + std::to_string(++counter);
+   295→    }
+   296→    
+   297→    void addSupportingEvidence(const std::string& evidence_id) {
+   298→        if (std::find(supporting_evidence_ids.begin(), supporting_evidence_ids.end(), evidence_id) == supporting_evidence_ids.end()) {
+   299→            supporting_evidence_ids.push_back(evidence_id);
+   300→            updated_at = Timestamp::now();
+   301→        }
+   302→    }
+   303→    
+   304→    void addRefutingEvidence(const std::string& evidence_id) {
+   305→        if (std::find(refuting_evidence_ids.begin(), refuting_evidence_ids.end(), evidence_id) == refuting_evidence_ids.end()) {
+   306→            refuting_evidence_ids.push_back(evidence_id);
+   307→            updated_at = Timestamp::now();
+   308→        }
+   309→    }
+   310→    
+   311→    void confirm() {
+   312→        status = InvestigationStatus::Confirmed;
+   313→        confirmed_at = Timestamp::now();
+   314→        updated_at = confirmed_at;
+   315→        confidence_score = 1.0;
+   316→    }
+   317→    
+   318→    void reject() {
+   319→        status = InvestigationStatus::Rejected;
+   320→        rejected_at = Timestamp::now();
+   321→        updated_at = rejected_at;
+   322→        confidence_score = 0.0;
+   323→    }
+   324→    
+   325→    static InvestigationStatus stringToStatus(const std::string& str) {
+   326→        static const std::map<std::string, InvestigationStatus> map = {
+   327→            {"Open", InvestigationStatus::Open},
+   328→            {"InProgress", InvestigationStatus::InProgress},
+   329→            {"Confirmed", InvestigationStatus::Confirmed},
+   330→            {"Rejected", InvestigationStatus::Rejected},
+   331→            {"NeedsEvidence", InvestigationStatus::NeedsEvidence},
+   332→            {"Blocked", InvestigationStatus::Blocked},
+   333→            {"Superseded", InvestigationStatus::Superseded}
+   334→        };
+   335→        auto it = map.find(str);
+   336→        return it != map.end() ? it->second : InvestigationStatus::Open;
+   337→    }
+   338→    
+   339→    static std::string statusToString(InvestigationStatus status) {
+   340→        switch (status) {
+   341→            case InvestigationStatus::Open: return "Open";
+   342→            case InvestigationStatus::InProgress: return "InProgress";
+   343→            case InvestigationStatus::Confirmed: return "Confirmed";
+   344→            case InvestigationStatus::Rejected: return "Rejected";
+   345→            case InvestigationStatus::NeedsEvidence: return "NeedsEvidence";
+   346→            case InvestigationStatus::Blocked: return "Blocked";
+   347→            case InvestigationStatus::Superseded: return "Superseded";
+   348→        }
+   349→        return "Open";
+   350→    }
+   351→};
+   352→
+   353→/**
+   354→ * Hypothesis tracker - manages investigation state
+   355→ */
+   356→class HypothesisTracker {
+   357→public:
+   358→    Hypothesis& create(const std::string& title, const std::string& description = "") {
+   359→        Hypothesis hyp;
+   360→        hyp.title = title;
+   361→        hyp.description = description;
+   362→        m_hypotheses[hyp.id] = std::move(hyp);
+   363→        return m_hypotheses[hyp.id];
+   364→    }
+   365→    
+   366→    bool remove(const std::string& id) {
+   367→        return m_hypotheses.erase(id) > 0;
+   368→    }
+   369→    
+   370→    std::optional<Hypothesis> find(const std::string& id) const {
+   371→        auto it = m_hypotheses.find(id);
+   372→        if (it != m_hypotheses.end()) {
+   373→            return it->second;
+   374→        }
+   375→        return std::nullopt;
+   376→    }
+   377→    
+   378→    std::vector<Hypothesis> findByStatus(InvestigationStatus status) const {
+   379→        std::vector<Hypothesis> result;
+   380→        for (const auto& [id, hyp] : m_hypotheses) {
+   381→            if (hyp.status == status) {
+   382→                result.push_back(hyp);
+   383→            }
+   384→        }
+   385→        return result;
+   386→    }
+   387→    
+   388→    std::vector<Hypothesis> getActive() const {
+   389→        std::vector<Hypothesis> result;
+   390→        for (const auto& [id, hyp] : m_hypotheses) {
+   391→            if (hyp.status == InvestigationStatus::Open || 
+   392→                hyp.status == InvestigationStatus::InProgress ||
+   393→                hyp.status == InvestigationStatus::NeedsEvidence) {
+   394→                result.push_back(hyp);
+   395→            }
+   396→        }
+   397→        return result;
+   398→    }
+   399→    
+   400→    std::vector<Hypothesis> getConfirmed() const {
+   401→        return findByStatus(InvestigationStatus::Confirmed);
+   402→    }
+   403→    
+   404→    std::vector<Hypothesis> getRejected() const {
+   405→        return findByStatus(InvestigationStatus::Rejected);
+   406→    }
+   407→    
+   408→    /**
+   409→     * Check if a similar hypothesis already exists to prevent duplicate investigations
+   410→     */
+   411→    std::optional<Hypothesis> findSimilar(const std::string& title, double threshold = 0.7) const {
+   412→        for (const auto& [id, hyp] : m_hypotheses) {
+   413→            double similarity = calculateSimilarity(title, hyp.title);
+   414→            if (similarity >= threshold) {
+   415→                return hyp;
+   416→            }
+   417→        }
+   418→        return std::nullopt;
+   419→    }
+   420→    
+   421→    std::vector<Hypothesis> all() const {
+   422→        std::vector<Hypothesis> result;
+   423→        for (const auto& [id, hyp] : m_hypotheses) {
+   424→            result.push_back(hyp);
+   425→        }
+   426→        return result;
+   427→    }
+   428→    
+   429→    size_t size() const { return m_hypotheses.size(); }
+   430→    bool empty() const { return m_hypotheses.empty(); }
+   431→    
+   432→private:
+   433→    std::map<std::string, Hypothesis> m_hypotheses;
+   434→    
+   435→    /**
+   436→     * Simple text similarity using bigram overlap
+   437→     */
+   438→    double calculateSimilarity(const std::string& a, const std::string& b) const {
+   439→        auto bigrams = [](const std::string& s) -> std::set<std::string> {
+   440→            std::set<std::string> result;
+   441→            std::string lower = s;
+   442→            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+   443→            for (size_t i = 0; i + 1 < lower.length(); ++i) {
+   444→                result.insert(lower.substr(i, 2));
+   445→            }
+   446→            return result;
+   447→        };
+   448→        
+   449→        auto bgA = bigrams(a);
+   450→        auto bgB = bigrams(b);
+   451→        
+   452→        if (bgA.empty() && bgB.empty()) return 1.0;
+   453→        if (bgA.empty() || bgB.empty()) return 0.0;
+   454→        
+   455→        std::set<std::string> intersection;
+   456→        std::set_intersection(bgA.begin(), bgA.end(), bgB.begin(), bgB.end(),
+   457→                             std::inserter(intersection, intersection.begin()));
+   458→        
+   459→        std::set<std::string> union_set;
+   460→        std::set_union(bgA.begin(), bgA.end(), bgB.begin(), bgB.end(),
+   461→                      std::inserter(union_set, union_set.begin()));
+   462→        
+   463→        return static_cast<double>(intersection.size()) / union_set.size();
+   464→    }
+   465→};
+   466→
+   467→// ============================================================================
+   468→// Experiment Recording System
+   469→// ============================================================================
+   470→
+   471→/**
+   472→ * Build configuration capture
+   473→ */
+   474→struct BuildConfiguration {
+   475→    std::string compiler;
+   476→    std::string compiler_version;
+   477→    std::string build_type;  // Debug, Release, RelWithDebInfo
+   478→    std::string cmake_args;
+   479→    std::string cxx_standard;
+   480→    std::vector<std::string> defines;
+   481→    std::vector<std::string> include_paths;
+   482→    std::vector<std::string> linked_libraries;
+   483→    std::string git_branch;
+   484→    std::string git_commit_hash;
+   485→    std::string git_commit_message;
+   486→    bool is_dirty;  // Uncommitted changes
+   487→    
+   488→    std::map<std::string, std::string> toMap() const {
+   489→        return {
+   490→            {"compiler", compiler},
+   491→            {"compiler_version", compiler_version},
+   492→            {"build_type", build_type},
+   493→            {"cmake_args", cmake_args},
+   494→            {"cxx_standard", cxx_standard},
+   495→            {"git_branch", git_branch},
+   496→            {"git_commit_hash", git_commit_hash},
+   497→            {"git_commit_message", git_commit_message},
+   498→            {"is_dirty", is_dirty ? "true" : "false"}
+   499→        };
+   500→    }
+   501→};
+   502→
+   503→/**
+   504→ * Environment snapshot
+   505→ */
+   506→struct EnvironmentSnapshot {
+   507→    std::map<std::string, std::string> variables;
+   508→    std::string os_name;
+   509→    std::string os_version;
+   510→    std::string architecture;
+   511→    std::string hostname;
+   512→    std::string username;
+   513→    int cpu_count;
+   514→    size_t total_memory_mb;
+   515→    std::string timestamp;
+   516→    
+   517→    EnvironmentSnapshot() : cpu_count(0), total_memory_mb(0) {
+   518→        timestamp = Timestamp::now();
+   519→    }
+   520→    
+   521→    std::optional<std::string> getVar(const std::string& name) const {
+   522→        auto it = variables.find(name);
+   523→        if (it != variables.end()) {
+   524→            return it->second;
+   525→        }
+   526→        return std::nullopt;
+   527→    }
+   528→};
+   529→
+   530→/**
+   531→ * Crash state capture
+   532→ */
+   533→struct CrashState {
+   534→    std::string signal_type;
+   535→    std::string signal_number;
+   536→    std::string fault_address;
+   537→    std::vector<std::string> stack_trace;
+   538→    std::vector<std::string> registers;
+   539→    std::string module_name;
+   540→    std::string offset;
+   541→    std::string timestamp;
+   542→    std::string crash_log_path;
+   543→    
+   544→    CrashState() {
+   545→        timestamp = Timestamp::now();
+   546→    }
+   547→    
+   548→    bool hasStackTrace() const { return !stack_trace.empty(); }
+   549→    bool hasRegisters() const { return !registers.empty(); }
+   550→};
+   551→
+   552→/**
+   553→ * Complete experiment record
+   554→ */
+   555→struct ExperimentRecord {
+   556→    std::string id;
+   557→    std::string title;
+   558→    std::string description;
+   559→    std::string created_at;
+   560→    std::string updated_at;
+   561→    std::string completed_at;
+   562→    
+   563→    BuildConfiguration build_config;
+   564→    EnvironmentSnapshot environment;
+   565→    CrashState crash_state;
+   566→    
+   567→    EvidenceCollection evidences;
+   568→    HypothesisTracker hypotheses;
+   569→    
+   570→    std::string issue_reference;  // GitHub issue, JIRA, etc.
+   571→    std::vector<std::string> tags;
+   572→    std::string status;  // running, completed, failed, aborted
+   573→    
+   574→    std::string exp_package_path;
+   575→    
+   576→    ExperimentRecord() {
+   577→        id = generateId();
+   578→        created_at = Timestamp::now();
+   579→        updated_at = created_at;
+   580→        status = "running";
+   581→    }
+   582→    
+   583→    static std::string generateId() {
+   584→        static uint64_t counter = 0;
+   585→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+   586→        return "exp_" + std::to_string(now) + "_" + std::to_string(++counter);
+   587→    }
+   588→    
+   589→    void markCompleted() {
+   590→        status = "completed";
+   591→        completed_at = Timestamp::now();
+   592→        updated_at = completed_at;
+   593→    }
+   594→    
+   595→    void markFailed(const std::string& reason = "") {
+   596→        status = "failed";
+   597→        if (!reason.empty()) {
+   598→            description += "\nFailure: " + reason;
+   599→        }
+   600→        updated_at = Timestamp::now();
+   601→    }
+   602→    
+   603→    void markAborted() {
+   604→        status = "aborted";
+   605→        updated_at = Timestamp::now();
+   606→    }
+   607→};
+   608→
+   609→// ============================================================================
+   610→// History Search System
+   611→// ============================================================================
+   612→
+   613→/**
+   614→ * Entry in experiment history
+   615→ */
+   616→struct HistoryEntry {
+   617→    std::string experiment_id;
+   618→    std::string title;
+   619→    std::string status;
+   620→    std::string timestamp;
+   621→    std::vector<std::string> tags;
+   622→    std::string summary;
+   623→    fs::path package_path;
+   624→    
+   625→    /**
+   626→     * Check if this entry matches a search query
+   627→     */
+   628→    bool matchesQuery(const std::string& query) const {
+   629→        std::string lower_query = query;
+   630→        std::transform(lower_query.begin(), lower_query.end(), lower_query.begin(), ::tolower);
+   631→        
+   632→        std::string combined = title + " " + summary + " ";
+   633→        for (const auto& tag : tags) {
+   634→            combined += tag + " ";
+   635→        }
+   636→        std::transform(combined.begin(), combined.end(), combined.begin(), ::tolower);
+   637→        
+   638→        return combined.find(lower_query) != std::string::npos;
+   639→    }
+   640→    
+   641→    /**
+   642→     * Calculate relevance score for a query (0.0 to 1.0)
+   643→     */
+   644→    double relevanceScore(const std::string& query) const {
+   645→        std::string lower_query = query;
+   646→        std::transform(lower_query.begin(), lower_query.end(), lower_query.begin(), ::tolower);
+   647→        
+   648→        // Exact title match gets highest score
+   649→        std::string lower_title = title;
+   650→        std::transform(lower_title.begin(), lower_title.end(), lower_title.begin(), ::tolower);
+   651→        if (lower_title == lower_query) return 1.0;
+   652→        
+   653→        // Title contains query
+   654→        if (lower_title.find(lower_query) != std::string::npos) return 0.9;
+   655→        
+   656→        // Check tags
+   657→        for (const auto& tag : tags) {
+   658→            std::string lower_tag = tag;
+   659→            std::transform(lower_tag.begin(), lower_tag.end(), lower_tag.begin(), ::tolower);
+   660→            if (lower_tag == lower_query) return 0.8;
+   661→            if (lower_tag.find(lower_query) != std::string::npos) return 0.7;
+   662→        }
+   663→        
+   664→        // Summary match
+   665→        std::string lower_summary = summary;
+   666→        std::transform(lower_summary.begin(), lower_summary.end(), lower_summary.begin(), ::tolower);
+   667→        if (lower_summary.find(lower_query) != std::string::npos) return 0.5;
+   668→        
+   669→        return 0.0;
+   670→    }
+   671→};
+   672→
+   673→/**
+   674→ * Duplicate detection warning
+   675→ */
+   676→struct DuplicateWarning {
+   677→    std::string existing_experiment_id;
+   678→    std::string existing_title;
+   679→    std::string existing_status;
+   680→    double similarity_score;
+   681→    std::string reason;
+   682→    std::string recommendation;
+   683→};
+   684→
+   685→/**
+   686→ * Upstream fix notification
+   687→ */
+   688→struct UpstreamFixNotification {
+   689→    std::string fix_reference;  // PR URL, commit hash, etc.
+   690→    std::string title;
+   691→    std::string description;
+   692→    std::string fixed_in_version;
+   693→    std::string detected_at;
+   694→    
+   695→    UpstreamFixNotification() {
+   696→        detected_at = Timestamp::now();
+   697→    }
+   698→};
+   699→
+   700→// ============================================================================
+   701→// Report Generation System
+   702→// ============================================================================
+   703→
+   704→/**
+   705→ * Timeline event for reports
+   706→ */
+   707→struct TimelineEvent {
+   708→    std::string timestamp;
+   709→    std::string event_type;
+   710→    std::string description;
+   711→    std::string reference_id;  // Evidence ID, hypothesis ID, etc.
+   712→    std::map<std::string, std::string> metadata;
+   713→    
+   714→    static TimelineEvent evidenceAdded(const Evidence& e) {
+   715→        TimelineEvent evt;
+   716→        evt.timestamp = e.timestamp;
+   717→        evt.event_type = "evidence_added";
+   718→        evt.description = "Evidence captured: " + e.description;
+   719→        evt.reference_id = e.id;
+   720→        evt.metadata = e.toMap();
+   721→        return evt;
+   722→    }
+   723→    
+   724→    static TimelineEvent hypothesisCreated(const Hypothesis& h) {
+   725→        TimelineEvent evt;
+   726→        evt.timestamp = h.created_at;
+   727→        evt.event_type = "hypothesis_created";
+   728→        evt.description = "Hypothesis proposed: " + h.title;
+   729→        evt.reference_id = h.id;
+   730→        return evt;
+   731→    }
+   732→    
+   733→    static TimelineEvent hypothesisConfirmed(const Hypothesis& h) {
+   734→        TimelineEvent evt;
+   735→        evt.timestamp = h.confirmed_at;
+   736→        evt.event_type = "hypothesis_confirmed";
+   737→        evt.description = "Root cause confirmed: " + h.title;
+   738→        evt.reference_id = h.id;
+   739→        return evt;
+   740→    }
+   741→    
+   742→    static TimelineEvent hypothesisRejected(const Hypothesis& h) {
+   743→        TimelineEvent evt;
+   744→        evt.timestamp = h.rejected_at;
+   745→        evt.event_type = "hypothesis_rejected";
+   746→        evt.description = "Hypothesis rejected: " + h.title;
+   747→        evt.reference_id = h.id;
+   748→        return evt;
+   749→    }
+   750→};
+   751→
+   752→/**
+   753→ * Final root cause report
+   754→ */
+   755→struct RootCauseReport {
+   756→    std::string experiment_id;
+   757→    std::string generated_at;
+   758→    std::string title;
+   759→    std::string executive_summary;
+   760→    
+   761→    std::string root_cause_description;
+   762→    std::string confirmed_hypothesis_id;
+   763→    double confidence_level;
+   764→    
+   765→    std::vector<TimelineEvent> timeline;
+   766→    std::vector<Evidence> key_evidence;
+   767→    std::vector<Hypothesis> all_hypotheses;
+   768→    std::vector<Hypothesis> rejected_hypotheses;
+   769→    
+   770→    std::string recommended_fix;
+   771→    std::string verification_steps;
+   772→    std::string lessons_learned;
+   773→    
+   774→    std::vector<UpstreamFixNotification> upstream_fixes;
+   775→    std::vector<DuplicateWarning> duplicates_found;
+   776→    
+   777→    std::map<std::string, std::string> metadata;
+   778→    
+   779→    RootCauseReport() : confidence_level(0.0) {
+   780→        generated_at = Timestamp::now();
+   781→    }
+   782→    
+   783→    /**
+   784→     * Validate that report has minimum required fields populated
+   785→     */
+   786→    bool isValid() const {
+   787→        return !experiment_id.empty() &&
+   788→               !root_cause_description.empty() &&
+   789→               !confirmed_hypothesis_id.empty() &&
+   790→               confidence_level > 0.0 &&
+   791→               !key_evidence.empty();
+   792→    }
+   793→};
+   794→
+   795→} // namespace debug_intelligence
+   796→

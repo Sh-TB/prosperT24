@@ -1,0 +1,858 @@
+     1→/**
+     2→ * Experiment Recorder Module
+     3→ * 
+     4→ * Captures and persists experiment state including:
+     5→ * - Build configuration (compiler, git state, defines)
+     6→ * - Environment variables and system info
+     7→ * - Runtime logs
+     8→ * - Screenshots
+     9→ * - Crash state
+    10→ * - EXP package generation
+    11→ */
+    12→
+    13→#pragma once
+    14→
+    15→#include "debug_intelligence.hpp"
+    16→#include <cstdlib>
+    17→#include <cstdio>
+    18→#include <cstring>
+    19→#include <memory>
+    20→#include <thread>
+    21→#include <sys/utsname.h>
+    22→#include <sys/sysinfo.h>
+    23→#include <unistd.h>
+    24→
+    25→namespace debug_intelligence {
+    26→
+    27→/**
+    28→ * Result of a capture operation
+    29→ */
+    30→struct CaptureResult {
+    31→    bool success;
+    32→    std::string message;
+    33→    std::string captured_path;
+    34→    size_t bytes_captured;
+    35→    
+    36→    static CaptureResult ok(const std::string& path = "", size_t bytes = 0) {
+    37→        return {true, "Capture successful", path, bytes};
+    38→    }
+    39→    
+    40→    static CaptureResult error(const std::string& msg) {
+    41→        return {false, msg, "", 0};
+    42→    }
+    43→};
+    44→
+    45→/**
+    46→ * Experiment Recorder - Main interface for capturing experiment data
+    47→ */
+    48→class ExperimentRecorder {
+    49→public:
+    50→    explicit ExperimentRecorder(const fs::path& base_dir)
+    51→        : m_base_dir(base_dir), m_initialized(false) {}
+    52→    
+    53→    /**
+    54→     * Initialize recorder directory structure
+    55→     */
+    56→    bool initialize() {
+    57→        try {
+    58→            m_evidence_dir = m_base_dir / EVIDENCE_DIR;
+    59→            m_screenshots_dir = m_base_dir / SCREENSHOTS_DIR;
+    60→            m_logs_dir = m_base_dir / LOGS_DIR;
+    61→            
+    62→            fs::create_directories(m_evidence_dir);
+    63→            fs::create_directories(m_screenshots_dir);
+    64→            fs::create_directories(m_logs_dir);
+    65→            
+    66→            m_initialized = true;
+    67→            return true;
+    68→        } catch (const fs::filesystem_error& e) {
+    69→            m_last_error = e.what();
+    70→            return false;
+    71→        }
+    72→    }
+    73→    
+    74→    // ========================================================================
+    75→    // Build Configuration Capture
+    76→    // ========================================================================
+    77→    
+    78→    /**
+    79→     * Capture current build configuration from environment
+    80→     */
+    81→    BuildConfiguration captureBuildConfig() const {
+    82→        BuildConfiguration config;
+    83→        
+    84→        // Compiler information
+    85→        config.compiler = getEnvOrDefault("CXX", "g++");
+    86→        config.compiler_version = captureCompilerVersion();
+    87→        
+    88→        // Build type
+    89→        config.build_type = getEnvOrDefault("CMAKE_BUILD_TYPE", "Debug");
+    90→        
+    91→        // CMake arguments
+    92→        config.cmake_args = getEnvOrDefault("CMAKE_ARGS", "");
+    93→        
+    94→        // C++ standard
+    95→        config.cxx_standard = getEnvOrDefault("CXX_STANDARD", "17");
+    96→        
+    97→        // Git information
+    98→        captureGitInfo(config);
+    99→        
+   100→        // Compiler defines (from common build systems)
+   101→        captureCompilerDefines(config);
+   102→        
+   103→        return config;
+   104→    }
+   105→    
+   106→    /**
+   107→     * Parse build configuration from CMake cache file
+   108→     */
+   109→    std::optional<BuildConfiguration> parseFromCmakeCache(const fs::path& cmake_cache_path) const {
+   110→        if (!fs::exists(cmake_cache_path)) {
+   111→            return std::nullopt;
+   112→        }
+   113→        
+   114→        BuildConfiguration config;
+   115→        std::ifstream file(cmake_cache_path);
+   116→        if (!file.is_open()) {
+   117→            return std::nullopt;
+   118→        }
+   119→        
+   120→        std::string line;
+   121→        while (std::getline(file, line)) {
+   122→            // CMake cache format: NAME:TYPE=value
+   123→            auto colon_pos = line.find(':');
+   124→            if (colon_pos == std::string::npos) continue;
+   125→            
+   126→            auto eq_pos = line.find('=', colon_pos);
+   127→            if (eq_pos == std::string::npos) continue;
+   128→            
+   129→            std::string name = line.substr(0, colon_pos);
+   130→            std::string value = line.substr(eq_pos + 1);
+   131→            
+   132→            if (name == "CMAKE_BUILD_TYPE") {
+   133→                config.build_type = value;
+   134→            } else if (name == "CMAKE_CXX_COMPILER") {
+   135→                config.compiler = value;
+   136→            } else if (name == "CMAKE_CXX_STANDARD") {
+   137→                config.cxx_standard = value;
+   138→            }
+   139→        }
+   140→        
+   141→        // Also capture git info for this source tree
+   142→        auto parent_dir = cmake_cache_path.parent_path();
+   143→        captureGitInfo(config, parent_dir);
+   144→        
+   145→        return config;
+   146→    }
+   147→    
+   148→    // ========================================================================
+   149→    // Environment Capture
+   150→    // ========================================================================
+   151→    
+   152→    /**
+   153→     * Capture current environment snapshot
+   154→     */
+   155→    EnvironmentSnapshot captureEnvironment() const {
+   156→        EnvironmentSnapshot env;
+   157→        
+   158→        // Capture all environment variables (filtering sensitive ones)
+   159→        extern char** environ;
+   160→        if (environ) {
+   161→            for (char** env_var = environ; *env_var; ++env_var) {
+   162→                std::string entry(*env_var);
+   163→                auto eq_pos = entry.find('=');
+   164→                if (eq_pos != std::string::npos) {
+   165→                    std::string name = entry.substr(0, eq_pos);
+   166→                    std::string value = entry.substr(eq_pos + 1);
+   167→                    
+   168→                    // Skip sensitive variables but record they exist
+   169→                    if (isSensitive(name)) {
+   170→                        env.variables[name] = "[REDACTED]";
+   171→                    } else {
+   172→                        env.variables[name] = value;
+   173→                    }
+   174→                }
+   175→            }
+   176→        }
+   177→        
+   178→        // System information
+   179→        env.os_name = captureOsName();
+   180→        env.architecture = captureArchitecture();
+   181→        env.hostname = captureHostname();
+   182→        env.cpu_count = std::thread::hardware_concurrency();
+   183→        env.total_memory_mb = captureTotalMemoryMB();
+   184→        
+   185→        return env;
+   186→    }
+   187→    
+   188→    /**
+   189→     * Capture specific environment variable as evidence
+   190→     */
+   191→    Evidence captureEnvironmentVar(const std::string& var_name) const {
+   192→        Evidence evd;
+   193→        evd.type = EvidenceType::EnvironmentVariable;
+   194→        evd.description = "Environment variable: " + var_name;
+   195→        
+   196→        const char* value = std::getenv(var_name.c_str());
+   197→        if (value) {
+   198→            if (isSensitive(var_name)) {
+   199→                evd.content = "[REDACTED]";
+   200→                evd.tags["sensitive"] = "true";
+   201→            } else {
+   202→                evd.content = value;
+   203→            }
+   204→            evd.severity = Severity::Info;
+   205→        } else {
+   206→            evd.content = "[NOT SET]";
+   207→            evd.severity = Severity::Warning;
+   208→        }
+   209→        
+   210→        evd.source_path = var_name;
+   211→        evd.tags["variable_name"] = var_name;
+   212→        
+   213→        return evd;
+   214→    }
+   215→    
+   216→    // ========================================================================
+   217→    // Log Capture
+   218→    // ========================================================================
+   219→    
+   220→    /**
+   221→     * Copy log file into evidence store
+   222→     */
+   223→    CaptureResult captureLogFile(const fs::path& log_path, const std::string& description = "") const {
+   224→        if (!m_initialized) {
+   225→            return CaptureResult::error("Recorder not initialized");
+   226→        }
+   227→        
+   228→        if (!fs::exists(log_path)) {
+   229→            return CaptureResult::error("Log file does not exist: " + log_path.string());
+   230→        }
+   231→        
+   232→        try {
+   233→            fs::path dest = m_logs_dir / log_path.filename();
+   234→            
+   235→            // If file exists, add timestamp to avoid overwriting
+   236→            if (fs::exists(dest)) {
+   237→                dest = m_logs_dir / (log_path.stem().string() + "_" + Timestamp::fileFriendly() + log_path.extension().string());
+   238→            }
+   239→            
+   240→            fs::copy_file(log_path, dest);
+   241→            
+   242→            auto file_size = fs::file_size(dest);
+   243→            return CaptureResult::ok(dest.string(), file_size);
+   244→        } catch (const fs::filesystem_error& e) {
+   245→            return CaptureResult::error(e.what());
+   246→        }
+   247→    }
+   248→    
+   249→    /**
+   250→     * Create evidence from log content string
+   251→     */
+   252→    Evidence createLogEvidence(const std::string& content, const std::string& description, Severity severity = Severity::Info) const {
+   253→        Evidence evd;
+   254→        evd.type = EvidenceType::LogEntry;
+   255→        evd.description = description.empty() ? "Runtime log entry" : description;
+   256→        evd.content = content;
+   257→        evd.severity = severity;
+   258→        evd.verified = true;
+   259→        
+   260→        // Auto-detect severity from content
+   261→        if (content.find("ERROR") != std::string::npos || 
+   262→            content.find("FATAL") != std::string::npos ||
+   263→            content.find("CRASH") != std::string::npos) {
+   264→            evd.severity = std::max(evd.severity, Severity::Error);
+   265→        }
+   266→        if (content.find("WARNING") != std::string::npos || 
+   267→            content.find("WARN") != std::string::npos) {
+   268→            evd.severity = std::max(evd.severity, Severity::Warning);
+   269→        }
+   270→        
+   271→        return evd;
+   272→    }
+   273→    
+   274→    /**
+   275→     * Append to experiment log file
+   276→     */
+   277→    bool appendToExperimentLog(const std::string& message, const std::string& log_name = "experiment.log") const {
+   278→        if (!m_initialized) return false;
+   279→        
+   280→        fs::path log_path = m_logs_dir / log_name;
+   281→        try {
+   282→            std::ofstream file(log_path, std::ios::app);
+   283→            if (file.is_open()) {
+   284→                file << "[" << Timestamp::now() << "] " << message << "\n";
+   285→                return true;
+   286→            }
+   287→        } catch (...) {}
+   288→        return false;
+   289→    }
+   290→    
+   291→    // ========================================================================
+   292→    // Screenshot Capture
+   293→    // ========================================================================
+   294→    
+   295→    /**
+   296→     * Register screenshot file in evidence store
+   297→     * Note: Actual screenshot capture is platform-specific; this registers an existing screenshot
+   298→     */
+   299→    CaptureResult registerScreenshot(const fs::path& screenshot_path, const std::string& description = "") const {
+   300→        if (!m_initialized) {
+   301→            return CaptureResult::error("Recorder not initialized");
+   302→        }
+   303→        
+   304→        if (!fs::exists(screenshot_path)) {
+   305→            return CaptureResult::error("Screenshot file does not exist: " + screenshot_path.string());
+   306→        }
+   307→        
+   308→        try {
+   309→            fs::path dest = m_screenshots_dir / screenshot_path.filename();
+   310→            
+   311→            if (fs::exists(dest)) {
+   312→                dest = m_screenshots_dir / (screenshot_path.stem().string() + "_" + Timestamp::fileFriendly() + screenshot_path.extension().string());
+   313→            }
+   314→            
+   315→            fs::copy_file(screenshot_path, dest);
+   316→            
+   317→            auto file_size = fs::file_size(dest);
+   318→            return CaptureResult::ok(dest.string(), file_size);
+   319→        } catch (const fs::filesystem_error& e) {
+   320→            return CaptureResult::error(e.what());
+   321→        }
+   322→    }
+   323→    
+   324→    /**
+   325→     * Create screenshot evidence entry
+   326→     */
+   327→    Evidence createScreenshotEvidence(const fs::path& screenshot_path, const std::string& description = "") const {
+   328→        Evidence evd;
+   329→        evd.type = EvidenceType::Screenshot;
+   330→        evd.description = description.empty() ? "Screenshot" : description;
+   331→        evd.source_path = screenshot_path.string();
+   332→        
+   333→        // Store file info as content (actual image stored separately)
+   334→        if (fs::exists(screenshot_path)) {
+   335→            evd.content = "File: " + screenshot_path.filename().string() + 
+   336→                         " Size: " + std::to_string(fs::file_size(screenshot_path)) + " bytes";
+   337→            evd.verified = true;
+   338→        } else {
+   339→            evd.content = "[File not found]";
+   340→            evd.verified = false;
+   341→            evd.severity = Severity::Warning;
+   342→        }
+   343→        
+   344→        return evd;
+   345→    }
+   346→    
+   347→    // ========================================================================
+   348→    // Crash State Capture
+   349→    // ========================================================================
+   350→    
+   351→    /**
+   352→     * Create crash state evidence from components
+   353→     */
+   354→    CrashState createCrashState(
+   355→        const std::string& signal_type,
+   356→        const std::string& signal_number,
+   357→        const std::string& fault_address = "",
+   358→        const std::vector<std::string>& stack_trace = {},
+   359→        const std::vector<std::string>& registers = {}) const {
+   360→        
+   361→        CrashState crash;
+   362→        crash.signal_type = signal_type;
+   363→        crash.signal_number = signal_number;
+   364→        crash.fault_address = fault_address;
+   365→        crash.stack_trace = stack_trace;
+   366→        crash.registers = registers;
+   367→        crash.timestamp = Timestamp::now();
+   368→        return crash;
+   369→    }
+   370→    
+   371→    /**
+   372→     * Convert crash state to evidence
+   373→     */
+   374→    Evidence createCrashEvidence(const CrashState& crash) const {
+   375→        Evidence evd;
+   376→        evd.type = EvidenceType::CrashDump;
+   377→        evd.description = "Crash: " + crash.signal_type + " (" + crash.signal_number + ")";
+   378→        evd.severity = Severity::Critical;
+   379→        
+   380→        std::stringstream ss;
+   381→        ss << "{\n";
+   382→        ss << "  \"signal_type\": \"" << crash.signal_type << "\",\n";
+   383→        ss << "  \"signal_number\": \"" << crash.signal_number << "\",\n";
+   384→        ss << "  \"fault_address\": \"" << crash.fault_address << "\",\n";
+   385→        ss << "  \"timestamp\": \"" << crash.timestamp << "\",\n";
+   386→        
+   387→        if (!crash.stack_trace.empty()) {
+   388→            ss << "  \"stack_trace\": [\n";
+   389→            for (size_t i = 0; i < crash.stack_trace.size(); ++i) {
+   390→                ss << "    \"" << crash.stack_trace[i] << "\"";
+   391→                if (i < crash.stack_trace.size() - 1) ss << ",";
+   392→                ss << "\n";
+   393→            }
+   394→            ss << "  ],\n";
+   395→        }
+   396→        
+   397→        if (!crash.registers.empty()) {
+   398→            ss << "  \"registers\": {\n";
+   399→            for (size_t i = 0; i < crash.registers.size(); ++i) {
+   400→                ss << "    " << crash.registers[i];
+   401→                if (i < crash.registers.size() - 1) ss << ",";
+   402→                ss << "\n";
+   403→            }
+   404→            ss << "  }\n";
+   405→        }
+   406→        
+   407→        ss << "}";
+   408→        evd.content = ss.str();
+   409→        evd.verified = true;
+   410→        
+   411→        return evd;
+   412→    }
+   413→    
+   414→    /**
+   415→     * Parse crash log file into CrashState
+   416→     */
+   417→    std::optional<CrashState> parseCrashLog(const fs::path& crash_log_path) const {
+   418→        if (!fs::exists(crash_log_path)) {
+   419→            return std::nullopt;
+   420→        }
+   421→        
+   422→        std::ifstream file(crash_log_path);
+   423→        if (!file.is_open()) {
+   424→            return std::nullopt;
+   425→        }
+   426→        
+   427→        CrashState crash;
+   428→        crash.crash_log_path = crash_log_path.string();
+   429→        
+   430→        std::string line;
+   431→        bool in_stack_trace = false;
+   432→        bool in_registers = false;
+   433→        
+   434→        while (std::getline(file, line)) {
+   435→            // Try to detect signal info
+   436→            if (line.find("Signal") != std::string::npos || line.find("SIGSEGV") != std::string::npos ||
+   437→                line.find("SIGABRT") != std::string::npos || line.find("SIGBUS") != std::string::npos) {
+   438→                crash.signal_type = line;
+   439→            }
+   440→            
+   441→            // Detect fault address
+   442→            if (line.find("fault") != std::string::npos || line.find("address") != std::string::npos) {
+   443→                crash.fault_address = line;
+   444→            }
+   445→            
+   446→            // Detect stack trace start
+   447→            if (line.find("Stack trace") != std::string::npos || 
+   448→                line.find("#0") != std::string::npos ||
+   449→                line.find("Backtrace") != std::string::npos) {
+   450→                in_stack_trace = true;
+   451→                in_registers = false;
+   452→            }
+   453→            
+   454→            // Detect register section
+   455→            if (line.find("register") != std::string::npos && !in_stack_trace) {
+   456→                in_registers = true;
+   457→            }
+   458→            
+   459→            if (in_stack_trace && !line.empty()) {
+   460→                crash.stack_trace.push_back(line);
+   461→            }
+   462→            
+   463→            if (in_registers && !line.empty() && line.find(':') != std::string::npos) {
+   464→                crash.registers.push_back(line);
+   465→            }
+   466→        }
+   467→        
+   468→        if (crash.signal_type.empty()) {
+   469→            return std::nullopt;  // Not a valid crash log
+   470→        }
+   471→        
+   472→        return crash;
+   473→    }
+   474→    
+   475→    // ========================================================================
+   476→    // EXP Package Generation
+   477→    // ========================================================================
+   478→    
+   479→    /**
+   480→     * Generate complete EXP package from experiment record
+   481→     * Returns path to generated package
+   482→     */
+   483→    std::optional<fs::path> generateExpPackage(const ExperimentRecord& record) const {
+   484→        if (!m_initialized) {
+   485→            return std::nullopt;
+   486→        }
+   487→        
+   488→        try {
+   489→            std::string package_content = serializeExperimentToJson(record);
+   490→            
+   491→            fs::path package_path = m_base_dir / (record.id + EXP_PACKAGE_EXT);
+   492→            
+   493→            std::ofstream file(package_path);
+   494→            if (!file.is_open()) {
+   495→                return std::nullopt;
+   496→            }
+   497→            
+   498→            file << package_content;
+   499→            file.close();
+   500→            
+   501→            return package_path;
+   502→        } catch (...) {
+   503→            return std::nullopt;
+   504→        }
+   505→    }
+   506→    
+   507→    /**
+   508→     * Load existing EXP package
+   509→     */
+   510→    std::optional<ExperimentRecord> loadExpPackage(const fs::path& package_path) const {
+   511→        if (!fs::exists(package_path) || package_path.extension().string() != EXP_PACKAGE_EXT) {
+   512→            return std::nullopt;
+   513→        }
+   514→        
+   515→        std::ifstream file(package_path);
+   516→        if (!file.is_open()) {
+   517→            return std::nullopt;
+   518→        }
+   519→        
+   520→        std::stringstream buffer;
+   521→        buffer << file.rdbuf();
+   522→        
+   523→        return deserializeExperimentFromJson(buffer.str());
+   524→    }
+   525→    
+   526→    // ========================================================================
+   527→    // Utility Methods
+   528→    // ========================================================================
+   529→    
+   530→    fs::path getBaseDir() const { return m_base_dir; }
+   531→    fs::path getEvidenceDir() const { return m_evidence_dir; }
+   532→    fs::path getScreenshotsDir() const { return m_screenshots_dir; }
+   533→    fs::path getLogsDir() const { return m_logs_dir; }
+   534→    bool isInitialized() const { return m_initialized; }
+   535→    std::string getLastError() const { return m_last_error; }
+   536→    
+   537→private:
+   538→    fs::path m_base_dir;
+   539→    fs::path m_evidence_dir;
+   540→    fs::path m_screenshots_dir;
+   541→    fs::path m_logs_dir;
+   542→    bool m_initialized;
+   543→    mutable std::string m_last_error;
+   544→    
+   545→    // ========================================================================
+   546→    // Internal Helpers
+   547→    // ========================================================================
+   548→    
+   549→    std::string getEnvOrDefault(const std::string& name, const std::string& default_val) const {
+   550→        const char* val = std::getenv(name.c_str());
+   551→        return val ? std::string(val) : default_val;
+   552→    }
+   553→    
+   554→    bool isSensitive(const std::string& var_name) const {
+   555→        static const std::set<std::string> sensitive_patterns = {
+   556→            "PASSWORD", "PASSWD", "SECRET", "KEY", "TOKEN", "API_KEY",
+   557→            "API_SECRET", "AUTH", "CREDENTIAL", "PRIVATE"
+   558→        };
+   559→        
+   560→        std::string upper = var_name;
+   561→        std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+   562→        
+   563→        for (const auto& pattern : sensitive_patterns) {
+   564→            if (upper.find(pattern) != std::string::npos) {
+   565→                return true;
+   566→            }
+   567→        }
+   568→        return false;
+   569→    }
+   570→    
+   571→    std::string captureCompilerVersion() const {
+   572→        // Try to get compiler version
+   573→        std::string compiler = getEnvOrDefault("CXX", "g++");
+   574→        std::string cmd = compiler + " --version";
+   575→        
+   576→        FILE* pipe = popen(cmd.c_str(), "r");
+   577→        if (!pipe) return "unknown";
+   578→        
+   579→        char buffer[256];
+   580→        std::string result;
+   581→        while (fgets(buffer, sizeof(buffer), pipe)) {
+   582→            result += buffer;
+   583→        }
+   584→        pclose(pipe);
+   585→        
+   586→        // Just take first line
+   587→        auto newline_pos = result.find('\n');
+   588→        if (newline_pos != std::string::npos) {
+   589→            result = result.substr(0, newline_pos);
+   590→        }
+   591→        
+   592→        return result.empty() ? "unknown" : result;
+   593→    }
+   594→    
+   595→    void captureGitInfo(BuildConfiguration& config, const fs::path& repo_path = fs::current_path()) const {
+   596→        auto runGitCommand = [&](const std::string& arg) -> std::string {
+   597→            std::string cmd = "git -C " + repo_path.string() + " " + arg + " 2>/dev/null";
+   598→            FILE* pipe = popen(cmd.c_str(), "r");
+   599→            if (!pipe) return "";
+   600→            
+   601→            char buffer[256];
+   602→            std::string result;
+   603→            if (fgets(buffer, sizeof(buffer), pipe)) {
+   604→                result = buffer;
+   605→                // Trim newline
+   606→                while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
+   607→                    result.pop_back();
+   608→                }
+   609→            }
+   610→            pclose(pipe);
+   611→            return result;
+   612→        };
+   613→        
+   614→        config.git_commit_hash = runGitCommand("rev-parse HEAD");
+   615→        config.git_branch = runGitCommand("rev-parse --abbrev-ref HEAD");
+   616→        config.git_commit_message = runGitCommand("log -1 --pretty=%B");
+   617→        config.is_dirty = !runGitCommand("status --porcelain").empty();
+   618→    }
+   619→    
+   620→    void captureCompilerDefines(BuildConfiguration& config) const {
+   621→        // Common debug/release defines based on build type
+   622→        if (config.build_type == "Debug") {
+   623→            config.defines.push_back("_DEBUG");
+   624→            config.defines.push_back("DEBUG");
+   625→        } else if (config.build_type == "Release") {
+   626→            config.defines.push_back("NDEBUG");
+   627→        }
+   628→        
+   629→        // Platform-specific
+   630→#ifdef _WIN32
+   631→        config.defines.push_back("_WIN32");
+   632→#elif __linux__
+   633→        config.defines.push_back("__linux__");
+   634→#endif
+   635→    }
+   636→    
+   637→    std::string captureOsName() const {
+   638→#ifdef _WIN32
+   639→        return "Windows";
+   640→#elif __APPLE__
+   641→        return "macOS";
+   642→#elif __linux__
+   643→        // Try to read from /etc/os-release
+   644→        std::ifstream file("/etc/os-release");
+   645→        if (file.is_open()) {
+   646→            std::string line;
+   647→            while (std::getline(file, line)) {
+   648→                if (line.find("PRETTY_NAME=") == 0) {
+   649→                    auto start = line.find('"') + 1;
+   650→                    auto end = line.rfind('"');
+   651→                    if (start != std::string::npos && end != std::string::npos && end > start) {
+   652→                        return line.substr(start, end - start);
+   653→                    }
+   654→                }
+   655→            }
+   656→        }
+   657→        return "Linux";
+   658→#else
+   659→        return "Unknown";
+   660→#endif
+   661→    }
+   662→    
+   663→    std::string captureArchitecture() const {
+   664→#if defined(__x86_64__) || defined(_M_X64)
+   665→        return "x86_64";
+   666→#elif defined(__aarch64__) || defined(_M_ARM64)
+   667→        return "ARM64";
+   668→#elif defined(__i386__) || defined(_M_IX86)
+   669→        return "x86";
+   670→#elif defined(__arm__) || defined(_M_ARM)
+   671→        return "ARM";
+   672→#else
+   673→        return "Unknown";
+   674→#endif
+   675→    }
+   676→    
+   677→    std::string captureHostname() const {
+   678→        char buffer[256];
+   679→        if (gethostname(buffer, sizeof(buffer)) == 0) {
+   680→            return std::string(buffer);
+   681→        }
+   682→        return "unknown";
+   683→    }
+   684→    
+   685→    size_t captureTotalMemoryMB() const {
+   686→#if __linux__
+   687→        struct sysinfo mem_info;
+   688→        if (sysinfo(&mem_info) == 0) {
+   689→            return mem_info.totalram / 1024 / 1024;
+   690→        }
+   691→#endif
+   692→        return 0;
+   693→    }
+   694→    
+   695→    // ========================================================================
+   696→    // JSON Serialization (Simple implementation without external library)
+   697→    // ========================================================================
+   698→    
+   699→    std::string escapeJson(const std::string& input) const {
+   700→        std::string output;
+   701→        output.reserve(input.length() * 2);
+   702→        for (char c : input) {
+   703→            switch (c) {
+   704→                case '"': output += "\\\""; break;
+   705→                case '\\': output += "\\\\"; break;
+   706→                case '\b': output += "\\b"; break;
+   707→                case '\f': output += "\\f"; break;
+   708→                case '\n': output += "\\n"; break;
+   709→                case '\r': output += "\\r"; break;
+   710→                case '\t': output += "\\t"; break;
+   711→                default:
+   712→                    if ('\x00' <= c && c <= '\x1f') {
+   713→                        char buf[8];
+   714→                        snprintf(buf, sizeof(buf), "\\u%04x", (unsigned)c);
+   715→                        output += buf;
+   716→                    } else {
+   717→                        output += c;
+   718→                    }
+   719→            }
+   720→        }
+   721→        return output;
+   722→    }
+   723→    
+   724→    std::string serializeExperimentToJson(const ExperimentRecord& record) const {
+   725→        std::stringstream json;
+   726→        json << "{\n";
+   727→        
+   728→        // Basic info
+   729→        json << "  \"id\": \"" << escapeJson(record.id) << "\",\n";
+   730→        json << "  \"title\": \"" << escapeJson(record.title) << "\",\n";
+   731→        json << "  \"description\": \"" << escapeJson(record.description) << "\",\n";
+   732→        json << "  \"status\": \"" << escapeJson(record.status) << "\",\n";
+   733→        json << "  \"created_at\": \"" << escapeJson(record.created_at) << "\",\n";
+   734→        json << "  \"updated_at\": \"" << escapeJson(record.updated_at) << "\",\n";
+   735→        json << "  \"completed_at\": \"" << escapeJson(record.completed_at) << "\",\n";
+   736→        json << "  \"issue_reference\": \"" << escapeJson(record.issue_reference) << "\",\n";
+   737→        
+   738→        // Build configuration
+   739→        json << "  \"build_config\": {\n";
+   740→        auto build_map = record.build_config.toMap();
+   741→        for (auto it = build_map.begin(); it != build_map.end(); ++it) {
+   742→            json << "    \"" << escapeJson(it->first) << "\": \"" << escapeJson(it->second) << "\"";
+   743→            if (std::next(it) != build_map.end()) json << ",";
+   744→            json << "\n";
+   745→        }
+   746→        json << "  },\n";
+   747→        
+   748→        // Environment (selective - skip full dump for privacy)
+   749→        json << "  \"environment\": {\n";
+   750→        json << "    \"os_name\": \"" << escapeJson(record.environment.os_name) << "\",\n";
+   751→        json << "    \"architecture\": \"" << escapeJson(record.environment.architecture) << "\",\n";
+   752→        json << "    \"hostname\": \"" << escapeJson(record.environment.hostname) << "\",\n";
+   753→        json << "    \"cpu_count\": " << record.environment.cpu_count << ",\n";
+   754→        json << "    \"total_memory_mb\": " << record.environment.total_memory_mb << ",\n";
+   755→        json << "    \"timestamp\": \"" << escapeJson(record.environment.timestamp) << "\"\n";
+   756→        json << "  },\n";
+   757→        
+   758→        // Evidence count
+   759→        json << "  \"evidence_count\": " << record.evidences.size() << ",\n";
+   760→        
+   761→        // Evidence list (summary)
+   762→        json << "  \"evidences\": [\n";
+   763→        auto all_evidence = record.evidences.all();
+   764→        for (size_t i = 0; i < all_evidence.size(); ++i) {
+   765→            const auto& evd = all_evidence[i];
+   766→            json << "    {\n";
+   767→            auto evd_map = evd.toMap();
+   768→            for (auto it = evd_map.begin(); it != evd_map.end(); ++it) {
+   769→                json << "      \"" << escapeJson(it->first) << "\": \"" << escapeJson(it->second) << "\"";
+   770→                if (std::next(it) != evd_map.end()) json << ",";
+   771→                json << "\n";
+   772→            }
+   773→            json << "    }";
+   774→            if (i < all_evidence.size() - 1) json << ",";
+   775→            json << "\n";
+   776→        }
+   777→        json << "  ],\n";
+   778→        
+   779→        // Hypotheses
+   780→        json << "  \"hypotheses\": [\n";
+   781→        auto all_hyps = record.hypotheses.all();
+   782→        for (size_t i = 0; i < all_hyps.size(); ++i) {
+   783→            const auto& hyp = all_hyps[i];
+   784→            json << "    {\n";
+   785→            json << "      \"id\": \"" << escapeJson(hyp.id) << "\",\n";
+   786→            json << "      \"title\": \"" << escapeJson(hyp.title) << "\",\n";
+   787→            json << "      \"description\": \"" << escapeJson(hyp.description) << "\",\n";
+   788→            json << "      \"status\": \"" << Hypothesis::statusToString(hyp.status) << "\",\n";
+   789→            json << "      \"confidence_score\": " << hyp.confidence_score << ",\n";
+   790→            json << "      \"supporting_evidence_count\": " << hyp.supporting_evidence_ids.size() << ",\n";
+   791→            json << "      \"refuting_evidence_count\": " << hyp.refuting_evidence_ids.size() << "\n";
+   792→            json << "    }";
+   793→            if (i < all_hyps.size() - 1) json << ",";
+   794→            json << "\n";
+   795→        }
+   796→        json << "  ],\n";
+   797→        
+   798→        // Tags
+   799→        json << "  \"tags\": [";
+   800→        for (size_t i = 0; i < record.tags.size(); ++i) {
+   801→            json << "\"" << escapeJson(record.tags[i]) << "\"";
+   802→            if (i < record.tags.size() - 1) json << ", ";
+   803→        }
+   804→        json << "],\n";
+   805→        
+   806→        // Metadata
+   807→        json << "  \"metadata\": {\n";
+   808→        json << "    \"generator_version\": \"" << VERSION << "\",\n";
+   809→        json << "    \"generated_at\": \"" << Timestamp::now() << "\"\n";
+   810→        json << "  }\n";
+   811→        
+   812→        json << "}\n";
+   813→        return json.str();
+   814→    }
+   815→    
+   816→    std::optional<ExperimentRecord> deserializeExperimentFromJson(const std::string& json_str) const {
+   817→        // Simple JSON parser for our specific format
+   818→        // In production, use nlohmann/json or similar
+   819→        
+   820→        ExperimentRecord record;
+   821→        
+   822→        // Extract basic fields with simple string search
+   823→        auto extractString = [&json_str](const std::string& key) -> std::string {
+   824→            std::string search = "\"" + key + "\": \"";
+   825→            auto pos = json_str.find(search);
+   826→            if (pos == std::string::npos) return "";
+   827→            
+   828→            pos += search.length();
+   829→            auto end = json_str.find("\"", pos);
+   830→            if (end == std::string::npos) return "";
+   831→            
+   832→            std::string result = json_str.substr(pos, end - pos);
+   833→            // Unescape
+   834→            size_t found = 0;
+   835→            while ((found = result.find("\\\"", found)) != std::string::npos) {
+   836→                result.replace(found, 2, "\"");
+   837→            }
+   838→            return result;
+   839→        };
+   840→        
+   841→        record.id = extractString("id");
+   842→        record.title = extractString("title");
+   843→        record.description = extractString("description");
+   844→        record.status = extractString("status");
+   845→        record.created_at = extractString("created_at");
+   846→        record.updated_at = extractString("updated_at");
+   847→        record.issue_reference = extractString("issue_reference");
+   848→        
+   849→        if (record.id.empty()) {
+   850→            return std::nullopt;  // Invalid format
+   851→        }
+   852→        
+   853→        return record;
+   854→    }
+   855→};
+   856→
+   857→} // namespace debug_intelligence
+   858→

@@ -1,0 +1,633 @@
+     1→/**
+     2→ * Root Cause Report Generator Module
+     3→ * 
+     4→ * Generates comprehensive EXP reports including:
+     5→ * - Timeline of investigation
+     6→ * - Evidence summary
+     7→ * - Hypothesis tracking (confirmed/rejected)
+     8→ * - Final root cause analysis
+     9→ * - Recommendations
+    10→ */
+    11→
+    12→#pragma once
+    13→
+    14→#include "debug_intelligence.hpp"
+    15→#include <iomanip>
+    16→#include <numeric>
+    17→
+    18→namespace debug_intelligence {
+    19→
+    20→/**
+    21→ * Report configuration options
+    22→ */
+    23→struct ReportConfig {
+    24→    bool include_full_evidence;      // Include complete evidence content
+    25→    bool include_raw_logs;           // Include raw log files
+    26→    bool include_timeline;           // Include investigation timeline
+    27→    bool include_rejected;           // Include rejected hypotheses
+    28→    bool include_recommendations;    // Include fix recommendations
+    29→    bool ai_friendly_format;         // Format optimized for LLM parsing
+    30→    int max_evidence_detail_length;  // Truncate long evidence content
+    31→    
+    32→    static ReportConfig detailed() {
+    33→        return {true, true, true, true, true, true, 10000};
+    34→    }
+    35→    
+    36→    static ReportConfig summary() {
+    37→        return {false, false, true, true, true, true, 500};
+    38→    }
+    39→    
+    40→    static ReportConfig minimal() {
+    41→        return {false, false, false, false, true, false, 200};
+    42→    }
+    43→    
+    44→    static ReportConfig defaultConfig() {
+    45→        return {true, false, true, true, true, true, 2000};
+    46→    }
+    47→};
+    48→
+    49→/**
+    50→ * Report generation statistics
+    51→ */
+    52→struct ReportStats {
+    53→    int total_hypotheses;
+    54→    int confirmed_hypotheses;
+    55→    int rejected_hypotheses;
+    56→    int open_hypotheses;
+    57→    size_t total_evidence;
+    58→    size_t key_evidence_count;
+    59→    size_t timeline_events;
+    60→    size_t report_size_bytes;
+    61→    
+    62→    double investigation_duration_hours;  // Time from first to last event
+    63→    
+    64→    std::string toString() const {
+    65→        std::stringstream ss;
+    66→        ss << "Report Statistics:\n";
+    67→        ss << "  Hypotheses: " << total_hypotheses << " total (" 
+    68→           << confirmed_hypotheses << " confirmed, "
+    69→           << rejected_hypotheses << " rejected, "
+    70→           << open_hypotheses << " open)\n";
+    71→        ss << "  Evidence: " << total_evidence << " total (" << key_evidence_count << " key)\n";
+    72→        ss << "  Timeline Events: " << timeline_events << "\n";
+    73→        ss << "  Investigation Duration: " << std::fixed << std::setprecision(2) 
+    74→           << investigation_duration_hours << " hours\n";
+    75→        ss << "  Report Size: " << report_size_bytes << " bytes\n";
+    76→        return ss.str();
+    77→    }
+    78→};
+    79→
+    80→/**
+    81→ * Root Cause Report Generator
+    82→ */
+    83→class ReportGenerator {
+    84→public:
+    85→    explicit ReportGenerator(const ReportConfig& config = ReportConfig::defaultConfig())
+    86→        : m_config(config) {}
+    87→    
+    88→    /**
+    89→     * Generate complete root cause report from experiment record
+    90→     */
+    91→    RootCauseReport generateReport(const ExperimentRecord& record) const {
+    92→        RootCauseReport report;
+    93→        
+    94→        report.experiment_id = record.id;
+    95→        report.title = record.title.empty() ? "Debug Investigation" : record.title;
+    96→        report.generated_at = Timestamp::now();
+    97→        
+    98→        // Build timeline from evidence and hypotheses
+    99→        buildTimeline(record, report);
+   100→        
+   101→        // Collect all hypotheses
+   102→        collectHypotheses(record, report);
+   103→        
+   104→        // Identify key evidence (high severity or attached to confirmed hypothesis)
+   105→        identifyKeyEvidence(record, report);
+   106→        
+   107→        // Determine root cause if we have a confirmed hypothesis
+   108→        determineRootCause(report);
+   109→        
+   110→        // Generate recommendations
+   111→        generateRecommendations(record, report);
+   112→        
+   113→        // Calculate metadata
+   114→        calculateStats(record, report);
+   115→        
+   116→        return report;
+   117→    }
+   118→    
+   119→    /**
+   120→     * Generate report as formatted text (for CLI output)
+   121→     */
+   122→    std::string generateTextReport(const RootCauseReport& report) const {
+   123→        std::stringstream output;
+   124→        
+   125→        // Header
+   126→        output << "=" << std::string(78, '=') << "\n";
+   127→        output << "  ROOT CAUSE ANALYSIS REPORT\n";
+   128→        output << "  Experiment: " << report.experiment_id << "\n";
+   129→        output << "  Generated: " << report.generated_at << "\n";
+   130→        output << "=" << std::string(78, '=') << "\n\n";
+   131→        
+   132→        // Executive Summary
+   133→        output << "EXECUTIVE SUMMARY\n";
+   134→        output << "-" << std::string(40, '-') << "\n";
+   135→        output << report.executive_summary << "\n\n";
+   136→        
+   137→        // Root Cause
+   138→        if (!report.root_cause_description.empty()) {
+   139→            output << "ROOT CAUSE\n";
+   140→            output << "-" << std::string(40, '-') << "\n";
+   141→            output << report.root_cause_description << "\n";
+   142→            output << "Confidence Level: " << std::fixed << std::setprecision(1) 
+   143→                   << (report.confidence_level * 100.0) << "%\n";
+   144→            output << "Confirmed Hypothesis ID: " << report.confirmed_hypothesis_id << "\n\n";
+   145→        }
+   146→        
+   147→        // Timeline
+   148→        if (m_config.include_timeline && !report.timeline.empty()) {
+   149→            output << "INVESTIGATION TIMELINE\n";
+   150→            output << "-" << std::string(40, '-') << "\n";
+   151→            
+   152→            for (const auto& event : report.timeline) {
+   153→                output << "[" << event.timestamp << "] ";
+   154→                output << "[" << event.event_type << "] ";
+   155→                output << event.description << "\n";
+   156→                
+   157→                if (m_config.ai_friendly_format && !event.metadata.empty()) {
+   158→                    for (const auto& [k, v] : event.metadata) {
+   159→                        output << "  " << k << ": " << truncateString(v, m_config.max_evidence_detail_length) << "\n";
+   160→                    }
+   161→                }
+   162→            }
+   163→            output << "\n";
+   164→        }
+   165→        
+   166→        // Key Evidence
+   167→        if (!report.key_evidence.empty()) {
+   168→            output << "KEY EVIDENCE\n";
+   169→            output << "-" << std::string(40, '-') << "\n";
+   170→            
+   171→            for (size_t i = 0; i < report.key_evidence.size(); ++i) {
+   172→                const auto& evd = report.key_evidence[i];
+   173→                output << i + 1 << ". [" << Evidence::severityToString(evd.severity) << "] " 
+   174→                       << evd.description << "\n";
+   175→                
+   176→                if (m_config.include_full_evidence) {
+   177→                    output << "   Content: " << truncateString(evd.content, m_config.max_evidence_detail_length) << "\n";
+   178→                }
+   179→                output << "   Source: " << evd.source_path << "\n";
+   180→                output << "   Verified: " << (evd.verified ? "Yes" : "No") << "\n";
+   181→                output << "\n";
+   182→            }
+   183→        }
+   184→        
+   185→        // Confirmed Hypothesis Details
+   186→        if (!report.all_hypotheses.empty()) {
+   187→            output << "HYPOTHESIS ANALYSIS\n";
+   188→            output << "-" << std::string(40, '-') << "\n";
+   189→            
+   190→            for (const auto& hyp : report.all_hypotheses) {
+   191→                if (hyp.status == InvestigationStatus::Confirmed) {
+   192→                    output << "[CONFIRMED] " << hyp.title << "\n";
+   193→                    output << "  Description: " << hyp.description << "\n";
+   194→                    output << "  Confidence: " << std::fixed << std::setprecision(1) 
+   195→                           << (hyp.confidence_score * 100.0) << "%\n";
+   196→                    
+   197→                    if (!hyp.supporting_evidence_ids.empty()) {
+   198→                        output << "  Supporting Evidence: " << hyp.supporting_evidence_ids.size() << " items\n";
+   199→                    }
+   200→                    output << "\n";
+   201→                }
+   202→            }
+   203→        }
+   204→        
+   205→        // Rejected Hypotheses
+   206→        if (m_config.include_rejected && !report.rejected_hypotheses.empty()) {
+   207→            output << "REJECTED HYPOTHESES\n";
+   208→            output << "-" << std::string(40, '-') << "\n";
+   209→            
+   210→            for (const auto& hyp : report.rejected_hypotheses) {
+   211→                output << "[REJECTED] " << hyp.title << "\n";
+   212→                output << "  Reason: " << (hyp.notes.empty() ? "Not specified" : hyp.notes) << "\n";
+   213→                
+   214→                if (!hyp.refuting_evidence_ids.empty()) {
+   215→                    output << "  Refuting Evidence: " << hyp.refuting_evidence_ids.size() << " items\n";
+   216→                }
+   217→                output << "\n";
+   218→            }
+   219→        }
+   220→        
+   221→        // Recommendations
+   222→        if (m_config.include_recommendations && !report.recommended_fix.empty()) {
+   223→            output << "RECOMMENDATIONS\n";
+   224→            output << "-" << std::string(40, '-') << "\n";
+   225→            output << report.recommended_fix << "\n\n";
+   226→            
+   227→            if (!report.verification_steps.empty()) {
+   228→                output << "VERIFICATION STEPS:\n";
+   229→                output << report.verification_steps << "\n\n";
+   230→            }
+   231→        }
+   232→        
+   233→        // Lessons Learned
+   234→        if (!report.lessons_learned.empty()) {
+   235→            output << "LESSONS LEARNED\n";
+   236→            output << "-" << std::string(40, '-') << "\n";
+   237→            output << report.lessons_learned << "\n\n";
+   238→        }
+   239→        
+   240→        // Statistics
+   241→        if (report.metadata.count("stats")) {
+   242→            output << "STATISTICS\n";
+   243→            output << "-" << std::string(40, '-') << "\n";
+   244→            output << report.metadata.at("stats") << "\n";
+   245→        }
+   246→        
+   247→        // Footer
+   248→        output << "=" << std::string(78, '=') << "\n";
+   249→        output << "End of Report | Debug Intelligence Layer v" << VERSION << "\n";
+   250→        
+   251→        return output.str();
+   252→    }
+   253→    
+   254→    /**
+   255→     * Generate report as JSON (for AI consumption)
+   256→     */
+   257→    std::string generateJsonReport(const RootCauseReport& report) const {
+   258→        std::stringstream json;
+   259→        
+   260→        json << "{\n";
+   261→        
+   262→        // Basic info
+   263→        json << "  \"report_version\": \"1.0\",\n";
+   264→        json << "  \"experiment_id\": \"" << escapeJson(report.experiment_id) << "\",\n";
+   265→        json << "  \"generated_at\": \"" << escapeJson(report.generated_at) << "\",\n";
+   266→        json << "  \"title\": \"" << escapeJson(report.title) << "\",\n";
+   267→        
+   268→        // Summary section
+   269→        json << "  \"summary\": {\n";
+   270→        json << "    \"executive_summary\": \"" << escapeJson(report.executive_summary) << "\",\n";
+   271→        json << "    \"root_cause\": \"" << escapeJson(report.root_cause_description) << "\",\n";
+   272→        json << "    \"confidence_level\": " << report.confidence_level << ",\n";
+   273→        json << "    \"confirmed_hypothesis_id\": \"" << escapeJson(report.confirmed_hypothesis_id) << "\"\n";
+   274→        json << "  },\n";
+   275→        
+   276→        // Timeline
+   277→        if (m_config.include_timeline) {
+   278→            json << "  \"timeline\": [\n";
+   279→            for (size_t i = 0; i < report.timeline.size(); ++i) {
+   280→                const auto& evt = report.timeline[i];
+   281→                json << "    {\n";
+   282→                json << "      \"timestamp\": \"" << escapeJson(evt.timestamp) << "\",\n";
+   283→                json << "      \"type\": \"" << escapeJson(evt.event_type) << "\",\n";
+   284→                json << "      \"description\": \"" << escapeJson(evt.description) << "\"\n";
+   285→                json << "    }";
+   286→                if (i < report.timeline.size() - 1) json << ",";
+   287→                json << "\n";
+   288→            }
+   289→            json << "  ],\n";
+   290→        }
+   291→        
+   292→        // Key evidence
+   293→        json << "  \"key_evidence\": [\n";
+   294→        for (size_t i = 0; i < report.key_evidence.size(); ++i) {
+   295→            const auto& evd = report.key_evidence[i];
+   296→            json << "    {\n";
+   297→            json << "      \"id\": \"" << escapeJson(evd.id) << "\",\n";
+   298→            json << "      \"type\": \"" << Evidence::evidenceTypeToString(evd.type) << "\",\n";
+   299→            json << "      \"description\": \"" << escapeJson(evd.description) << "\",\n";
+   300→            json << "      \"severity\": \"" << Evidence::severityToString(evd.severity) << "\",\n";
+   301→            if (m_config.include_full_evidence) {
+   302→                json << "      \"content\": \"" << escapeJson(truncateString(evd.content, m_config.max_evidence_detail_length)) << "\",\n";
+   303→            }
+   304→            json << "      \"verified\": " << (evd.verified ? "true" : "false") << "\n";
+   305→            json << "    }";
+   306→            if (i < report.key_evidence.size() - 1) json << ",";
+   307→            json << "\n";
+   308→        }
+   309→        json << "  ],\n";
+   310→        
+   311→        // Hypotheses summary
+   312→        json << "  \"hypotheses\": {\n";
+   313→        json << "    \"confirmed\": " << countByStatus(report.all_hypotheses, InvestigationStatus::Confirmed) << ",\n";
+   314→        json << "    \"rejected\": " << countByStatus(report.all_hypotheses, InvestigationStatus::Rejected) << ",\n";
+   315→        json << "    \"open\": " << countByStatus(report.all_hypotheses, InvestigationStatus::Open) + 
+   316→                              countByStatus(report.all_hypotheses, InvestigationStatus::InProgress) << ",\n";
+   317→        json << "    \"total\": " << report.all_hypotheses.size() << "\n";
+   318→        json << "  },\n";
+   319→        
+   320→        // Rejected hypotheses detail
+   321→        if (m_config.include_rejected && !report.rejected_hypotheses.empty()) {
+   322→            json << "  \"rejected_hypotheses\": [\n";
+   323→            for (size_t i = 0; i < report.rejected_hypotheses.size(); ++i) {
+   324→                const auto& hyp = report.rejected_hypotheses[i];
+   325→                json << "    {\n";
+   326→                json << "      \"id\": \"" << escapeJson(hyp.id) << "\",\n";
+   327→                json << "      \"title\": \"" << escapeJson(hyp.title) << "\",\n";
+   328→                json << "      \"reason\": \"" << escapeJson(hyp.notes) << "\"\n";
+   329→                json << "    }";
+   330→                if (i < report.rejected_hypotheses.size() - 1) json << ",";
+   331→                json << "\n";
+   332→            }
+   333→            json << "  ],\n";
+   334→        }
+   335→        
+   336→        // Recommendations
+   337→        if (m_config.include_recommendations) {
+   338→            json << "  \"recommendations\": {\n";
+   339→            json << "    \"fix\": \"" << escapeJson(report.recommended_fix) << "\",\n";
+   340→            json << "    \"verification\": \"" << escapeJson(report.verification_steps) << "\",\n";
+   341→            json << "    \"lessons\": \"" << escapeJson(report.lessons_learned) << "\"\n";
+   342→            json << "  },\n";
+   343→        }
+   344→        
+   345→        // Upstream fixes
+   346→        if (!report.upstream_fixes.empty()) {
+   347→            json << "  \"upstream_fixes\": [\n";
+   348→            for (size_t i = 0; i < report.upstream_fixes.size(); ++i) {
+   349→                const auto& fix = report.upstream_fixes[i];
+   350→                json << "    {\n";
+   351→                json << "      \"reference\": \"" << escapeJson(fix.fix_reference) << "\",\n";
+   352→                json << "      \"title\": \"" << escapeJson(fix.title) << "\"\n";
+   353→                json << "    }";
+   354→                if (i < report.upstream_fixes.size() - 1) json << ",";
+   355→                json << "\n";
+   356→            }
+   357→            json << "  ],\n";
+   358→        }
+   359→        
+   360→        // Metadata
+   361→        json << "  \"metadata\": {\n";
+   362→        for (auto it = report.metadata.begin(); it != report.metadata.end(); ++it) {
+   363→            json << "    \"" << escapeJson(it->first) << "\": \"" << escapeJson(it->second) << "\"";
+   364→            if (std::next(it) != report.metadata.end()) json << ",";
+   365→            json << "\n";
+   366→        }
+   367→        json << "  }\n";
+   368→        
+   369→        json << "}\n";
+   370→        
+   371→        return json.str();
+   372→    }
+   373→    
+   374→    /**
+   375→     * Save report to file
+   376→     */
+   377→    bool saveReport(const RootCauseReport& report, const fs::path& output_path, bool as_json = false) const {
+   378→        try {
+   379→            std::ofstream file(output_path);
+   380→            if (!file.is_open()) return false;
+   381→            
+   382→            if (as_json) {
+   383→                file << generateJsonReport(report);
+   384→            } else {
+   385→                file << generateTextReport(report);
+   386→            }
+   387→            
+   388→            return true;
+   389→        } catch (...) {
+   390→            return false;
+   391→        }
+   392→    }
+   393→    
+   394→    /**
+   395→     * Get report statistics
+   396→     */
+   397→    ReportStats getStats(const RootCauseReport& report) const {
+   398→        ReportStats stats;
+   399→        
+   400→        stats.total_hypotheses = report.all_hypotheses.size();
+   401→        stats.confirmed_hypotheses = countByStatus(report.all_hypotheses, InvestigationStatus::Confirmed);
+   402→        stats.rejected_hypotheses = countByStatus(report.all_hypotheses, InvestigationStatus::Rejected);
+   403→        stats.open_hypotheses = countByStatus(report.all_hypotheses, InvestigationStatus::Open) +
+   404→                               countByStatus(report.all_hypotheses, InvestigationStatus::InProgress);
+   405→        stats.total_evidence = report.key_evidence.size();  // Would need full experiment for total
+   406→        stats.key_evidence_count = report.key_evidence.size();
+   407→        stats.timeline_events = report.timeline.size();
+   408→        
+   409→        // Estimate report size
+   410→        std::string report_str = generateTextReport(report);
+   411→        stats.report_size_bytes = report_str.length();
+   412→        
+   413→        // Calculate duration from timeline
+   414→        if (report.timeline.size() >= 2) {
+   415→            // Simple calculation - would need proper time parsing for accuracy
+   416→            stats.investigation_duration_hours = 0.0;  // Placeholder
+   417→        }
+   418→        
+   419→        return stats;
+   420→    }
+   421→
+   422→private:
+   423→    ReportConfig m_config;
+   424→    
+   425→    void buildTimeline(const ExperimentRecord& record, RootCauseReport& report) const {
+   426→        // Add creation event
+   427→        TimelineEvent create_evt;
+   428→        create_evt.timestamp = record.created_at;
+   429→        create_evt.event_type = "experiment_started";
+   430→        create_evt.description = "Experiment started: " + record.title;
+   431→        create_evt.reference_id = record.id;
+   432→        report.timeline.push_back(create_evt);
+   433→        
+   434→        // Add evidence events
+   435→        for (const auto& evd : record.evidences.all()) {
+   436→            report.timeline.push_back(TimelineEvent::evidenceAdded(evd));
+   437→        }
+   438→        
+   439→        // Add hypothesis events
+   440→        for (const auto& hyp : record.hypotheses.all()) {
+   441→            report.timeline.push_back(TimelineEvent::hypothesisCreated(hyp));
+   442→            
+   443→            if (hyp.status == InvestigationStatus::Confirmed) {
+   444→                report.timeline.push_back(TimelineEvent::hypothesisConfirmed(hyp));
+   445→            } else if (hyp.status == InvestigationStatus::Rejected) {
+   446→                report.timeline.push_back(TimelineEvent::hypothesisRejected(hyp));
+   447→            }
+   448→        }
+   449→        
+   450→        // Sort by timestamp
+   451→        std::sort(report.timeline.begin(), report.timeline.end(),
+   452→                 [](const TimelineEvent& a, const TimelineEvent& b) {
+   453→                     return a.timestamp < b.timestamp;
+   454→                 });
+   455→    }
+   456→    
+   457→    void collectHypotheses(const ExperimentRecord& record, RootCauseReport& report) const {
+   458→        report.all_hypotheses = record.hypotheses.all();
+   459→        
+   460→        // Separate rejected
+   461→        for (const auto& hyp : report.all_hypotheses) {
+   462→            if (hyp.status == InvestigationStatus::Rejected || 
+   463→                hyp.status == InvestigationStatus::Superseded) {
+   464→                report.rejected_hypotheses.push_back(hyp);
+   465→            }
+   466→        }
+   467→    }
+   468→    
+   469→    void identifyKeyEvidence(const ExperimentRecord& record, RootCauseReport& report) const {
+   470→        // Get high-severity evidence
+   471→        auto all_evd = record.evidences.all();
+   472→        
+   473→        // First pass: critical and error severity
+   474→        for (const auto& evd : all_evd) {
+   475→            if (evd.severity == Severity::Critical || evd.severity == Severity::Error) {
+   476→                report.key_evidence.push_back(evd);
+   477→            }
+   478→        }
+   479→        
+   480→        // Second pass: evidence attached to confirmed hypotheses
+   481→        for (const auto& hyp : record.hypotheses.getConfirmed()) {
+   482→            for (const auto& evd_id : hyp.supporting_evidence_ids) {
+   483→                auto evd = record.evidences.find(evd_id);
+   484→                if (evd) {
+   485→                    // Check if already added
+   486→                    bool found = false;
+   487→                    for (const auto& existing : report.key_evidence) {
+   488→                        if (existing.id == evd->id) {
+   489→                            found = true;
+   490→                            break;
+   491→                        }
+   492→                    }
+   493→                    if (!found) {
+   494→                        report.key_evidence.push_back(*evd);
+   495→                    }
+   496→                }
+   497→            }
+   498→        }
+   499→        
+   500→        // If no key evidence yet, take some warnings too
+   501→        if (report.key_evidence.empty()) {
+   502→            for (const auto& evd : all_evd) {
+   503→                if (evd.severity >= Severity::Warning) {
+   504→                    report.key_evidence.push_back(evd);
+   505→                    if (report.key_evidence.size() >= 5) break;  // Limit
+   506→                }
+   507→            }
+   508→        }
+   509→    }
+   510→    
+   511→    void determineRootCause(RootCauseReport& report) const {
+   512→        auto confirmed = [&]() -> std::optional<Hypothesis> {
+   513→            for (const auto& hyp : report.all_hypotheses) {
+   514→                if (hyp.status == InvestigationStatus::Confirmed) {
+   515→                    return hyp;
+   516→                }
+   517→            }
+   518→            return std::nullopt;
+   519→        }();
+   520→        
+   521→        if (confirmed) {
+   522→            report.root_cause_description = confirmed->description.empty() 
+   523→                ? confirmed->title 
+   524→                : confirmed->description;
+   525→            report.confirmed_hypothesis_id = confirmed->id;
+   526→            report.confidence_level = confirmed->confidence_score;
+   527→            
+   528→            // Build executive summary
+   529→            report.executive_summary = "Root cause identified: " + confirmed->title + ". " +
+   530→                "Investigation completed with " + std::to_string(report.all_hypotheses.size()) + 
+   531→                " hypotheses tested, " + std::to_string(report.rejected_hypotheses.size()) + " rejected.";
+   532→        } else if (!report.all_hypotheses.empty()) {
+   533→            // No confirmed hypothesis - report status
+   534→            report.executive_summary = "Investigation in progress: " + 
+   535→                std::to_string(report.all_hypotheses.size()) + " hypotheses under consideration. " +
+   536→                "No root cause confirmed yet.";
+   537→            report.root_cause_description = "Under investigation";
+   538→            report.confidence_level = 0.0;
+   539→        } else {
+   540→            report.executive_summary = "Experiment recorded but no hypotheses proposed yet.";
+   541→            report.root_cause_description = "Not determined";
+   542→        }
+   543→    }
+   544→    
+   545→    void generateRecommendations(const ExperimentRecord& record, RootCauseReport& report) const {
+   546→        // Find the confirmed hypothesis to base recommendations on
+   547→        for (const auto& hyp : record.hypotheses.getConfirmed()) {
+   548→            // Extract potential fix from hypothesis description/notes
+   549→            if (!hyp.notes.empty()) {
+   550→                report.recommended_fix = hyp.notes;
+   551→            } else {
+   552→                report.recommended_fix = "Address issue: " + hyp.title;
+   553→            }
+   554→            
+   555→            // Generic verification steps
+   556→            report.verification_steps = buildVerificationSteps(hyp);
+   557→            break;
+   558→        }
+   559→        
+   560→        // Lessons learned template
+   561→        if (!report.rejected_hypotheses.empty()) {
+   562→            std::stringstream lessons;
+   563→            lessons << "Investigation ruled out " << report.rejected_hypotheses.size() 
+   564→                    << " incorrect hypotheses before finding root cause.\n";
+   565→            
+   566→            // List what was learned from rejections
+   567→            for (const auto& rej : report.rejected_hypotheses) {
+   568→                if (!rej.notes.empty()) {
+   569→                    lessons << "- " << rej.notes << "\n";
+   570→                }
+   571→            }
+   572→            
+   573→            report.lessons_learned = lessons.str();
+   574→        }
+   575→    }
+   576→    
+   577→    std::string buildVerificationSteps(const Hypothesis& hyp) const {
+   578→        std::stringstream steps;
+   579→        steps << "1. Apply fix addressing: " << hyp.title << "\n";
+   580→        steps << "2. Rebuild with configuration matching this experiment\n";
+   581→        steps << "3. Reproduce original test case\n";
+   582→        steps << "4. Verify issue is resolved\n";
+   583→        steps << "5. Run regression tests\n";
+   584→        steps << "6. Document findings in EXP package\n";
+   585→        return steps.str();
+   586→    }
+   587→    
+   588→    void calculateStats(const ExperimentRecord& record, RootCauseReport& report) const {
+   589→        ReportStats stats = getStats(report);
+   590→        report.metadata["stats"] = stats.toString();
+   591→        report.metadata["generator_version"] = VERSION;
+   592→        report.metadata["total_evidence"] = std::to_string(record.evidences.size());
+   593→        report.metadata["total_hypotheses"] = std::to_string(record.hypotheses.size());
+   594→    }
+   595→    
+   596→    int countByStatus(const std::vector<Hypothesis>& hypotheses, InvestigationStatus status) const {
+   597→        return std::count_if(hypotheses.begin(), hypotheses.end(),
+   598→                            [status](const Hypothesis& h) { return h.status == status; });
+   599→    }
+   600→    
+   601→    std::string truncateString(const std::string& str, size_t max_len) const {
+   602→        if (str.length() <= max_len) return str;
+   603→        return str.substr(0, max_len) + "...[truncated]";
+   604→    }
+   605→    
+   606→    std::string escapeJson(const std::string& input) const {
+   607→        std::string output;
+   608→        output.reserve(input.length() * 2);
+   609→        for (char c : input) {
+   610→            switch (c) {
+   611→                case '"': output += "\\\""; break;
+   612→                case '\\': output += "\\\\"; break;
+   613→                case '\b': output += "\\b"; break;
+   614→                case '\f': output += "\\f"; break;
+   615→                case '\n': output += "\\n"; break;
+   616→                case '\r': output += "\\r"; break;
+   617→                case '\t': output += "\\t"; break;
+   618→                default:
+   619→                    if ('\x00' <= c && c <= '\x1f') {
+   620→                        char buf[8];
+   621→                        snprintf(buf, sizeof(buf), "\\u%04x", (unsigned)c);
+   622→                        output += buf;
+   623→                    } else {
+   624→                        output += c;
+   625→                    }
+   626→            }
+   627→        }
+   628→        return output;
+   629→    }
+   630→};
+   631→
+   632→} // namespace debug_intelligence
+   633→
