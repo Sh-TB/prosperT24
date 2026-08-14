@@ -1,0 +1,964 @@
+     1→/**
+     2→ * Causal Dependency Graph - Priority 6
+     3→ * 
+     4→ * PROBLEM SOLVED:
+     5→ * Emulator debugging is not normal application debugging.
+     6→ * Architecture has multiple layers:
+     7→ * 
+     8→ *   Guest Application
+     9→ *        ↓
+    10→ *   HLE (High-Level Emulation)
+    11→ *        ↓
+    12→ *   Kernel
+    13→ *        ↓
+    14→ *   Memory
+    15→ *        ↓
+    16→ *   CPU
+    17→ *        ↓
+    18→ *   GPU
+    19→ *        ↓
+    20→ *   Host System
+    21→ * 
+    22→ * A crash in one layer may originate elsewhere.
+    23→ * 
+    24→ * EXAMPLE:
+    25→ *   Crash: Allocator failure (Memory layer)
+    26→ *   Actual cause: GPU wrote into freed memory 20 seconds earlier (GPU layer)
+    27→ * 
+    28→ * This module builds and queries dependency graphs to trace root causes across layers.
+    29→ */
+    30→
+    31→#pragma once
+    32→
+    33→#include "../core/foundation.hpp"
+    34→#include <mutex>
+    35→#include <unordered_map>
+    36→#include <unordered_set>
+    37→#include <set>
+    38→#include <queue>
+    39→#include <functional>
+    40→#include <atomic>
+    41→#include <shared_mutex>
+    42→#include <thread>
+    43→
+    44→namespace prosper_debug {
+    45→namespace graph {
+    46→
+    47→// ============================================================================
+    48→// Layer Definitions
+    49→// ============================================================================
+    50→
+    51→enum class EmulationLayer : uint8_t {
+    52→    Guest,          // Game/application code
+    53→    HLE,            // High-level emulation functions
+    54→    Kernel,         // OS kernel simulation
+    55→    Memory,         // Memory management
+    56→    CPU,            // Processor emulation
+    57→    GPU,            // Graphics processing
+    58→    Audio,          // Sound processing
+    59→    Input,          // Input handling
+    60→    FileSystem,     // File system abstraction
+    61→    Network,        // Network stack
+    62→    Host,           // Host operating system
+    63→    Diagnostic      // Debug/diagnostic infrastructure
+    64→};
+    65→
+    66→inline std::string emulationLayerToString(EmulationLayer layer) {
+    67→    switch (layer) {
+    68→        case EmulationLayer::Guest: return "Guest";
+    69→        case EmulationLayer::HLE: return "HLE";
+    70→        case EmulationLayer::Kernel: return "Kernel";
+    71→        case EmulationLayer::Memory: return "Memory";
+    72→        case EmulationLayer::CPU: return "CPU";
+    73→        case EmulationLayer::GPU: return "GPU";
+    74→        case EmulationLayer::Audio: return "Audio";
+    75→        case EmulationLayer::Input: return "Input";
+    76→        case EmulationLayer::FileSystem: return "FileSystem";
+    77→        case EmulationLayer::Network: return "Network";
+    78→        case EmulationLayer::Host: return "Host";
+    79→        case EmulationLayer::Diagnostic: return "Diagnostic";
+    80→    }
+    81→    return "Unknown";
+    82→}
+    83→
+    84→inline EmulationLayer subsystemToLayer(Subsystem subs) {
+    85→    switch (subs) {
+    86→        case Subsystem::GuestApplication:
+    87→        case Subsystem::IL2CPP_Runtime:
+    88→        case Subsystem::GameCode:
+    89→            return EmulationLayer::Guest;
+    90→            
+    91→        case Subsystem::HLE_LibKernel:
+    92→        case Subsystem::HLE_LibGpu:
+    93→        case Subsystem::HLE_LibAudio:
+    94→        case Subsystem::HLE_LibNet:
+    95→        case Subsystem::HLE_LibPng:
+    96→        case Subsystem::HLE_LibJpeg:
+    97→        case Subsystem::HLE_LibZlib:
+    98→        case Subsystem::HLE_LibSsl:
+    99→        case Subsystem::HLE_LibCrypto:
+   100→        case Subsystem::HLE_Other:
+   101→            return EmulationLayer::HLE;
+   102→            
+   103→        case Subsystem::Kernel:
+   104→        case Subsystem::ThreadManager:
+   105→        case Subsystem::Synchronization:
+   106→            return EmulationLayer::Kernel;
+   107→            
+   108→        case Subsystem::Memory:
+   109→            return EmulationLayer::Memory;
+   110→            
+   111→        case Subsystem::CPU:
+   112→            return EmulationLayer::CPU;
+   113→            
+   114→        case Subsystem::GPU:
+   115→            return EmulationLayer::GPU;
+   116→            
+   117→        case Subsystem::Audio:
+   118→            return EmulationLayer::Audio;
+   119→            
+   120→        case Subsystem::Input:
+   121→            return EmulationLayer::Input;
+   122→            
+   123→        case Subsystem::FileSystem:
+   124→        case Subsystem::FileSystemHost:
+   125→            return EmulationLayer::FileSystem;
+   126→            
+   127→        case Subsystem::HostSystem:
+   128→            return EmulationLayer::Host;
+   129→            
+   130→        default:
+   131→            return EmulationLayer::Diagnostic;
+   132→    }
+   133→}
+   134→
+   135→// ============================================================================
+   136→// Node Types for the Graph
+   137→// ============================================================================
+   138→
+   139→enum class NodeType : uint8_t {
+   140→    // Events
+   141→    Crash,
+   142→    Error,
+   143→    Corruption,
+   144→    Warning,
+   145→    StateChange,
+   146→    ResourceEvent,
+   147→    
+   148→    // Entities
+   149→    MemoryRegion,
+   150→    Object,
+   151→    Handle,
+   152→    Thread,
+   153→    Allocation,
+   154→    
+   155→    // Code locations
+   156→    FunctionCall,
+   157→    CodePath,
+   158→    BranchPoint,
+   159→    
+   160→    // Abstract concepts
+   161→    RootCauseCandidate,
+   162→    Symptom,
+   163→    Effect
+   164→};
+   165→
+   166→inline std::string nodeTypeToString(NodeType type) {
+   167→    switch (type) {
+   168→        case NodeType::Crash: return "Crash";
+   169→        case NodeType::Error: return "Error";
+   170→        case NodeType::Corruption: return "Corruption";
+   171→        case NodeType::Warning: return "Warning";
+   172→        case NodeType::StateChange: return "StateChange";
+   173→        case NodeType::ResourceEvent: return "ResourceEvent";
+   174→        case NodeType::MemoryRegion: return "MemoryRegion";
+   175→        case NodeType::Object: return "Object";
+   176→        case NodeType::Handle: return "Handle";
+   177→        case NodeType::Thread: return "Thread";
+   178→        case NodeType::Allocation: return "Allocation";
+   179→        case NodeType::FunctionCall: return "FunctionCall";
+   180→        case NodeType::CodePath: return "CodePath";
+   181→        case NodeType::BranchPoint: return "BranchPoint";
+   182→        case NodeType::RootCauseCandidate: return "RootCauseCandidate";
+   183→        case NodeType::Symptom: return "Symptom";
+   184→        case NodeType::Effect: return "Effect";
+   185→    }
+   186→    return "Unknown";
+   187→}
+   188→
+   189→// ============================================================================
+   190→// Edge Types (Causal Relationships)
+   191→// ============================================================================
+   192→
+   193→enum class EdgeType : uint8_t {
+   194→    // Direct causation
+   195→    CausedBy,           // A was directly caused by B
+   196→    CorruptedBy,        // A's data was corrupted by B
+   197→    TriggeredBy,        // A was triggered by B
+   198→    
+   199→    // Temporal relationships
+   200→    HappensBefore,      // A occurs before B in time
+   201→    HappensAfter,       // A occurs after B in time
+   202→    ConcurrentWith,     // A and B happen at same time
+   203→    
+   204→    // Containment/ownership
+   205→    Contains,           // A contains B (spatial or logical)
+   206→    Owns,              // A owns resource B
+   207→    Allocates,          // A allocated memory that became B
+   208→    Frees,             // A freed memory that B used
+   209→    
+   210→    // Dependencies
+   211→    DependsOn,          // A depends on B
+   212→    ReadsFrom,          // A reads data written by B
+   213→    WritesTo,          // A writes data read by B
+   214→    Calls,              // A calls function B
+   215→    CalledBy,           // A is called by B
+   216→    
+   217→    // Cross-layer
+   218→    CrossLayerUp,       // From lower layer to higher layer
+   219→    CrossLayerDown,     // From higher layer to lower layer
+   220→    
+   221→    // Abstract
+   222→    RelatedTo,          // General relationship
+   223→    SimilarTo,          // Pattern similarity
+   224→    PossiblyCauses      // Speculative causal link
+   225→};
+   226→
+   227→inline std::string edgeTypeToString(EdgeType type) {
+   228→    switch (type) {
+   229→        case EdgeType::CausedBy: return "caused_by";
+   230→        case EdgeType::CorruptedBy: return "corrupted_by";
+   231→        case EdgeType::TriggeredBy: return "triggered_by";
+   232→        case EdgeType::HappensBefore: return "happens_before";
+   233→        case EdgeType::HappensAfter: return "happens_after";
+   234→        case EdgeType::ConcurrentWith: return "concurrent_with";
+   235→        case EdgeType::Contains: return "contains";
+   236→        case EdgeType::Owns: return "owns";
+   237→        case EdgeType::Allocates: return "allocates";
+   238→        case EdgeType::Frees: return "frees";
+   239→        case EdgeType::DependsOn: return "depends_on";
+   240→        case EdgeType::ReadsFrom: return "reads_from";
+   241→        case EdgeType::WritesTo: return "writes_to";
+   242→        case EdgeType::Calls: return "calls";
+   243→        case EdgeType::CalledBy: return "called_by";
+   244→        case EdgeType::CrossLayerUp: return "cross_layer_up";
+   245→        case EdgeType::CrossLayerDown: return "cross_layer_down";
+   246→        case EdgeType::RelatedTo: return "related_to";
+   247→        case EdgeType::SimilarTo: return "similar_to";
+   248→        case EdgeType::PossiblyCauses: return "possibly_causes";
+   249→    }
+   250→    return "unknown";
+   251→}
+   252→
+   253→// ============================================================================
+   254→// Graph Node
+   255→// ============================================================================
+   256→
+   257→struct GraphNode {
+   258→    std::string id;
+   259→    NodeType type;
+   260→    EmulationLayer layer{EmulationLayer::Diagnostic};
+   261→    
+   262→    // Identification
+   263→    std::string name;
+   264→    std::string description;
+   265→    
+   266→    // Location/context
+   267→    SourceLocation location;
+   268→    Subsystem subsystem{Subsystem::Unknown};
+   269→    
+   270→    // Timing
+   271→    DebugTimestamp timestamp;
+   272→    uint64_t frame_number{0};
+   273→    
+   274→    // Data payload
+   275→    std::map<std::string, std::string> attributes;
+   276→    
+   277→    // State
+   278→    bool is_resolved{false};
+   279→    bool is_symptom{false};      // This is a symptom, not a cause
+   280→    bool is_root_cause{false};   // This is identified as root cause
+   281→    
+   282→    static std::string generateId() {
+   283→        static std::atomic<uint64_t> counter{0};
+   284→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+   285→        return "node_" + std::to_string(now) + "_" + std::to_string(++counter);
+   286→    }
+   287→    
+   288→    GraphNode() {
+   289→        id = generateId();
+   290→        timestamp = DebugTimestamp::now();
+   291→    }
+   292→    
+   293→    std::string toJson() const {
+   294→        std::stringstream json;
+   295→        json << "{\n";
+   296→        json << "  \"id\": \"" << JsonUtils::escapeJson(id) << "\",\n";
+   297→        json << "  \"type\": \"" << nodeTypeToString(type) << "\",\n";
+   298→        json << "  \"layer\": \"" << emulationLayerToString(layer) << "\",\n";
+   299→        json << "  \"name\": \"" << JsonUtils::escapeJson(name) << "\",\n";
+   300→        if (!description.empty()) {
+   301→            json << "  \"description\": \"" << JsonUtils::escapeJson(description) << "\",\n";
+   302→        }
+   303→        json << "  \"frame\": " << frame_number << "\n";
+   304→        json << "}";
+   305→        return json.str();
+   306→    }
+   307→};
+   308→
+   309→// ============================================================================
+   310→// Graph Edge
+   311→// ============================================================================
+   312→
+   313→struct GraphEdge {
+   314→    std::string id;
+   315→    std::string source_id;   // From node
+   316→    std::string target_id;   // To node
+   317→    EdgeType type;
+   318→    
+   319→    // Strength/confidence
+   320→    double confidence{1.0};  // How confident are we in this relationship?
+   321→    
+   322→    // Evidence
+   323→    std::vector<std::string> evidence_ids;
+   324→    std::string reasoning;
+   325→    
+   326→    // Metadata
+   327→    std::map<std::string, std::string> attributes;
+   328→    
+   329→    static std::string generateId() {
+   330→        static std::atomic<uint64_t> counter{0};
+   331→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+   332→        return "edge_" + std::to_string(now) + "_" + std::to_string(++counter);
+   333→    }
+   334→    
+   335→    GraphEdge() {
+   336→        id = generateId();
+   337→    }
+   338→    
+   339→    std::string toJson() const {
+   340→        std::stringstream json;
+   341→        json << "{\n";
+   342→        json << "  \"id\": \"" << JsonUtils::escapeJson(id) << "\",\n";
+   343→        json << "  \"source\": \"" << JsonUtils::escapeJson(source_id) << "\",\n";
+   344→        json << "  \"target\": \"" << JsonUtils::escapeJson(target_id) << "\",\n";
+   345→        json << "  \"type\": \"" << edgeTypeToString(type) << "\",\n";
+   346→        json << "  \"confidence\": " << std::fixed << std::setprecision(2) 
+   347→             << confidence << "\n";
+   348→        json << "}";
+   349→        return json.str();
+   350→    }
+   351→};
+   352→
+   353→// ============================================================================
+   354→// Causal Path - Sequence of edges from cause to effect
+   355→// ============================================================================
+   356→
+   357→struct CausalPath {
+   358→    std::vector<std::string> node_ids;  // Nodes along the path
+   359→    std::vector<GraphEdge> edges;        // Edges connecting them
+   360→    
+   361→    double total_confidence{1.0};
+   362→    int cross_layer_transitions{0};
+   363→    
+   364→    // Classification
+   365→    enum class Strength {
+   366→        Strong,     // High confidence, direct evidence
+   367→        Moderate,   // Reasonable inference
+   368→        Weak,       // Speculative but plausible
+   369→        VeryWeak    // Tentative, needs verification
+   370→    } strength{Strength::Moderate};
+   371→    
+   372→    double strengthScore() const {
+   373→        switch (strength) {
+   374→            case Strength::Strong: return 0.9;
+   375→            case Strength::Moderate: return 0.7;
+   376→            case Strength::Weak: return 0.4;
+   377→            case Strength::VeryWeak: return 0.2;
+   378→        }
+   379→        return 0.0;
+   380→    }
+   381→    
+   382→    std::string toJson() const {
+   383→        std::stringstream json;
+   384→        json << "{\n";
+   385→        json << "  \"nodes\": " << node_ids.size() << ",\n";
+   386→        json << "  \"edges\": " << edges.size() << ",\n";
+   387→        json << "  \"confidence\": " << std::fixed << std::setprecision(2) 
+   388→             << total_confidence << ",\n";
+   389→        
+   390→        const char* str_str = "";
+   391→        switch (strength) {
+   392→            case Strength::Strong: str_str = "Strong"; break;
+   393→            case Strength::Moderate: str_str = "Moderate"; break;
+   394→            case Strength::Weak: str_str = "Weak"; break;
+   395→            case Strength::VeryWeak: str_str = "VeryWeak"; break;
+   396→        }
+   397→        json << "  \"strength\": \"" << str_str << "\"\n";
+   398→        
+   399→        json << "}";
+   400→        return json.str();
+   401→    }
+   402→};
+   403→
+   404→// ============================================================================
+   405→// Root Cause Analysis Result
+   406→// ============================================================================
+   407→
+   408→struct RootCauseAnalysis {
+   409→    GraphNode symptom_node;              // The crash/error we're investigating
+   410→    std::vector<CausalPath> candidate_paths;  // Possible root causes
+   411→    
+   412→    // Ranked candidates
+   413→    struct Candidate {
+   414→        GraphNode node;
+   415→        CausalPath path;
+   416→        double overall_score{0};
+   417→        std::string reasoning;
+   418→        
+   419→        bool operator>(const Candidate& other) const {
+   420→            return overall_score > other.overall_score;
+   421→        }
+   422→    };
+   423→    
+   424→    std::vector<Candidate> ranked_candidates;
+   425→    
+   426→    // Summary
+   427→    GraphNode most_likely_root_cause;
+   428→    CausalPath most_likely_path;
+   429→    double confidence_in_analysis{0};
+   430→    
+   431→    // Rejected hypotheses
+   432→    std::vector<Candidate> rejected_candidates;
+   433→    std::vector<std::string> rejection_reasons;
+   434→    
+   435→    std::string toJson() const {
+   436→        std::stringstream json;
+   437→        json << "{\n";
+   438→        json << "  \"symptom\": \"" << JsonUtils::escapeJson(symptom_node.name) << "\",\n";
+   439→        json << "  \"candidates\": " << ranked_candidates.size() << ",\n";
+   440→        json << "  \"most_likely_cause\": ";
+   441→        if (!most_likely_root_cause.id.empty()) {
+   442→            json << "\"" << JsonUtils::escapeJson(most_likely_root_cause.name) << "\"\n";
+   443→        } else {
+   444→            json << "null\n";
+   445→        }
+   446→        json << "}\n";
+   447→        return json.str();
+   448→    }
+   449→};
+   450→
+   451→// ============================================================================
+   452→// Causal Dependency Graph - Main Class
+   453→// ============================================================================
+   454→
+   455→class CausalDependencyGraph {
+   456→public:
+   457→    struct Config {
+   458→        size_t max_nodes;
+   459→        size_t max_edges;
+   460→        bool auto_detect_cross_layer;
+   461→        bool infer_temporal_relations;
+   462→        int max_path_length;  // Max nodes in a causal path
+   463→        
+   464→        Config()
+   465→            : max_nodes(100000)
+   466→            , max_edges(500000)
+   467→            , auto_detect_cross_layer(true)
+   468→            , infer_temporal_relations(true)
+   469→            , max_path_length(10) {}
+   470→        
+   471→        Config(size_t mn, size_t me, bool adcl, bool itr, int mpl)
+   472→            : max_nodes(mn)
+   473→            , max_edges(me)
+   474→            , auto_detect_cross_layer(adcl)
+   475→            , infer_temporal_relations(itr)
+   476→            , max_path_length(mpl) {}
+   477→        
+   478→        static Config defaultConfig() {
+   479→            return Config(100000, 500000, true, true, 10);
+   480→        }
+   481→    };
+   482→    
+   483→    explicit CausalDependencyGraph(const Config& config = Config())
+   484→        : m_config(config), m_enabled(true) {}
+   485→    
+   486→    void enable() { m_enabled.store(true); }
+   487→    void disable() { m_enabled.store(false); }
+   488→    bool isEnabled() const { return m_enabled.load(); }
+   489→    
+   490→    void clear() {
+   491→        std::unique_lock lock(m_mutex);
+   492→        m_nodes.clear();
+   493→        m_edges.clear();
+   494→        m_adjacency.clear();
+   495→    }
+   496→    
+   497→    // ========================================================================
+   498→    // Node Management
+   499→    // ========================================================================
+   500→    
+   501→    /**
+   502→     * Add a node to the graph
+   503→     */
+   504→    std::string addNode(
+   505→        NodeType type,
+   506→        const std::string& name,
+   507→        EmulationLayer layer,
+   508→        const SourceLocation& loc = DEBUG_HERE(),
+   509→        Subsystem subs = Subsystem::Unknown) {
+   510→        
+   511→        if (!isEnabled()) return "";
+   512→        
+   513→        GraphNode node;
+   514→        node.type = type;
+   515→        node.name = name;
+   516→        node.layer = layer;
+   517→        node.location = loc;
+   518→        node.subsystem = subs;
+   519→        
+   520→        std::unique_lock lock(m_mutex);
+   521→        
+   522→        if (m_nodes.size() >= m_config.max_nodes) return "";
+   523→        
+   524→        m_nodes[node.id] = node;
+   525→        m_adjacency[node.id];  // Initialize adjacency list
+   526→        
+   527→        return node.id;
+   528→    }
+   529→    
+   530→    /**
+   531→     * Get node by ID
+   532→     */
+   533→    std::optional<GraphNode> getNode(const std::string& id) const {
+   534→        std::shared_lock lock(m_mutex);
+   535→        
+   536→        auto it = m_nodes.find(id);
+   537→        if (it != m_nodes.end()) return it->second;
+   538→        return std::nullopt;
+   539→    }
+   540→    
+   541→    /**
+   542→     * Find nodes matching criteria
+   543→     */
+   544→    std::vector<GraphNode> findNodes(
+   545→        std::optional<NodeType> type_filter = std::nullopt,
+   546→        std::optional<EmulationLayer> layer_filter = std::nullopt,
+   547→        std::optional<Subsystem> subsystem_filter = std::nullopt) const {
+   548→        
+   549→        std::shared_lock lock(m_mutex);
+   550→        
+   551→        std::vector<GraphNode> result;
+   552→        for (const auto& [id, node] : m_nodes) {
+   553→            if (type_filter.has_value() && node.type != *type_filter) continue;
+   554→            if (layer_filter.has_value() && node.layer != *layer_filter) continue;
+   555→            if (subsystem_filter.has_value() && node.subsystem != *subsystem_filter) continue;
+   556→            result.push_back(node);
+   557→        }
+   558→        
+   559→        return result;
+   560→    }
+   561→    
+   562→    // ========================================================================
+   563→    // Edge Management (Causal Relationships)
+   564→    // ========================================================================
+   565→    
+   566→    /**
+   567→     * Add an edge (causal relationship)
+   568→     */
+   569→    std::string addEdge(
+   570→        const std::string& source_id,
+   571→        const std::string& target_id,
+   572→        EdgeType type,
+   573→        double confidence = 1.0,
+   574→        const std::string& reasoning = "") {
+   575→        
+   576→        if (!isEnabled()) return "";
+   577→        
+   578→        GraphEdge edge;
+   579→        edge.source_id = source_id;
+   580→        edge.target_id = target_id;
+   581→        edge.type = type;
+   582→        edge.confidence = confidence;
+   583→        edge.reasoning = reasoning;
+   584→        
+   585→        // Auto-detect cross-layer transitions
+   586→        auto source_node = getNode(source_id);
+   587→        auto target_node = getNode(target_id);
+   588→        
+   589→        if (source_node && target_node &&
+   590→            m_config.auto_detect_cross_layer &&
+   591→            source_node->layer != target_node->layer) {
+   592→            
+   593→            if (isHigherLayer(source_node->layer, target_node->layer)) {
+   594→                edge.attributes["cross_layer"] = "down";
+   595→            } else {
+   596→                edge.attributes["cross_layer"] = "up";
+   597→            }
+   598→        }
+   599→        
+   600→        std::unique_lock lock(m_mutex);
+   601→        
+   602→        if (m_edges.size() >= m_config.max_edges) return "";
+   603→        
+   604→        m_edges[edge.id] = edge;
+   605→        m_adjacency[source_id].insert(target_id);
+   606→        
+   607→        return edge.id;
+   608→    }
+   609→    
+   610→    /**
+   611→     * Convenience: Record that A caused B
+   612→     */
+   613→    std::string recordCausation(
+   614→        const std::string& cause_id,
+   615→        const std::string& effect_id,
+   616→        double confidence = 0.8,
+   617→        const std::string& evidence = "") {
+   618→        
+   619→        return addEdge(cause_id, effect_id, EdgeType::CausedBy, confidence, evidence);
+   620→    }
+   621→    
+   622→    /**
+   623→     * Convenience: Record that A corrupted B's data
+   624→     */
+   625→    std::string recordCorruption(
+   626→        const std::string& corruptor_id,
+   627→        const std::string& victim_id,
+   628→        double confidence = 0.9,
+   629→        const std::string& details = "") {
+   630→        
+   631→        return addEdge(corruptor_id, victim_id, EdgeType::CorruptedBy, confidence, details);
+   632→    }
+   633→    
+   634→    // ========================================================================
+   635→    // Query Interface - Finding Root Causes
+   636→    // ========================================================================
+   637→    
+   638→    /**
+   639→     * Find all paths from potential causes to a symptom
+   640→     */
+   641→    std::vector<CausalPath> findPathsToSymptom(
+   642→        const std::string& symptom_id,
+   643→        int max_paths = 10,
+   644→        int max_length = -1) const {
+   645→        
+   646→        if (max_length < 0) max_length = m_config.max_path_length;
+   647→        
+   648→        std::shared_lock lock(m_mutex);
+   649→        
+   650→        std::vector<CausalPath> all_paths;
+   651→        
+   652→        // BFS from symptom backwards (following reverse edges)
+   653→        std::queue<std::pair<std::string, std::vector<GraphEdge>>> queue;
+   654→        queue.push({symptom_id, {}});
+   655→        
+   656→        std::set<std::string> visited;
+   657→        visited.insert(symptom_id);
+   658→        
+   659→        while (!queue.empty() && all_paths.size() < static_cast<size_t>(max_paths)) {
+   660→            auto [current_id, path_so_far] = queue.front();
+   661→            queue.pop();
+   662→            
+   663→            if (path_so_far.size() > static_cast<size_t>(max_length)) continue;
+   664→            
+   665→            // Look for nodes that have edges TO current_id (reverse traversal)
+   666→            for (const auto& [edge_id, edge] : m_edges) {
+   667→                if (edge.target_id == current_id && 
+   668→                    visited.find(edge.source_id) == visited.end()) {
+   669→                    
+   670→                    visited.insert(edge.source_id);
+   671→                    
+   672→                    CausalPath new_path;
+   673→                    new_path.edges = path_so_far;
+   674→                    new_path.edges.push_back(edge);
+   675→                    new_path.node_ids.push_back(edge.source_id);
+   676→                    new_path.node_ids.push_back(current_id);  // Will be deduplicated
+   677→                    
+   678→                    // Calculate path properties
+   679→                    calculatePathProperties(new_path);
+   680→                    
+   681→                    // Check if this could be a root cause
+   682→                    auto source_node_it = m_nodes.find(edge.source_id);
+   683→                    if (source_node_it != m_nodes.end()) {
+   684→                        const auto& source_node = source_node_it->second;
+   685→                        
+   686→                        // Good root cause candidates:
+   687→                        // - In a different layer than symptom
+   688→                        // - Is an error/corruption itself
+   689→                        // - Has no incoming edges (origin)
+   690→                        
+   691→                        auto symptom_node_it = m_nodes.find(symptom_id);
+   692→                        if (symptom_node_it != m_nodes.end()) {
+   693→                            if (source_node.layer != symptom_node_it->second.layer) {
+   694→                                new_path.cross_layer_transitions++;
+   695→                            }
+   696→                        }
+   697→                        
+   698→                        if (source_node.type == NodeType::Error ||
+   699→                            source_node.type == NodeType::Corruption ||
+   700→                            source_node.type == NodeType::Crash) {
+   701→                            all_paths.push_back(new_path);
+   702→                        }
+   703→                        
+   704→                        // Also add paths that reach origin nodes
+   705→                        bool has_incoming = false;
+   706→                        for (const auto& [e_id, e] : m_edges) {
+   707→                            if (e.target_id == edge.source_id) {
+   708→                                has_incoming = true;
+   709→                                break;
+   710→                            }
+   711→                        }
+   712→                        
+   713→                        if (!has_incoming && !path_so_far.empty()) {
+   714→                            // This is an origin node - good candidate
+   715→                            all_paths.push_back(new_path);
+   716→                        }
+   717→                    }
+   718→                    
+   719→                    // Continue searching from this node
+   720→                    queue.push({edge.source_id, new_path.edges});
+   721→                }
+   722→            }
+   723→        }
+   724→        
+   725→        // Sort by confidence/strength
+   726→        std::sort(all_paths.begin(), all_paths.end(),
+   727→            [](const CausalPath& a, const CausalPath& b) {
+   728→                return a.total_confidence > b.total_confidence;
+   729→            });
+   730→        
+   731→        return all_paths;
+   732→    }
+   733→    
+   734→    /**
+   735→     * Perform full root cause analysis for a symptom
+   736→     */
+   737→    RootCauseAnalysis analyzeRootCause(const std::string& symptom_id) {
+   738→        RootCauseAnalysis analysis;
+   739→        
+   740→        auto symptom_opt = getNode(symptom_id);
+   741→        if (!symptom_opt) {
+   742→            return analysis;  // Invalid symptom ID
+   743→        }
+   744→        
+   745→        analysis.symptom_node = *symptom_opt;
+   746→        
+   747→        // Find candidate paths
+   748→        analysis.candidate_paths = findPathsToSymptom(symptom_id, 50);
+   749→        
+   750→        // Score and rank each unique endpoint as a candidate
+   751→        std::map<std::string, RootCauseAnalysis::Candidate> candidates;
+   752→        
+   753→        for (const auto& path : analysis.candidate_paths) {
+   754→            if (path.node_ids.empty()) continue;
+   755→            
+   756→            std::string candidate_id = path.node_ids.front();  // Origin of path
+   757→            
+   758→            auto it = candidates.find(candidate_id);
+   759→            if (it == candidates.end()) {
+   760→                RootCauseAnalysis::Candidate cand;
+   761→                
+   762→                auto node_opt = getNode(candidate_id);
+   763→                if (node_opt) {
+   764→                    cand.node = *node_opt;
+   765→                    cand.path = path;
+   766→                    
+   767→                    // Score based on multiple factors
+   768→                    cand.overall_score = calculateCandidateScore(cand, analysis.symptom_node);
+   769→                    
+   770→                    candidates[candidate_id] = cand;
+   771→                }
+   772→            } else {
+   773→                // Keep best path for this candidate
+   774→                if (path.total_confidence > it->second.path.total_confidence) {
+   775→                    it->second.path = path;
+   776→                }
+   777→            }
+   778→        }
+   779→        
+   780→        // Move to vector and sort
+   781→        for (auto& [id, cand] : candidates) {
+   782→            analysis.ranked_candidates.push_back(std::move(cand));
+   783→        }
+   784→        
+   785→        std::sort(analysis.ranked_candidates.begin(), analysis.ranked_candidates.end(),
+   786→            std::greater<RootCauseAnalysis::Candidate>());
+   787→        
+   788→        // Set most likely cause
+   789→        if (!analysis.ranked_candidates.empty()) {
+   790→            analysis.most_likely_root_cause = analysis.ranked_candidates.front().node;
+   791→            analysis.most_likely_path = analysis.ranked_candidates.front().path;
+   792→            analysis.confidence_in_analysis = analysis.ranked_candidates.front().overall_score;
+   793→        }
+   794→        
+   795→        // Separate weak candidates as rejected
+   796→        for (const auto& cand : analysis.ranked_candidates) {
+   797→            if (cand.overall_score < 0.3) {
+   798→                analysis.rejected_candidates.push_back(cand);
+   799→                analysis.rejection_reasons.push_back(
+   800→                    "Low confidence score: " + std::to_string(cand.overall_score));
+   801→            }
+   802→        }
+   803→        
+   804→        return analysis;
+   805→    }
+   806→    
+   807→    /**
+   808→     * Find what a given node could have caused (forward traversal)
+   809→     */
+   810→    std::vector<GraphNode> findPossibleEffects(
+   811→        const std::string& cause_id,
+   812→        int max_depth = 3) const {
+   813→        
+   814→        std::shared_lock lock(m_mutex);
+   815→        
+   816→        std::vector<GraphNode> effects;
+   817→        std::set<std::string> visited;
+   818→        
+   819→        std::queue<std::pair<std::string, int>> queue;
+   820→        queue.push({cause_id, 0});
+   821→        visited.insert(cause_id);
+   822→        
+   823→        while (!queue.empty()) {
+   824→            auto [current_id, depth] = queue.front();
+   825→            queue.pop();
+   826→            
+   827→            if (depth >= max_depth) continue;
+   828→            
+   829→            // Follow outgoing edges
+   830→            auto adj_it = m_adjacency.find(current_id);
+   831→            if (adj_it != m_adjacency.end()) {
+   832→                for (const auto& target_id : adj_it->second) {
+   833→                    if (visited.find(target_id) == visited.end()) {
+   834→                        visited.insert(target_id);
+   835→                        
+   836→                        auto target_node_it = m_nodes.find(target_id);
+   837→                        if (target_node_it != m_nodes.end()) {
+   838→                            effects.push_back(target_node_it->second);
+   839→                        }
+   840→                        
+   841→                        queue.push({target_id, depth + 1});
+   842→                    }
+   843→                }
+   844→            }
+   845→        }
+   846→        
+   847→        return effects;
+   848→    }
+   849→
+   850→private:
+   851→    Config m_config;
+   852→    std::atomic<bool> m_enabled;
+   853→    mutable std::shared_mutex m_mutex;
+   854→    
+   855→    std::map<std::string, GraphNode> m_nodes;
+   856→    std::map<std::string, GraphEdge> m_edges;
+   857→    std::map<std::string, std::set<std::string>> m_adjacency;  // source -> targets
+   858→    
+   859→    // ========================================================================
+   860→    // Internal Methods
+   861→    // ========================================================================
+   862→    
+   863→    bool isHigherLayer(EmulationLayer a, EmulationLayer b) const {
+   864→        // Guest is highest, Host is lowest
+   865→        static const std::map<EmulationLayer, int> layer_order = {
+   866→            {EmulationLayer::Guest, 10},
+   867→            {EmulationLayer::HLE, 9},
+   868→            {EmulationLayer::Kernel, 8},
+   869→            {EmulationLayer::FileSystem, 7},
+   870→            {EmulationLayer::Network, 7},
+   871→            {EmulationLayer::Audio, 6},
+   872→            {EmulationLayer::Input, 6},
+   873→            {EmulationLayer::GPU, 5},
+   874→            {EmulationLayer::Memory, 4},
+   875→            {EmulationLayer::CPU, 3},
+   876→            {EmulationLayer::Host, 2},
+   877→            {EmulationLayer::Diagnostic, 1}
+   878→        };
+   879→        
+   880→        auto it_a = layer_order.find(a);
+   881→        auto it_b = layer_order.find(b);
+   882→        
+   883→        if (it_a == layer_order.end() || it_b == layer_order.end()) return false;
+   884→        
+   885→        return it_a->second > it_b->second;
+   886→    }
+   887→    
+   888→    void calculatePathProperties(CausalPath& path) const {
+   889→        if (path.edges.empty()) {
+   890→            path.total_confidence = 0;
+   891→            path.strength = CausalPath::Strength::Strong;
+   892→            return;
+   893→        }
+   894→        
+   895→        // Confidence multiplies along path
+   896→        double conf = 1.0;
+   897→        for (const auto& edge : path.edges) {
+   898→            conf *= edge.confidence;
+   899→        }
+   900→        path.total_confidence = conf;
+   901→        
+   902→        // Count cross-layer transitions
+   903→        path.cross_layer_transitions = 0;
+   904→        EmulationLayer prev_layer = EmulationLayer::Diagnostic;
+   905→        
+   906→        for (const auto& edge : path.edges) {
+   907→            auto source = m_nodes.find(edge.source_id);
+   908→            if (source != m_nodes.end()) {
+   909→                if (source->second.layer != prev_layer && prev_layer != EmulationLayer::Diagnostic) {
+   910→                    path.cross_layer_transitions++;
+   911→                }
+   912→                prev_layer = source->second.layer;
+   913→            }
+   914→        }
+   915→        
+   916→        // Determine strength
+   917→        if (conf >= 0.8 && path.cross_layer_transitions >= 2) {
+   918→            path.strength = CausalPath::Strength::Strong;
+   919→        } else if (conf >= 0.5) {
+   920→            path.strength = CausalPath::Strength::Moderate;
+   921→        } else if (conf >= 0.2) {
+   922→            path.strength = CausalPath::Strength::Weak;
+   923→        } else {
+   924→            path.strength = CausalPath::Strength::VeryWeak;
+   925→        }
+   926→    }
+   927→    
+   928→    double calculateCandidateScore(const RootCauseAnalysis::Candidate& candidate, const GraphNode& symptom_node) const {
+   929→        double score = 0.0;
+   930→        
+   931→        // Base score from path confidence
+   932→        score += candidate.path.total_confidence * 0.4;
+   933→        
+   934→        // Bonus for cross-layer origin (different layer than symptom)
+   935→        if (candidate.node.layer != symptom_node.layer) {
+   936→            score += 0.2;
+   937→            
+   938→            // Extra bonus for lower-layer origins (more fundamental)
+   939→            if (isHigherLayer(symptom_node.layer, candidate.node.layer)) {
+   940→                score += 0.1;
+   941→            }
+   942→        }
+   943→        
+   944→        // Bonus for being an error/corruption/crash node
+   945→        if (candidate.node.type == NodeType::Error ||
+   946→            candidate.node.type == NodeType::Corruption ||
+   947→            candidate.node.type == NodeType::Crash) {
+   948→            score += 0.15;
+   949→        }
+   950→        
+   951→        // Bonus for path length (not too short, not too long)
+   952→        size_t path_len = candidate.path.edges.size();
+   953→        if (path_len >= 2 && path_len <= 5) {
+   954→            score += 0.1;
+   955→        }
+   956→        
+   957→        // Normalize to 0-1
+   958→        return std::min(score, 1.0);
+   959→    }
+   960→};
+   961→
+   962→} // namespace graph
+   963→} // namespace prosper_debug
+   964→

@@ -1,0 +1,798 @@
+     1→/**
+     2→ * Diagnostic Quality Analyzer - Priority 4
+     3→ * 
+     4→ * PROBLEM SOLVED:
+     5→ * A lot of time wasted because diagnostics were added but never executed.
+     6→ * 
+     7→ * EXAMPLES OF MISLEADING SITUATIONS:
+     8→ *   "Added breakpoint, no output, therefore not the issue"
+     9→ *   
+    10→ *   REALITY:
+    11→ *   - Wrong code path (branch not taken)
+    12→ *   - Unreachable code (dead path)
+    13→ *   - Condition impossible (contradictory preconditions)
+    14→ *   - Diagnostic removed during optimization
+    15→ *   - Exception thrown before diagnostic reached
+    16→ * 
+    17→ * REQUIREMENT:
+    18→ * Every diagnostic must report:
+    19→ *   - Registered: When it was added to the system
+    20→ *   - Executed: How many times it ran
+    21→ *   - Last execution: When it last ran
+    22→ *   - Not reached: Why it might not have run
+    23→ */
+    24→
+    25→#pragma once
+    26→
+    27→#include "../core/foundation.hpp"
+    28→#include <mutex>
+    29→#include <functional>
+    30→#include <unordered_map>
+    31→#include <atomic>
+    32→
+    33→namespace prosper_debug {
+    34→namespace diagnostics {
+    35→
+    36→// ============================================================================
+    37→// Diagnostic Status
+    38→// ============================================================================
+    39→
+    40→enum class DiagnosticStatus : uint8_t {
+    41→    Registered,      // Created and registered in system
+    42→    Executed,        // Ran at least once
+    43→    Triggered,       // Condition was met (for conditional diagnostics)
+    44→    NotReached,      // Code path never entered
+    45→    Removed,         // Explicitly removed
+    46→    Error            // Diagnostic itself had an error
+    47→};
+    48→
+    49→inline std::string diagnosticStatusToString(DiagnosticStatus status) {
+    50→    switch (status) {
+    51→        case DiagnosticStatus::Registered: return "Registered";
+    52→        case DiagnosticStatus::Executed: return "Executed";
+    53→        case DiagnosticStatus::Triggered: return "Triggered";
+    54→        case DiagnosticStatus::NotReached: return "NotReached";
+    55→        case DiagnosticStatus::Removed: return "Removed";
+    56→        case DiagnosticStatus::Error: return "Error";
+    57→    }
+    58→    return "Unknown";
+    59→}
+    60→
+    61→// ============================================================================
+    62→// Diagnostic Types
+    63→// ============================================================================
+    64→
+    65→enum class DiagnosticType : uint8_t {
+    66→    // Basic checks
+    67→    Assertion,
+    68→    ConditionCheck,
+    69→    ValueRangeCheck,
+    70→    
+    71→    // State validation
+    72→    StateInvariant,
+    73→    PreCondition,
+    74→    PostCondition,
+    75→    
+    76→    // Data integrity
+    77→    ChecksumValidation,
+    78→    SignatureVerification,
+    79→    PointerValidation,
+    80→    
+    81→    // Timing/ordering
+    82→    SequencePoint,
+    83→    OrderingConstraint,
+    84→    TimeoutCheck,
+    85→    
+    86→    // Coverage
+    87→    CodePathReached,
+    88→    FunctionEntered,
+    89→    BranchTaken,
+    90→    
+    91→    // Custom
+    92→    CustomDiagnostic,
+    93→    Breakpoint,
+    94→    Watchpoint,
+    95→    LogPoint
+    96→};
+    97→
+    98→inline std::string diagnosticTypeToString(DiagnosticType type) {
+    99→    switch (type) {
+   100→        case DiagnosticType::Assertion: return "Assertion";
+   101→        case DiagnosticType::ConditionCheck: return "ConditionCheck";
+   102→        case DiagnosticType::ValueRangeCheck: return "ValueRangeCheck";
+   103→        case DiagnosticType::StateInvariant: return "StateInvariant";
+   104→        case DiagnosticType::PreCondition: return "PreCondition";
+   105→        case DiagnosticType::PostCondition: return "PostCondition";
+   106→        case DiagnosticType::ChecksumValidation: return "ChecksumValidation";
+   107→        case DiagnosticType::SignatureVerification: return "SignatureVerification";
+   108→        case DiagnosticType::PointerValidation: return "PointerValidation";
+   109→        case DiagnosticType::SequencePoint: return "SequencePoint";
+   110→        case DiagnosticType::OrderingConstraint: return "OrderingConstraint";
+   111→        case DiagnosticType::TimeoutCheck: return "TimeoutCheck";
+   112→        case DiagnosticType::CodePathReached: return "CodePathReached";
+   113→        case DiagnosticType::FunctionEntered: return "FunctionEntered";
+   114→        case DiagnosticType::BranchTaken: return "BranchTaken";
+   115→        case DiagnosticType::CustomDiagnostic: return "CustomDiagnostic";
+   116→        case DiagnosticType::Breakpoint: return "Breakpoint";
+   117→        case DiagnosticType::Watchpoint: return "Watchpoint";
+   118→        case DiagnosticType::LogPoint: return "LogPoint";
+   119→    }
+   120→    return "Unknown";
+   121→}
+   122→
+   123→// ============================================================================
+   124→// Why a Diagnostic Might Not Execute
+   125→// ============================================================================
+   126→
+   127→enum class NonExecutionReason : uint8_t {
+   128→    Unknown,
+   129→    
+   130→    // Control flow reasons
+   131→    ParentBranchNotTaken,
+   132→    LoopNeverEntered,
+   133→    EarlyReturnBeforeDiagnostic,
+   134→    ExceptionThrownBeforeDiagnostic,
+   135→    
+   136→    // Condition reasons
+   137→    ConditionNeverTrue,
+   138→    ContradictoryPreconditions,
+   139→    ImpossibleState,
+   140→    
+   141→    // Scope/lifetime reasons
+   142→    ObjectDestroyedBeforeDiagnostic,
+   143→    ModuleNotLoaded,
+   144→    FunctionNeverCalled,
+   145→    
+   146→    // Optimization reasons
+   147→    OptimizedOut,
+   148→    DeadCodeEliminated,
+   149→    InlinedAway,
+   150→    
+   151→    // System reasons
+   152→    DisabledAtRuntime,
+   153→    FilteredOut,
+   154→    PriorityTooLow
+   155→};
+   156→
+   157→inline std::string nonExecutionReasonToString(NonExecutionReason reason) {
+   158→    switch (reason) {
+   159→        case NonExecutionReason::Unknown: return "Unknown";
+   160→        case NonExecutionReason::ParentBranchNotTaken: return "ParentBranchNotTaken";
+   161→        case NonExecutionReason::LoopNeverEntered: return "LoopNeverEntered";
+   162→        case NonExecutionReason::EarlyReturnBeforeDiagnostic: return "EarlyReturnBeforeDiagnostic";
+   163→        case NonExecutionReason::ExceptionThrownBeforeDiagnostic: return "ExceptionThrownBeforeDiagnostic";
+   164→        case NonExecutionReason::ConditionNeverTrue: return "ConditionNeverTrue";
+   165→        case NonExecutionReason::ContradictoryPreconditions: return "ContradictoryPreconditions";
+   166→        case NonExecutionReason::ImpossibleState: return "ImpossibleState";
+   167→        case NonExecutionReason::ObjectDestroyedBeforeDiagnostic: return "ObjectDestroyedBeforeDiagnostic";
+   168→        case NonExecutionReason::ModuleNotLoaded: return "ModuleNotLoaded";
+   169→        case NonExecutionReason::FunctionNeverCalled: return "FunctionNeverCalled";
+   170→        case NonExecutionReason::OptimizedOut: return "OptimizedOut";
+   171→        case NonExecutionReason::DeadCodeEliminated: return "DeadCodeEliminated";
+   172→        case NonExecutionReason::InlinedAway: return "InlinedAway";
+   173→        case NonExecutionReason::DisabledAtRuntime: return "DisabledAtRuntime";
+   174→        case NonExecutionReason::FilteredOut: return "FilteredOut";
+   175→        case NonExecutionReason::PriorityTooLow: return "PriorityTooLow";
+   176→    }
+   177→    return "Unknown";
+   178→}
+   179→
+   180→// ============================================================================
+   181→// Diagnostic Definition
+   182→// ============================================================================
+   183→
+   184→struct DiagnosticDefinition {
+   185→    std::string id;
+   186→    std::string name;
+   187→    std::string description;
+   188→    DiagnosticType type;
+   189→    
+   190→    // Location
+   191→    SourceLocation location;
+   192→    Subsystem subsystem{Subsystem::Unknown};
+   193→    
+   194→    // Condition (if conditional)
+   195→    std::function<bool()> condition;  // When should this run?
+   196→    bool is_conditional{false};
+   197→    
+   198→    // What it checks
+   199→    std::function<bool()> check;     // The actual diagnostic logic
+   200→    
+   201→    // What to do when triggered
+   202→    std::function<void(const std::string&)> on_triggered;
+   203→    
+   204→    // Metadata
+   205→    std::map<std::string, std::string> tags;
+   206→    std::string category;
+   207→    int priority{0};  // Higher = more important
+   208→    
+   209→    // Expected frequency
+   210→    size_t expected_executions_per_session{1};  // 0 = unknown/unlimited
+   211→    
+   212→    static std::string generateId() {
+   213→        static std::atomic<uint64_t> counter{0};
+   214→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+   215→        return "diag_" + std::to_string(now) + "_" + std::to_string(++counter);
+   216→    }
+   217→    
+   218→    DiagnosticDefinition() {
+   219→        id = generateId();
+   220→    }
+   221→};
+   222→
+   223→// ============================================================================
+   224→// Diagnostic Execution Record
+   225→// ============================================================================
+   226→
+   227→struct DiagnosticExecution {
+   228→    std::string diagnostic_id;
+   229→    DebugTimestamp timestamp;
+   230→    uint64_t frame_number{0};
+   231→    
+   232→    // Result
+   233→    DiagnosticStatus status{DiagnosticStatus::Registered};
+   234→    bool passed{true};
+   235→    std::string result_message;
+   236→    std::string failure_detail;
+   237→    
+   238→    // Context
+   239→    std::string thread_id;
+   240→    std::map<std::string, std::string> context_data;  // Values at time of execution
+   241→    
+   242→    // Performance
+   243→    uint64_t execution_time_ns{0};
+   244→    
+   245→    static std::string generateId() {
+   246→        static std::atomic<uint64_t> counter{0};
+   247→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+   248→        return "exec_" << std::to_string(now) + "_" + std::to_string(++counter);
+   249→    }
+   250→    
+   251→    DiagnosticExecution() {
+   252→        timestamp = DebugTimestamp::now();
+   253→    }
+   254→    
+   255→    std::string toJson() const {
+   256→        std::stringstream json;
+   257→        json << "{\n";
+   258→        json << "  \"diagnostic_id\": \"" << JsonUtils::escapeJson(diagnostic_id) << "\",\n";
+   259→        json << "  \"timestamp\": \"" << timestamp.toISO8601() << "\",\n";
+   260→        json << "  \"frame\": " << frame_number << ",\n";
+   261→        json << "  \"status\": \"" << diagnosticStatusToString(status) << "\",\n";
+   262→        json << "  \"passed\": " << (passed ? "true" : "false") << ",\n";
+   263→        if (!result_message.empty()) {
+   264→            json << "  \"message\": \"" << JsonUtils::escapeJson(result_message) << "\"\n";
+   265→        }
+   266→        json << "}";
+   267→        return json.str();
+   268→    }
+   269→};
+   270→
+   271→// ============================================================================
+   272→// Diagnostic Summary - Current State of a Diagnostic
+   273→// ============================================================================
+   274→
+   275→struct DiagnosticSummary {
+   276→    DiagnosticDefinition definition;
+   277→    
+   278→    // Execution history
+   279→    std::vector<DiagnosticExecution> executions;
+   280→    
+   281→    // Aggregated stats
+   282→    DiagnosticStatus current_status{DiagnosticStatus::Registered};
+   283→    size_t total_executions{0};
+   284→    size_t total_passes{0};
+   285→    size_t total_failures{0};
+   286→    
+   287→    // Timing
+   288→    DebugTimestamp registration_time;
+   289→    DebugTimestamp first_execution;
+   290→    DebugTimestamp last_execution;
+   291→    
+   292→    // If not executing, why?
+   293→    NonExecutionReason suspected_reason{NonExecutionReason::Unknown};
+   294→    std::string non_execution_analysis;
+   295→    
+   296→    // Health assessment
+   297→    enum class Health {
+   298→        Healthy,       // Running as expected
+   299→        Suspicious,    // Should have run but hasn't
+   300→        Broken,        // Failing consistently
+   301→        Unknown         // Not enough data
+   302→    } health{Health::Unknown};
+   303→    
+   304→    std::string health_reason;
+   305→    
+   306→    double passRate() const {
+   307→        return total_executions > 0 ?
+   308→            static_cast<double>(total_passes) / total_executions : 1.0;
+   309→    }
+   310→    
+   311→    bool hasEverExecuted() const { return total_executions > 0; }
+   312→    
+   313→    std::string toJson() const {
+   314→        std::stringstream json;
+   315→        json << "{\n";
+   316→        json << "  \"id\": \"" << JsonUtils::escapeJson(definition.id) << "\",\n";
+   317→        json << "  \"name\": \"" << JsonUtils::escapeJson(definition.name) << "\",\n";
+   318→        json << "  \"type\": \"" << diagnosticTypeToString(definition.type) << "\",\n";
+   319→        json << "  \"status\": \"" << diagnosticStatusToString(current_status) << "\",\n";
+   320→        json << "  \"executions\": " << total_executions << ",\n";
+   321→        json << "  \"passes\": " << total_passes << ",\n";
+   322→        json << "  \"failures\": " << total_failures << ",\n";
+   323→        json << "  \"pass_rate\": " << std::fixed << std::setprecision(2) 
+   324→             << (passRate() * 100.0) << "%,\n";
+   325→        
+   326→        if (!hasEverExecuted()) {
+   327→            json << "  \"not_reached_reason\": \"" 
+   328→                 << JsonUtils::escapeJson(nonExecutionReasonToString(suspected_reason)) << "\",\n";
+   329→            json << "  \"analysis\": \"" << JsonUtils::escapeJson(non_execution_analysis) << "\",\n";
+   330→        }
+   331→        
+   332→        const char* health_str = "";
+   333→        switch (health) {
+   334→            case Health::Healthy: health_str = "Healthy"; break;
+   335→            case Health::Suspicious: health_str = "Suspicious"; break;
+   336→            case Health::Broken: health_str = "Broken"; break;
+   337→            case Health::Unknown: health_str = "Unknown"; break;
+   338→        }
+   339→        json << "  \"health\": \"" << health_str << "\"\n";
+   340→        
+   341→        json << "}";
+   342→        return json.str();
+   343→    }
+   344→};
+   345→
+   346→// ============================================================================
+   347→// Quality Report
+   348→// ============================================================================
+   349→
+   350→struct DiagnosticQualityReport {
+   351→    // Overall stats
+   352→    size_t total_diagnostics{0};
+   353→    size_t healthy_count{0};
+   354→    size_t suspicious_count{0};
+   355→    size_t broken_count{0};
+   356→    size_t unknown_count{0};
+   357→    size_t never_executed_count{0};
+   358→    
+   359→    // By subsystem
+   360→    std::map<Subsystem, std::pair<size_t, size_t>> by_subsystem;  // total, suspicious
+   361→    
+   362→    // Problematic diagnostics (need attention)
+   363→    std::vector<DiagnosticSummary> suspicious_diagnostics;
+   364→    std::vector<DiagnosticSummary> broken_diagnostics;
+   365→    std::vector<DiagnosticSummary> never_executed_diagnostics;
+   366→    
+   367→    // Analysis
+   368→    std::vector<std::string> findings;
+   369→    std::vector<std::string> recommendations;
+   370→    
+   371→    double coverage_score{0.0};  // Estimated % of diagnostics actually running
+   372→    
+   373→    std::string toJson() const {
+   374→        std::stringstream json;
+   375→        json << "{\n";
+   376→        json << "  \"total_diagnostics\": " << total_diagnostics << ",\n";
+   377→        json << "  \"healthy\": " << healthy_count << ",\n";
+   378→        json << "  \"suspicious\": " << suspicious_count << ",\n";
+   379→        json << "  \"broken\": " << broken_count << ",\n";
+   380→        json << "  \"never_executed\": " << never_executed_count << ",\n";
+   381→        json << "  \"coverage_score\": " << std::fixed << std::setprecision(1)
+   382→             << (coverage_score * 100.0) << "%,\n";
+   383→        
+   384→        json << "  \"findings\": [\n";
+   385→        for (size_t i = 0; i < findings.size(); ++i) {
+   386→            json << "    \"" << JsonUtils::escapeJson(findings[i]) << "\"";
+   387→            if (i < findings.size() - 1) json << ",";
+   388→            json << "\n";
+   389→        }
+   390→        json << "  ],\n";
+   391→        
+   392→        json << "  \"recommendations\": [\n";
+   393→        for (size_t i = 0; i < recommendations.size(); ++i) {
+   394→            json << "    \"" << JsonUtils::escapeJson(recommendations[i]) << "\"";
+   395→            if (i < recommendations.size() - 1) json << ",";
+   396→            json << "\n";
+   397→        }
+   398→        json << "  ]\n";
+   399→        
+   400→        json << "}\n";
+   401→        return json.str();
+   402→    }
+   403→};
+   404→
+   405→// ============================================================================
+   406→// Diagnostic Quality Analyzer - Main Class
+   407→// ============================================================================
+   408→
+   409→class DiagnosticQualityAnalyzer {
+   410→public:
+   411→    struct Config {
+   412→        bool enabled{true};
+   413→        bool auto_analyze{true};          // Auto-analyze after each session
+   414→        bool track_all_executions{true};  // Keep full history or just summaries
+   415→        size_t max_executions_per_diagnostic{10000};
+   416→        size_t max_diagnostics{10000};
+   417→        
+   418→        // Suspicion thresholds
+   419→        size_t min_executions_for_health{3};  // Need this many before judging
+   420→        double suspicious_threshold{0.3};      // Below this pass rate = suspicious
+   421→        
+   422→        static Config defaultConfig() {
+   423→            return {true, true, true, 1000, 5000, 5, 0.5};
+   424→        }
+   425→    };
+   426→    
+   427→    explicit DiagnosticQualityAnalyzer(const Config& config = Config())
+   428→        : m_config(config), m_enabled(config.enabled) {}
+   429→    
+   430→    // ========================================================================
+   431→    // Control Interface
+   432→    // ========================================================================
+   433→    
+   434→    void enable() { m_enabled.store(true); }
+   435→    void disable() { m_enabled.store(false); }
+   436→    bool isEnabled() const { return m_enabled.load(); }
+   437→    
+   438→    void clear() {
+   439→        std::unique_lock lock(m_mutex);
+   440→        m_diagnostics.clear();
+   441→        m_executions.clear();
+   442→    }
+   443→    
+   444→    // ========================================================================
+   445→    // Diagnostic Registration
+   446→    // ========================================================================
+   447→    
+   448→    /**
+   449→     * Register a new diagnostic
+   450→     */
+   451→    std::string registerDiagnostic(
+   452→        const std::string& name,
+   453→        DiagnosticType type,
+   454→        std::function<bool()> check_func,
+   455→        const SourceLocation& loc = DEBUG_HERE(),
+   456→        Subsystem subs = Subsystem::Unknown,
+   457→        const std::string& description = "") {
+   458→        
+   459→        if (!isEnabled()) return "";
+   460→        
+   461→        DiagnosticDefinition def;
+   462→        def.name = name;
+   463→        def.type = type;
+   464→        def.check = check_func;
+   465→        def.location = loc;
+   466→        def.subsystem = subs;
+   467→        def.description = description;
+   468→        
+   469→        return registerDiagnostic(def);
+   470→    }
+   471→    
+   472→    /**
+   473→     * Register a diagnostic with full definition
+   474→     */
+   475→    std::string registerDiagnostic(const DiagnosticDefinition& definition) {
+   476→        if (!isEnabled()) return "";
+   477→        
+   478→        std::unique_lock lock(m_mutex);
+   479→        
+   480→        if (m_diagnostics.size() >= m_config.max_diagnostics) {
+   481→            return "";  // At capacity
+   482→        }
+   483→        
+   484→        DiagnosticSummary summary;
+   485→        summary.definition = definition;
+   486→        summary.registration_time = DebugTimestamp::now();
+   487→        summary.current_status = DiagnosticStatus::Registered;
+   488→        
+   489→        m_diagnostics[definition.id] = summary;
+   490→        
+   491→        return definition.id;
+   492→    }
+   493→    
+   494→    /**
+   495→     * Unregister a diagnostic
+   496→     */
+   497→    bool unregisterDiagnostic(const std::string& id) {
+   498→        std::unique_lock lock(m_mutex);
+   499→        
+   500→        auto it = m_diagnostics.find(id);
+   501→        if (it == m_diagnostics.end()) return false;
+   502→        
+   503→        it->second.current_status = DiagnosticStatus::Removed;
+   504→        // Keep in map for historical analysis, just mark as removed
+   505→        return true;
+   506→    }
+   507→    
+   508→    // ========================================================================
+   509→    // Execution Interface
+   510→    // ========================================================================
+   511→    
+   512→    /**
+   513→     * Execute a diagnostic by ID
+   514→     * Returns whether it passed
+   515→     */
+   516→    std::optional<bool> executeDiagnostic(const std::string& id) {
+   517→        if (!isEnabled()) return std::nullopt;
+   518→        
+   519→        DiagnosticExecution exec;
+   520→        exec.diagnostic_id = id;
+   521→        exec.thread_id = getCurrentThreadId();
+   522→        
+   523→        std::unique_lock lock(m_mutex);
+   524→        
+   525→        auto it = m_diagnostics.find(id);
+   526→        if (it == m_diagnostics.end()) {
+   527→            exec.status = DiagnosticStatus::Error;
+   528→            exec.result_message = "Diagnostic not found";
+   529→            
+   530→            if (m_config.track_all_executions) {
+   531→                m_executions.push_back(exec);
+   532→            }
+   533→            return std::nullopt;
+   534→        }
+   535→        
+   536→        DiagnosticSummary& summary = it->second;
+   537→        lock.unlock();  // Don't hold lock during execution
+   538→        
+   539→        // Run the diagnostic
+   540→        auto start = std::chrono::high_resolution_clock::now();
+   541→        
+   542→        try {
+   543→            if (summary.definition.check) {
+   544→                exec.passed = summary.definition.check();
+   545→            }
+   546→            exec.status = DiagnosticStatus::Executed;
+   547→            
+   548→            if (exec.passed) {
+   549→                exec.status = DiagnosticStatus::Triggered;
+   550→                if (summary.definition.on_triggered) {
+   551→                    summary.definition.on_triggered(summary.definition.id);
+   552→                }
+   553→            }
+   554→        } catch (const std::exception& e) {
+   555→            exec.passed = false;
+   556→            exec.status = DiagnosticStatus::Error;
+   557→            exec.failure_detail = e.what();
+   558→        }
+   559→        
+   560→        auto end = std::chrono::high_resolution_clock::now();
+   561→        exec.execution_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+   562→        
+   563→        // Update summary
+   564→        lock.lock();
+   565→        summary.executions.push_back(exec);
+   566→        summary.total_executions++;
+   567→        summary.current_status = exec.status;
+   568→        summary.last_execution = exec.timestamp;
+   569→        
+   570→        if (summary.total_executions == 1) {
+   571→            summary.first_execution = exec.timestamp;
+   572→        }
+   573→        
+   574→        if (exec.passed) {
+   575→            summary.total_passes++;
+   576→        } else {
+   577→            summary.total_failures++;
+   578→        }
+   579→        
+   580→        // Enforce per-diagnostic limit
+   581→        while (summary.executions.size() > m_config.max_executions_per_diagnostic) {
+   582→            summary.executions.erase(summary.executions.begin());
+   583→        }
+   584→        
+   585→        if (m_config.track_all_executions) {
+   586→            m_executions.push_back(exec);
+   587→        }
+   588→        
+   589→        return exec.passed;
+   590→    }
+   591→    
+   592→    /**
+   593→     * Mark a code path as reached (lightweight diagnostic)
+   594→     */
+   595→    void markCodePathReached(const std::string& id) {
+   596→        if (!isEnabled()) return;
+   597→        
+   598→        DiagnosticExecution exec;
+   599→        exec.diagnostic_id = id;
+   600→        exec.status = DiagnosticStatus::Executed;
+   601→        exec.passed = true;
+   602→        exec.result_message = "Code path reached";
+   603→        
+   604→        std::unique_lock lock(m_mutex);
+   605→        
+   606→        auto it = m_diagnostics.find(id);
+   607→        if (it != m_diagnostics.end()) {
+   608→            DiagnosticSummary& summary = it->second;
+   609→            summary.executions.push_back(exec);
+   610→            summary.total_executions++;
+   611→            summary.total_passes++;
+   612→            summary.last_execution = exec.timestamp;
+   613→            
+   614→            if (summary.total_executions == 1) {
+   615→                summary.first_execution = exec.timestamp;
+   616→            }
+   617→        }
+   618→    }
+   619→    
+   620→    /**
+   621→     * Record that a diagnostic was not reachable with reason
+   622→     */
+   623→    void markNotReachable(const std::string& id, NonExecutionReason reason,
+   624→                          const std::string& analysis = "") {
+   625→        if (!isEnabled()) return;
+   626→        
+   627→        std::unique_lock lock(m_mutex);
+   628→        
+   629→        auto it = m_diagnostics.find(id);
+   630→        if (it != m_diagnostics.end()) {
+   631→            it->second.suspected_reason = reason;
+   632→            it->second.non_execution_analysis = analysis;
+   633→            it->second.current_status = DiagnosticStatus::NotReached;
+   634→        }
+   635→    }
+   636→    
+   637→    // ========================================================================
+   638→    // Query Interface
+   639→    // ========================================================================
+   640→    
+   641→    /**
+   642→     * Get summary for a specific diagnostic
+   643→     */
+   644→    std::optional<DiagnosticSummary> getDiagnosticSummary(const std::string& id) const {
+   645→        std::shared_lock lock(m_mutex);
+   646→        
+   647→        auto it = m_diagnostics.find(id);
+   648→        if (it != m_diagnostics.end()) {
+   649→            return it->second;
+   650→        }
+   651→        return std::nullopt;
+   652→    }
+   653→    
+   654→    /**
+   655→     * Get all diagnostics that have never executed
+   656→     */
+   657→    std::vector<DiagnosticSummary> getNeverExecuted() const {
+   658→        std::shared_lock lock(m_mutex);
+   659→        
+   660→        std::vector<DiagnosticSummary> result;
+   661→        for (const auto& [id, summary] : m_diagnostics) {
+   662→            if (!summary.hasEverExecuted() && 
+   663→                summary.current_status != DiagnosticStatus::Removed) {
+   664→                result.push_back(summary);
+   665→            }
+   666→        }
+   667→        return result;
+   668→    }
+   669→    
+   670→    /**
+   671→     * Get all suspicious diagnostics (should be running but aren't)
+   672→     */
+   673→    std::vector<DiagnosticSummary> getSuspicious() const {
+   674→        std::shared_lock lock(m_mutex);
+   675→        
+   676→        std::vector<DiagnosticSummary> result;
+   677→        for (const auto& [id, summary] : m_diagnostics) {
+   678→            if (summary.health == DiagnosticSummary::Health::Suspicious ||
+   679→                summary.health == DiagnosticSummary::Health::Broken) {
+   680→                result.push_back(summary);
+   681→            }
+   682→        }
+   683→        return result;
+   684→    }
+   685→    
+   686→    /**
+   687→     * Generate quality report
+   688→     */
+   689→    DiagnosticQualityReport generateReport() const {
+   690→        DiagnosticQualityReport report;
+   691→        
+   692→        std::shared_lock lock(m_mutex);
+   693→        
+   694→        report.total_diagnostics = m_diagnostics.size();
+   695→        
+   696→        for (const auto& [id, summary] : m_diagnostics) {
+   697→            if (summary.current_status == DiagnosticStatus::Removed) continue;
+   698→            
+   699→            // Categorize
+   700→            switch (summary.health) {
+   701→                case DiagnosticSummary::Health::Healthy:
+   702→                    report.healthy_count++;
+   703→                    break;
+   704→                case DiagnosticSummary::Health::Suspicious:
+   705→                    report.suspicious_count++;
+   706→                    report.suspicious_diagnostics.push_back(summary);
+   707→                    break;
+   708→                case DiagnosticSummary::Health::Broken:
+   709→                    report.broken_count++;
+   710→                    report.broken_diagnostics.push_back(summary);
+   711→                    break;
+   712→                default:
+   713→                    report.unknown_count++;
+   714→                    break;
+   715→            }
+   716→            
+   717→            if (!summary.hasEverExecuted()) {
+   718→                report.never_executed_count++;
+   719→                report.never_executed_diagnostics.push_back(summary);
+   720→            }
+   721→            
+   722→            // By subsystem
+   723→            auto& sub_stats = report.by_subsystem[summary.definition.subsystem];
+   724→            sub_stats.first++;  // Total
+   725→            
+   726→            if (summary.health == DiagnosticSummary::Health::Suspicious ||
+   727→                summary.health == DiagnosticSummary::Health::Broken) {
+   728→                sub_stats.second++;  // Problematic
+   729→            }
+   730→        }
+   731→        
+   732→        // Calculate coverage score
+   733→        size_t executed = report.total_diagnostics - report.never_executed_count;
+   734→        report.coverage_score = report.total_diagnostics > 0 ?
+   735→            static_cast<double>(executed) / report.total_diagnostics : 1.0;
+   736→        
+   737→        // Generate findings and recommendations
+   738→        generateFindings(report);
+   739→        
+   740→        return report;
+   741→    }
+   742→
+   743→private:
+   744→    Config m_config;
+   745→    std::atomic<bool> m_enabled;
+   746→    mutable std::shared_mutex m_mutex;
+   747→    
+   748→    std::map<std::string, DiagnosticSummary> m_diagnostics;
+   749→    std::deque<DiagnosticExecution> m_executions;
+   750→    
+   751→    void generateFindings(DiagnosticQualityReport& report) const {
+   752→        // Finding: Many diagnostics never execute
+   753→        if (report.never_executed_count > report.total_diagnostics * 0.3) {
+   754→            report.findings.push_back(
+   755→                std::to_string(report.never_executed_count) + " of " +
+   756→                std::to_string(report.total_diagnostics) + " diagnostics (" +
+   757→                std::to_string(static_cast<int>((report.never_executed_count * 100.0) / report.total_diagnostics)) +
+   758→                "%) have never executed");
+   759→            report.recommendations.push_back(
+   760→                "Review unreachable diagnostics - may indicate dead code or incorrect assumptions about control flow");
+   761→        }
+   762→        
+   763→        // Finding: Broken diagnostics
+   764→        if (report.broken_count > 0) {
+   765→            report.findings.push_back(
+   766→                std::to_string(report.broken_count) + " diagnostics are failing consistently");
+   767→            report.recommendations.push_back(
+   768→                "Investigate failing diagnostics - they may indicate real bugs or outdated assertions");
+   769→        }
+   770→        
+   771→        // Finding: Subsystem-specific issues
+   772→        for (const auto& [sub, stats] : report.by_subsystem) {
+   773→            if (stats.second > 5) {  // More than 5 problematic in one subsystem
+   774→                report.findings.push_back(
+   775→                    "Subsystem " + subsystemToString(sub) + " has " +
+   776→                    std::to_string(stats.second) + " problematic diagnostics");
+   777→            }
+   778→        }
+   779→        
+   780→        // General recommendations
+   781→        if (report.coverage_score < 0.7) {
+   782→            report.recommendations.insert(report.recommendations.begin(),
+   783→                "Overall diagnostic coverage is low (" +
+   784→                std::to_string(static_cast<int>(report.coverage_score * 100)) +
+   785→                "%) - consider adding reachability markers to verify code paths");
+   786→        }
+   787→    }
+   788→    
+   789→    static std::string getCurrentThreadId() {
+   790→        std::stringstream ss;
+   791→        ss << std::this_thread::get_id();
+   792→        return ss.str();
+   793→    }
+   794→};
+   795→
+   796→} // namespace diagnostics
+   797→} // namespace prosper_debug
+   798→

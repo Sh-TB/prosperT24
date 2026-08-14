@@ -1,0 +1,894 @@
+     1→/**
+     2→ * HLE Contract Auditor - Priority 2
+     3→ * 
+     4→ * PROBLEM SOLVED:
+     5→ * Many hours lost because HLE functions returned success without
+     6→ * performing required side effects.
+     7→ * 
+     8→ * EXAMPLE:
+     9→ *   sceKernelFtruncate() returns SCE_OK
+    10→ *   But: file size unchanged
+    11→ *   Result: Guest continues assuming operation succeeded
+    12→ * 
+    13→ * DESIGN:
+    14→ * - Observer only: Does not modify HLE behavior
+    15→ * - Validates contracts after HLE calls complete
+    16→ * - Reports violations without blocking execution
+    17→ * - Tracks missing side effects for root cause analysis
+    18→ */
+    19→
+    20→#pragma once
+    21→
+    22→#include "../core/foundation.hpp"
+    23→#include <mutex>
+    24→#include <atomic>
+    25→#include <functional>
+    26→#include <unordered_map>
+    27→#include <shared_mutex>
+    28→#include <thread>
+    29→#include <deque>
+    30→
+    31→namespace prosper_debug {
+    32→namespace contracts {
+    33→
+    34→// ============================================================================
+    35→// Contract Types
+    36→// ============================================================================
+    37→
+    38→enum class SideEffectType : uint8_t {
+    39→    // File system effects
+    40→    FileCreated,
+    41→    FileDeleted,
+    42→    FileSizeChanged,
+    43→    FileHandleValid,
+    44→    FilePositionChanged,
+    45→    
+    46→    // Memory effects
+    47→    MemoryAllocated,
+    48→    MemoryFreed,
+    49→    MemoryRegionModified,
+    50→    HandleCreated,
+    51→    HandleDestroyed,
+    52→    HandleValid,
+    53→    
+    54→    // Synchronization effects
+    55→    MutexAcquired,
+    56→    MutexReleased,
+    57→    SemaphoreSignaled,
+    58→    SemaphoreWaited,
+    59→    ConditionVariableTriggered,
+    60→    
+    61→    // Thread effects
+    62→    ThreadCreated,
+    63→    ThreadStarted,
+    64→    ThreadTerminated,
+    65→    ThreadPriorityChanged,
+    66→    
+    67→    // GPU effects
+    68→    GpuResourceCreated,
+    69→    GpuCommandSubmitted,
+    70→    GpuMemoryMapped,
+    71→    GpuMemoryUnmapped,
+    72→    GpuFenceSignaled,
+    73→    
+    74→    // State effects
+    75→    StateVariableSet,
+    76→    CallbackRegistered,
+    77→    EventQueued,
+    78→    
+    79→    // Generic (for custom validation)
+    80→    CustomEffect,
+    81→    EffectVerified
+    82→};
+    83→
+    84→inline std::string sideEffectTypeToString(SideEffectType type) {
+    85→    switch (type) {
+    86→        case SideEffectType::FileCreated: return "FileCreated";
+    87→        case SideEffectType::FileDeleted: return "FileDeleted";
+    88→        case SideEffectType::FileSizeChanged: return "FileSizeChanged";
+    89→        case SideEffectType::FileHandleValid: return "FileHandleValid";
+    90→        case SideEffectType::FilePositionChanged: return "FilePositionChanged";
+    91→        case SideEffectType::MemoryAllocated: return "MemoryAllocated";
+    92→        case SideEffectType::MemoryFreed: return "MemoryFreed";
+    93→        case SideEffectType::MemoryRegionModified: return "MemoryRegionModified";
+    94→        case SideEffectType::HandleCreated: return "HandleCreated";
+    95→        case SideEffectType::HandleDestroyed: return "HandleDestroyed";
+    96→        case SideEffectType::HandleValid: return "HandleValid";
+    97→        case SideEffectType::MutexAcquired: return "MutexAcquired";
+    98→        case SideEffectType::MutexReleased: return "MutexReleased";
+    99→        case SideEffectType::SemaphoreSignaled: return "SemaphoreSignaled";
+   100→        case SideEffectType::SemaphoreWaited: return "SemaphoreWaited";
+   101→        case SideEffectType::ConditionVariableTriggered: return "ConditionVariableTriggered";
+   102→        case SideEffectType::ThreadCreated: return "ThreadCreated";
+   103→        case SideEffectType::ThreadStarted: return "ThreadStarted";
+   104→        case SideEffectType::ThreadTerminated: return "ThreadTerminated";
+   105→        case SideEffectType::ThreadPriorityChanged: return "ThreadPriorityChanged";
+   106→        case SideEffectType::GpuResourceCreated: return "GpuResourceCreated";
+   107→        case SideEffectType::GpuCommandSubmitted: return "GpuCommandSubmitted";
+   108→        case SideEffectType::GpuMemoryMapped: return "GpuMemoryMapped";
+   109→        case SideEffectType::GpuMemoryUnmapped: return "GpuMemoryUnmapped";
+   110→        case SideEffectType::GpuFenceSignaled: return "GpuFenceSignaled";
+   111→        case SideEffectType::StateVariableSet: return "StateVariableSet";
+   112→        case SideEffectType::CallbackRegistered: return "CallbackRegistered";
+   113→        case SideEffectType::EventQueued: return "EventQueued";
+   114→        case SideEffectType::CustomEffect: return "CustomEffect";
+   115→        case SideEffectType::EffectVerified: return "EffectVerified";
+   116→    }
+   117→    return "Unknown";
+   118→}
+   119→
+   120→// ============================================================================
+   121→// Contract Definition
+   122→// ============================================================================
+   123→
+   124→/**
+   125→ * Defines expected contract for an HLE function
+   126→ */
+   127→struct HLEContract {
+   128→    std::string function_name;
+   129→    int function_id{-1};
+   130→    std::string library_name;
+   131→    std::string description;
+   132→    
+   133→    // Expected side effects (must have at least one)
+   134→    struct ExpectedEffect {
+   135→        SideEffectType type;
+   136→        std::string description;
+   137→        bool required{true};           // Must happen vs optional
+   138→        std::map<std::string, std::string> parameters;  // Type-specific params
+   139→        
+   140→        // Validation function (returns true if effect satisfied)
+   141→        std::function<bool()> validator;
+   142→        
+   143→        // For delayed validation (e.g., async operations)
+   144→        bool validate_immediately{true};
+   145→        uint64_t timeout_ms{0};        // 0 = no timeout
+   146→    };
+   147→    
+   148→    std::vector<ExpectedEffect> expected_effects;
+   149→    
+   150→    // Return value constraints
+   151→    struct ReturnValueConstraint {
+   152→        bool check_return_value{false};
+   153→        std::set<int> success_codes;     // These codes indicate success
+   154→        std::set<int> failure_codes;     // These codes indicate known failures
+   155→        bool allow_other_codes{false};   // Unknown codes are warnings or errors
+   156→    };
+   157→    
+   158→    ReturnValueConstraint return_constraint;
+   159→    
+   160→    // Pre-conditions (should be true before call)
+   161→    std::vector<std::function<bool()>> preconditions;
+   162→    
+   163→    // Post-conditions (should be true after call)
+   164→    std::vector<std::function<bool()>> postconditions;
+   165→};
+   166→
+   167→// ============================================================================
+   168→// Side Effect Record
+   169→// ============================================================================
+   170→
+   171→struct SideEffectRecord {
+   172→    std::string id;
+   173→    DebugTimestamp timestamp;
+   174→    SideEffectType type;
+   175→    
+   176→    // What happened
+   177→    std::string description;
+   178→    std::map<std::string, std::string> data;  // Type-specific data
+   179→    
+   180→    // Provenance
+   181→    Subsystem subsystem{Subsystem::HLE_Other};
+   182→    SourceLocation source;
+   183→    std::string hle_function_name;
+   184→    
+   185→    // Verification
+   186→    bool verified{false};
+   187→    std::string verification_detail;
+   188→    
+   189→    static std::string generateId() {
+   190→        static std::atomic<uint64_t> counter{0};
+   191→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+   192→        return "se_" + std::to_string(now) + "_" + std::to_string(++counter);
+   193→    }
+   194→    
+   195→    SideEffectRecord() {
+   196→        id = generateId();
+   197→        timestamp = DebugTimestamp::now();
+   198→    }
+   199→    
+   200→    std::string toJson() const {
+   201→        std::stringstream json;
+   202→        json << "{\n";
+   203→        json << "  \"id\": \"" << JsonUtils::escapeJson(id) << "\",\n";
+   204→        json << "  \"timestamp\": \"" << timestamp.toISO8601() << "\",\n";
+   205→        json << "  \"type\": \"" << sideEffectTypeToString(type) << "\",\n";
+   206→        json << "  \"description\": \"" << JsonUtils::escapeJson(description) << "\",\n";
+   207→        json << "  \"verified\": " << (verified ? "true" : "false") << ",\n";
+   208→        json << "  \"hle_function\": \"" << JsonUtils::escapeJson(hle_function_name) << "\"\n";
+   209→        json << "}";
+   210→        return json.str();
+   211→    }
+   212→};
+   213→
+   214→// ============================================================================
+   215→// HLE Call Record
+   216→// ============================================================================
+   217→
+   218→enum class CallStatus : uint8_t {
+   219→    Started,
+   220→    Completed,
+   221→    ContractPassed,
+   222→    ContractFailed,
+   223→    MissingSideEffects,
+   224→    ExceptionDuringCall,
+   225→    Timeout
+   226→};
+   227→
+   228→inline std::string callStatusToString(CallStatus status) {
+   229→    switch (status) {
+   230→        case CallStatus::Started: return "Started";
+   231→        case CallStatus::Completed: return "Completed";
+   232→        case CallStatus::ContractPassed: return "ContractPassed";
+   233→        case CallStatus::ContractFailed: return "ContractFailed";
+   234→        case CallStatus::MissingSideEffects: return "MissingSideEffects";
+   235→        case CallStatus::ExceptionDuringCall: return "ExceptionDuringCall";
+   236→        case CallStatus::Timeout: return "Timeout";
+   237→    }
+   238→    return "Unknown";
+   239→}
+   240→
+   241→struct HLECallRecord {
+   242→    std::string id;
+   243→    DebugTimestamp start_time;
+   244→    DebugTimestamp end_time;
+   245→    
+   246→    // Function identification
+   247→    std::string function_name;
+   248→    int function_id{-1};
+   249→    std::string library_name;
+   250→    
+   251→    // Call parameters (serialized)
+   252→    std::string parameters_json;
+   253→    
+   254→    // Result
+   255→    int return_value{0};
+   256→    CallStatus status{CallStatus::Started};
+   257→    std::string error_message;
+   258→    
+   259→    // Contract validation
+   260→    std::vector<SideEffectRecord> observed_effects;
+   261→    std::vector<std::string> missing_required_effects;
+   262→    std::vector<std::string> failed_validations;
+   263→    
+   264→    // Provenance
+   265→    SourceLocation caller_location;
+   266→    std::string thread_id;
+   267→    uint64_t guest_call_site{0};
+   268→    
+   269→    static std::string generateId() {
+   270→        static std::atomic<uint64_t> counter{0};
+   271→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+   272→        return "call_" + std::to_string(now) + "_" + std::to_string(++counter);
+   273→    }
+   274→    
+   275→    HLECallRecord() {
+   276→        id = generateId();
+   277→        start_time = DebugTimestamp::now();
+   278→    }
+   279→    
+   280→    /**
+   281→     * Calculate duration in microseconds
+   282→     */
+   283→    uint64_t durationMicroseconds() const {
+   284→        if (end_time.steady_clock.time_since_epoch().count() == 0) {
+   285→            return 0;  // Not yet completed
+   286→        }
+   287→        auto duration = end_time.steady_clock - start_time.steady_clock;
+   288→        return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+   289→    }
+   290→    
+   291→    std::string toJson() const {
+   292→        std::stringstream json;
+   293→        json << "{\n";
+   294→        json << "  \"id\": \"" << JsonUtils::escapeJson(id) << "\",\n";
+   295→        json << "  \"function\": \"" << JsonUtils::escapeJson(function_name) << "\",\n";
+   296→        json << "  \"library\": \"" << JsonUtils::escapeJson(library_name) << "\",\n";
+   297→        json << "  \"return_value\": " << return_value << ",\n";
+   298→        json << "  \"status\": \"" << callStatusToString(status) << "\",\n";
+   299→        json << "  \"duration_us\": " << durationMicroseconds() << ",\n";
+   300→        json << "  \"observed_effects\": " << observed_effects.size() << ",\n";
+   301→        json << "  \"missing_effects\": " << missing_required_effects.size() << "\n";
+   302→        
+   303→        if (!missing_required_effects.empty()) {
+   304→            json << ",\n  \"missing_effect_details\": [\n";
+   305→            for (size_t i = 0; i < missing_required_effects.size(); ++i) {
+   306→                json << "    \"" << JsonUtils::escapeJson(missing_required_effects[i]) << "\"";
+   307→                if (i < missing_required_effects.size() - 1) json << ",";
+   308→                json << "\n";
+   309→            }
+   310→            json << "  ]";
+   311→        }
+   312→        
+   313→        json << "\n}";
+   314→        return json.str();
+   315→    }
+   316→};
+   317→
+   318→// ============================================================================
+   319→// Violation Report
+   320→// ============================================================================
+   321→
+   322→struct ContractViolation {
+   323→    HLECallRecord call_record;
+   324→    HLEContract contract;
+   325→    
+   326→    // What went wrong
+   327→    std::vector<std::string> missing_side_effects;
+   328→    std::vector<std::string> failed_postconditions;
+   329→    std::vector<std::string> unexpected_errors;
+   330→    std::vector<std::string> failed_validations;
+   331→    
+   332→    // Severity assessment
+   333→    Severity severity{Severity::Warning};
+   334→    std::string impact_description;
+   335→    
+   336→    // Suggested fix (if detectable)
+   337→    std::string suggested_fix;
+   338→    
+   339→    std::string toJson() const {
+   340→        std::stringstream json;
+   341→        json << "{\n";
+   342→        json << "  \"function\": \"" << JsonUtils::escapeJson(call_record.function_name) << "\",\n";
+   343→        json << "  \"severity\": \"" << severityToString(severity) << "\",\n";
+   344→        json << "  \"missing_side_effects\": " << missing_side_effects.size() << ",\n";
+   345→        json << "  \"impact\": \"" << JsonUtils::escapeJson(impact_description) << "\",\n";
+   346→        json << "  \"suggested_fix\": \"" << JsonUtils::escapeJson(suggested_fix) << "\"\n";
+   347→        json << "}";
+   348→        return json.str();
+   349→    }
+   350→};
+   351→
+   352→// ============================================================================
+   353→// HLE Contract Auditor - Main Class
+   354→// ============================================================================
+   355→
+   356→class HLEContractAuditor {
+   357→public:
+   358→    struct Config {
+   359→        bool enabled;
+   360→        bool strict_mode;          // Fail on any missing effect
+   361→        bool log_all_calls;        // Log even passing calls
+   362→        bool auto_register_common;  // Auto-register contracts for common HLE
+   363→        size_t max_history;        // Max calls to keep
+   364→        
+   365→        Config()
+   366→            : enabled(true)
+   367→            , strict_mode(false)
+   368→            , log_all_calls(false)
+   369→            , auto_register_common(true)
+   370→            , max_history(10000) {}
+   371→        
+   372→        Config(bool en, bool sm, bool lac, bool arc, size_t mh)
+   373→            : enabled(en)
+   374→            , strict_mode(sm)
+   375→            , log_all_calls(lac)
+   376→            , auto_register_common(arc)
+   377→            , max_history(mh) {}
+   378→        
+   379→        static Config lenient() {
+   380→            return Config(true, false, false, true, 50000);
+   381→        }
+   382→        
+   383→        static Config strict() {
+   384→            return Config(true, true, true, true, 100000);
+   385→        }
+   386→    };
+   387→    
+   388→    explicit HLEContractAuditor(const Config& config = Config())
+   389→        : m_config(config), m_enabled(config.enabled) {}
+   390→    
+   391→    // ========================================================================
+   392→    // Control Interface
+   393→    // ========================================================================
+   394→    
+   395→    void enable() { m_enabled = true; }
+   396→    void disable() { m_enabled = false; }
+   397→    bool isEnabled() const { return m_enabled; }
+   398→    
+   399→    void clear() {
+   400→        std::unique_lock lock(m_mutex);
+   401→        m_call_history.clear();
+   402→        m_active_calls.clear();
+   403→        m_violations.clear();
+   404→        m_contracts.clear();
+   405→    }
+   406→    
+   407→    // ========================================================================
+   408→    // Contract Registration
+   409→    // ========================================================================
+   410→    
+   411→    /**
+   412→     * Register a contract for an HLE function
+   413→     */
+   414→    void registerContract(const HLEContract& contract) {
+   415→        std::unique_lock lock(m_mutex);
+   416→        
+   417→        std::string key = makeContractKey(contract.function_name, contract.library_name);
+   418→        m_contracts[key] = contract;
+   419→    }
+   420→    
+   421→    /**
+   422→     * Register a simple contract with just required side effects
+   423→     */
+   424→    void registerSimpleContract(
+   425→        const std::string& function_name,
+   426→        const std::string& library_name,
+   427→        const std::vector<SideEffectType>& required_effects,
+   428→        const std::set<int>& success_codes = {0}) {
+   429→        
+   430→        HLEContract contract;
+   431→        contract.function_name = function_name;
+   432→        contract.library_name = library_name;
+   433→        contract.return_constraint.check_return_value = true;
+   434→        contract.return_constraint.success_codes = success_codes;
+   435→        
+   436→        for (auto effect_type : required_effects) {
+   437→            HLEContract::ExpectedEffect effect;
+   438→            effect.type = effect_type;
+   439→            effect.required = true;
+   440→            effect.description = sideEffectTypeToString(effect_type);
+   441→            contract.expected_effects.push_back(effect);
+   442→        }
+   443→        
+   444→        registerContract(contract);
+   445→    }
+   446→    
+   447→    /**
+   448→     * Pre-register common HLE contracts
+   449→     */
+   450→    void registerCommonContracts() {
+   451→        // File operations
+   452→        registerSimpleContract("sceKernelOpen", "libkernel", 
+   453→            {SideEffectType::FileHandleValid}, {0});
+   454→        registerSimpleContract("sceKernelClose", "libkernel",
+   455→            {}, {0});  // Close may not have observable effects
+   456→        registerSimpleContract("sceKernelRead", "libkernel",
+   457→            {SideEffectType::FilePositionChanged});
+   458→        registerSimpleContract("sceKernelWrite", "libkernel",
+   459→            {SideEffectType::FilePositionChanged, SideEffectType::FileSizeChanged});
+   460→        registerSimpleContract("sceKernelFtruncate", "libkernel",
+   461→            {SideEffectType::FileSizeChanged});
+   462→        
+   463→        // Memory operations
+   464→        registerSimpleContract("sceKernelAllocateDirectMemory", "libkernel",
+   465→            {SideEffectType::MemoryAllocated});
+   466→        registerSimpleContract("sceKernelFreeDirectMemory", "libkernel",
+   467→            {SideEffectType::MemoryFreed});
+   468→        registerSimpleContract("sceKernelMapDirectMemory", "libkernel",
+   469→            {SideEffectType::MemoryRegionModified});
+   470→        
+   471→        // Synchronization
+   472→        registerSimpleContract("sceKernelCreateMutex", "libkernel",
+   473→            {SideEffectType::HandleCreated});
+   474→        registerSimpleContract("sceKernelCreateSema", "libkernel",
+   475→            {SideEffectType::HandleCreated});
+   476→        registerSimpleContract("sceKernelCreateCond", "libkernel",
+   477→            {SideEffectType::HandleCreated});
+   478→        
+   479→        // Thread operations
+   480→        registerSimpleContract("sceKernelCreateThread", "libkernel",
+   481→            {SideEffectType::ThreadCreated, SideEffectType::HandleCreated});
+   482→        
+   483→        // GPU operations
+   484→        registerSimpleContract("sceGnmSubmitCommandBuffers", "libgnm",
+   485→            {SideEffectType::GpuCommandSubmitted});
+   486→        registerSimpleContract("sceGnmAddReleaseQueue", "libgnm",
+   487→            {});
+   488→    }
+   489→    
+   490→    // ========================================================================
+   491→    // Call Tracking Interface (Call From HLE Wrappers)
+   492→    // ========================================================================
+   493→    
+   494→    /**
+   495→     * Start tracking an HLE call
+   496→     * Returns call ID to use when completing the call
+   497→     */
+   498→    std::string startCall(
+   499→        const std::string& function_name,
+   500→        int function_id,
+   501→        const std::string& library_name,
+   502→        const SourceLocation& caller = DEBUG_HERE(),
+   503→        const std::string& params_json = "{}") {
+   504→        
+   505→        if (!isEnabled()) return "";
+   506→        
+   507→        HLECallRecord record;
+   508→        record.function_name = function_name;
+   509→        record.function_id = function_id;
+   510→        record.library_name = library_name;
+   511→        record.caller_location = caller;
+   512→        record.parameters_json = params_json;
+   513→        record.thread_id = getCurrentThreadId();
+   514→        record.status = CallStatus::Started;
+   515→        
+   516→        std::unique_lock lock(m_mutex);
+   517→        m_active_calls[record.id] = record;
+   518→        
+   519→        return record.id;
+   520→    }
+   521→    
+   522→    /**
+   523→     * Complete an HLE call and validate contract
+   524→     */
+   525→    void completeCall(
+   526→        const std::string& call_id,
+   527→        int return_value,
+   528→        const std::vector<SideEffectRecord>& observed_effects = {}) {
+   529→        
+   530→        if (!isEnabled() || call_id.empty()) return;
+   531→        
+   532→        std::unique_lock lock(m_mutex);
+   533→        
+   534→        auto it = m_active_calls.find(call_id);
+   535→        if (it == m_active_calls.end()) return;
+   536→        
+   537→        HLECallRecord& record = it->second;
+   538→        record.return_value = return_value;
+   539→        record.end_time = DebugTimestamp::now();
+   540→        record.observed_effects = observed_effects;
+   541→        
+   542→        // Validate against registered contract
+   543→        validateCall(record);
+   544→        
+   545→        // Move from active to history
+   546→        m_call_history.push_back(record);
+   547→        m_active_calls.erase(it);
+   548→        
+   549→        // Enforce history limit
+   550→        while (m_call_history.size() > m_config.max_history) {
+   551→            m_call_history.pop_front();
+   552→        }
+   553→    }
+   554→    
+   555→    /**
+   556→     * Convenience: Complete call with no side effects recorded
+   557→     */
+   558→    void completeCallNoEffects(const std::string& call_id, int return_value) {
+   559→        completeCall(call_id, return_value, {});
+   560→    }
+   561→    
+   562→    /**
+   563→     * Record that a specific side effect occurred during a call
+   564→     * (Can be called between startCall and completeCall)
+   565→     */
+   566→    void recordSideEffect(
+   567→        const std::string& call_id,
+   568→        SideEffectType type,
+   569→        const std::string& description = "",
+   570→        const std::map<std::string, std::string>& data = {},
+   571→        const SourceLocation& source = DEBUG_HERE()) {
+   572→        
+   573→        if (!isEnabled() || call_id.empty()) return;
+   574→        
+   575→        std::unique_lock lock(m_mutex);
+   576→        
+   577→        auto it = m_active_calls.find(call_id);
+   578→        if (it == m_active_calls.end()) return;
+   579→        
+   580→        SideEffectRecord effect;
+   581→        effect.type = type;
+   582→        effect.description = description.empty() ? sideEffectTypeToString(type) : description;
+   583→        effect.data = data;
+   584→        effect.source = source;
+   585→        effect.hle_function_name = it->second.function_name;
+   586→        effect.verified = true;
+   587→        
+   588→        it->second.observed_effects.push_back(effect);
+   589→    }
+   590→    
+   591→    // ========================================================================
+   592→    // Query Interface
+   593→    // ========================================================================
+   594→    
+   595→    /**
+   596→     * Get all contract violations
+   597→     */
+   598→    std::vector<ContractViolation> getViolations() const {
+   599→        std::shared_lock lock(m_mutex);
+   600→        return m_violations;
+   601→    }
+   602→    
+   603→    /**
+   604→     * Get violations for a specific function
+   605→     */
+   606→    std::vector<ContractViolation> getViolationsForFunction(
+   607→        const std::string& function_name) const {
+   608→        
+   609→        std::shared_lock lock(m_mutex);
+   610→        std::vector<ContractViolation> result;
+   611→        
+   612→        for (const auto& violation : m_violations) {
+   613→            if (violation.call_record.function_name == function_name) {
+   614→                result.push_back(violation);
+   615→            }
+   616→        }
+   617→        
+   618→        return result;
+   619→    }
+   620→    
+   621→    /**
+   622→     * Get call history for a function
+   623→     */
+   624→    std::vector<HLECallRecord> getCallHistory(
+   625→        const std::string& function_name,
+   626→        size_t limit = 100) const {
+   627→        
+   628→        std::shared_lock lock(m_mutex);
+   629→        std::vector<HLECallRecord> result;
+   630→        
+   631→        // Search from most recent
+   632→        for (auto it = m_call_history.rbegin(); 
+   633→             it != m_call_history.rend() && result.size() < limit; ++it) {
+   634→            
+   635→            if (it->function_name == function_name) {
+   636→                result.push_back(*it);
+   637→            }
+   638→        }
+   639→        
+   640→        return result;
+   641→    }
+   642→    
+   643→    /**
+   644→     * Get statistics about contract compliance
+   645→     */
+   646→    struct ComplianceStats {
+   647→        size_t total_calls{0};
+   648→        size_t passed_calls{0};
+   649→        size_t failed_calls{0};
+   650→        size_t calls_with_missing_effects{0};
+   651→        
+   652→        // By library
+   653→        std::map<std::string, size_t> calls_by_library;
+   654→        std::map<std::string, size_t> violations_by_library;
+   655→        
+   656→        // Most problematic functions
+   657→        std::vector<std::pair<std::string, size_t>> top_violations;
+   658→        
+   659→        double pass_rate() const {
+   660→            return total_calls > 0 ? 
+   661→                static_cast<double>(passed_calls) / total_calls : 1.0;
+   662→        }
+   663→        
+   664→        std::string toJson() const {
+   665→            std::stringstream json;
+   666→            json << "{\n";
+   667→            json << "  \"total_calls\": " << total_calls << ",\n";
+   668→            json << "  \"passed\": " << passed_calls << ",\n";
+   669→            json << "  \"failed\": " << failed_calls << ",\n";
+   670→            json << "  \"pass_rate\": " << std::fixed << std::setprecision(2) 
+   671→                 << (pass_rate() * 100.0) << "%\n";
+   672→            json << "}";
+   673→            return json.str();
+   674→        }
+   675→    };
+   676→    
+   677→    ComplianceStats getComplianceStats() const {
+   678→        std::shared_lock lock(m_mutex);
+   679→        
+   680→        ComplianceStats stats;
+   681→        stats.total_calls = m_call_history.size();
+   682→        
+   683→        // Count by function for top violators
+   684→        std::map<std::string, size_t> violation_counts;
+   685→        
+   686→        for (const auto& call : m_call_history) {
+   687→            stats.calls_by_library[call.library_name]++;
+   688→            
+   689→            switch (call.status) {
+   690→                case CallStatus::ContractPassed:
+   691→                    stats.passed_calls++;
+   692→                    break;
+   693→                case CallStatus::ContractFailed:
+   694→                case CallStatus::MissingSideEffects:
+   695→                    stats.failed_calls++;
+   696→                    stats.calls_with_missing_effects++;
+   697→                    violation_counts[call.function_name]++;
+   698→                    stats.violations_by_library[call.library_name]++;
+   699→                    break;
+   700→                default:
+   701→                    break;
+   702→            }
+   703→        }
+   704→        
+   705→        // Sort for top violators
+   706→        using PairType = std::pair<std::string, size_t>;
+   707→        std::vector<PairType> sorted(violation_counts.begin(), violation_counts.end());
+   708→        std::sort(sorted.begin(), sorted.end(),
+   709→            [](const PairType& a, const PairType& b) { return b.second < a.second; });
+   710→        
+   711→        stats.top_violations.assign(sorted.begin(), 
+   712→            sorted.begin() + std::min(sorted.size(), size_t(10)));
+   713→        
+   714→        return stats;
+   715→    }
+   716→    
+   717→    // ========================================================================
+   718→    // Export
+   719→    // ========================================================================
+   720→    
+   721→    /**
+   722→     * Export all data as JSON
+   723→     */
+   724→    std::string exportToJson() const {
+   725→        std::shared_lock lock(m_mutex);
+   726→        
+   727→        std::stringstream json;
+   728→        json << "{\n";
+   729→        json << "  \"export_timestamp\": \"" << DebugTimestamp::now().toISO8601() << "\",\n";
+   730→        
+   731→        // Statistics
+   732→        auto stats = getComplianceStats();
+   733→        json << "  \"statistics\": " << stats.toJson() << ",\n";
+   734→        
+   735→        // Recent violations
+   736→        json << "  \"recent_violations\": [\n";
+   737→        size_t count = 0;
+   738→        for (const auto& violation : m_violations) {
+   739→            if (count++ > 50) break;  // Limit output
+   740→            json << "    " << violation.toJson();
+   741→            if (count < m_violations.size() && count <= 50) json << ",";
+   742→            json << "\n";
+   743→        }
+   744→        json << "  ]\n";
+   745→        
+   746→        json << "}\n";
+   747→        return json.str();
+   748→    }
+   749→
+   750→private:
+   751→    Config m_config;
+   752→    std::atomic<bool> m_enabled;
+   753→    mutable std::shared_mutex m_mutex;
+   754→    
+   755→    // Registered contracts
+   756→    std::map<std::string, HLEContract> m_contracts;
+   757→    
+   758→    // Active calls (in progress)
+   759→    std::map<std::string, HLECallRecord> m_active_calls;
+   760→    
+   761→    // Completed call history
+   762→    std::deque<HLECallRecord> m_call_history;
+   763→    
+   764→    // Contract violations
+   765→    std::vector<ContractViolation> m_violations;
+   766→    
+   767→    // ========================================================================
+   768→    // Internal Methods
+   769→    // ========================================================================
+   770→    
+   771→    std::string makeContractKey(const std::string& func, const std::string& lib) {
+   772→        return lib + "::" + func;
+   773→    }
+   774→    
+   775→    void validateCall(HLECallRecord& record) {
+   776→        std::string key = makeContractKey(record.function_name, record.library_name);
+   777→        
+   778→        auto contract_it = m_contracts.find(key);
+   779→        if (contract_it == m_contracts.end()) {
+   780→            // No contract registered - mark as passed (or warning in strict mode)
+   781→            record.status = m_config.strict_mode ? 
+   782→                CallStatus::MissingSideEffects : CallStatus::Completed;
+   783→            return;
+   784→        }
+   785→        
+   786→        const HLEContract& contract = contract_it->second;
+   787→        ContractViolation violation;
+   788→        violation.call_record = record;
+   789→        violation.contract = contract;
+   790→        
+   791→        bool has_failure = false;
+   792→        
+   793→        // Check each expected effect
+   794→        for (const auto& expected : contract.expected_effects) {
+   795→            if (!expected.required) continue;
+   796→            
+   797→            bool found = false;
+   798→            for (const auto& observed : record.observed_effects) {
+   799→                if (observed.type == expected.type) {
+   800→                    found = true;
+   801→                    
+   802→                    // Run custom validator if provided
+   803→                    if (expected.validator && !expected.validator()) {
+   804→                        violation.failed_validations.push_back(
+   805→                            "Validator failed for: " + expected.description);
+   806→                        has_failure = true;
+   807→                    }
+   808→                    
+   809→                    break;
+   810→                }
+   811→            }
+   812→            
+   813→            if (!found) {
+   814→                violation.missing_side_effects.push_back(expected.description);
+   815→                has_failure = true;
+   816→                
+   817→                // Also add to call record
+   818→                record.missing_required_effects.push_back(expected.description);
+   819→            }
+   820→        }
+   821→        
+   822→        // Check return value constraint
+   823→        if (contract.return_constraint.check_return_value) {
+   824→            bool is_success = contract.return_constraint.success_codes.count(record.return_value) > 0;
+   825→            bool is_known_failure = contract.return_constraint.failure_codes.count(record.return_value) > 0;
+   826→            
+   827→            if (!is_success && !is_known_failure && !contract.return_constraint.allow_other_codes) {
+   828→                violation.unexpected_errors.push_back(
+   829→                    "Unexpected return value: " + std::to_string(record.return_value));
+   830→                has_failure = true;
+   831→            }
+   832→        }
+   833→        
+   834→        // Determine final status
+   835→        if (has_failure) {
+   836→            record.status = violation.missing_side_effects.empty() ?
+   837→                CallStatus::ContractFailed : CallStatus::MissingSideEffects;
+   838→            
+   839→            // Assess severity
+   840→            assessViolationSeverity(violation);
+   841→            
+   842→            // Store violation
+   843→            m_violations.push_back(violation);
+   844→            
+   845→            // Keep violations bounded
+   846→            while (m_violations.size() > m_config.max_history) {
+   847→                m_violations.erase(m_violations.begin());
+   848→            }
+   849→        } else {
+   850→            record.status = CallStatus::ContractPassed;
+   851→        }
+   852→    }
+   853→    
+   854→    void assessViolationSeverity(ContractViolation& violation) {
+   855→        // Critical: File handle claimed valid but wasn't created
+   856→        for (const auto& missing : violation.missing_side_effects) {
+   857→            if (missing.find("FileHandle") != std::string::npos ||
+   858→                missing.find("Handle") != std::string::npos) {
+   859→                violation.severity = Severity::Error;
+   860→                violation.impact_description = 
+   861→                    "Guest may use invalid handle, leading to crashes or corruption";
+   862→                violation.suggested_fix =
+   863→                    "Ensure handle is properly created and tracked before returning success";
+   864→                return;
+   865→            }
+   866→        }
+   867→        
+   868→        // Warning: State change not performed
+   869→        for (const auto& missing : violation.missing_side_effects) {
+   870→            if (missing.find("State") != std::string::npos ||
+   871→                missing.find("Modified") != std::string::npos) {
+   872→                violation.severity = Severity::Warning;
+   873→                violation.impact_description =
+   874→                    "Guest may operate on stale state, causing incorrect behavior";
+   875→                return;
+   876→            }
+   877→        }
+   878→        
+   879→        // Default
+   880→        violation.severity = Severity::Info;
+   881→        violation.impact_description =
+   882→            "HLE function may not fully implement expected behavior";
+   883→    }
+   884→    
+   885→    static std::string getCurrentThreadId() {
+   886→        std::stringstream ss;
+   887→        ss << std::this_thread::get_id();
+   888→        return ss.str();
+   889→    }
+   890→};
+   891→
+   892→} // namespace contracts
+   893→} // namespace prosper_debug
+   894→

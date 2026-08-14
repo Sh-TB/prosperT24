@@ -1,36 +1,55 @@
-# Debug Intelligence Layer for Prosper/SharpEmuT24
+# Debug Intelligence Platform for Prosper/SharpEmuT24
 
-**Version:** 1.0.0  
-**Type:** Observer-Only Evidence Management System  
+**Version:** 2.0.0 (Next Generation)  
+**Type:** Observer-Only Evidence Management & Reasoning System  
 **Language:** C++17  
-**Storage Format:** JSON (.exp.json)
+**Storage Format:** JSON (.exp.json, .replay.json)
 
 ---
 
 ## Overview
 
-The Debug Intelligence Layer is an **evidence management and reasoning assistant** designed specifically for AI-assisted debugging workflows in the Prosper PS4 emulator project. It is **not a debugger replacement**—rather, it provides structured capture, organization, and analysis of debugging data to support both human investigators and AI assistants.
+The Debug Intelligence Platform is a **comprehensive evidence management and reasoning assistant** designed specifically for AI-assisted debugging workflows in the Prosper PS4 emulator project. Based on analysis of **3000+ investigation history entries**, it addresses the biggest time losses in debugging: missing observability, repeated investigations, and inability to trace root causes across subsystem boundaries.
 
-### Core Philosophy
+### Core Philosophy (Golden Rules)
 
-1. **Observer Only**: Zero modifications to emulator behavior, runtime, loader, HLE, or GPU systems
+1. **Observer Only**: Zero modifications to emulator behavior, runtime, loader, HLE, GPU, CPU, or memory allocator
 2. **Evidence-Backed**: All conclusions require supporting data points
 3. **AI-Friendly**: Structured JSON output optimized for LLM consumption
-4. **Non-Invasive**: Can be added to any project without affecting existing functionality
+4. **Root Cause Focus**: Crash location ≠ corruption location—track provenance across frames
+5. **Temporal Awareness**: When matters as much as what—frame-level precision tracking
+6. **Non-Invasive**: Can be added to any project without affecting existing functionality
+7. **Performance Safe**: Zero overhead unless explicitly enabled
 
 ---
 
 ## Architecture
 
-### Module Structure
+### Module Structure (v2.0 - 7 Priority Modules)
 
 ```
 debug_intelligence/
-├── debug_intelligence.hpp       # Core types, enums, data structures
-├── experiment_recorder.hpp      # Build/env/log/crash capture, EXP generation
-├── report_generator.hpp         # Root cause report generation (text + JSON)
+├── core/
+│   └── foundation.hpp           # P0: Core types, timestamps, JSON utils
+├── memory/
+│   └── provenance_tracker.hpp   # P1: Memory write tracking (Who wrote this value?)
+├── contracts/
+│   └── hle_contract_auditor.hpp # P2: HLE side-effect validation
+├── timeline/
+│   └── state_timeline.hpp       # P3: Frame-level object lifecycle tracking
+├── diagnostics/
+│   └── quality_analyzer.hpp     # P4: Diagnostic reachability analysis
+├── history/
+│   └── intelligence_database.hpp# P5: Searchable experiment/hypothesis DB
+├── graph/
+│   └── causal_dependency_graph.hpp # P6: Cross-layer dependency mapping
+├── replay/
+│   └── replay_package.hpp       # P7: Deterministic investigation packages
+├── debug_intelligence.hpp       # Legacy v1.0 types (backward compatible)
+├── experiment_recorder.hpp      # Build/env/log/crash capture
+├── report_generator.hpp         # Root cause report generation
 ├── history_search.hpp           # Duplicate detection, upstream fix awareness
-├── cli_interface.hpp            # Command-line interface
+├── cli_interface.hpp            # Command-line interface (fork-only)
 ├── main.cpp                     # Executable entry point
 └── CMakeLists.txt               # Build configuration
 ```
@@ -692,9 +711,438 @@ export DEBUG_INTEL_VERBOSE=1
 
 ---
 
+## Next Generation Modules (v2.0)
+
+Based on analysis of **3000+ investigation history entries**, these 7 priority modules address the biggest time losses in emulator debugging:
+
+### P1: Memory Provenance Tracker (Highest Priority)
+
+**Problem Solved:** "Who wrote this bad value?"
+
+```cpp
+#include "debug_intelligence/memory/provenance_tracker.hpp"
+
+prosper_debug::memory::MemoryProvenanceTracker tracker;
+tracker.enable();
+
+// Watch address range
+tracker.watchRange(0x2000000000, 0x10000);
+
+// On memory write (instrument existing code)
+uint64_t value = 0xDEADBEEF;
+tracker.recordWrite(0x20000000100, &value, sizeof(value), 
+                   prosper_debug::Subsystem::GPU, DEBUG_HERE());
+
+// When corruption detected:
+auto writers = tracker.whoWrote(0x20000000100);  // All writers
+auto last = tracker.lastWriter(0x20000000100);   // Most recent
+auto history = tracker.getMemoryHistory(0x20000000100, 100); // Last 100 events
+
+// Export for AI analysis
+std::string json = tracker.exportToJson();
+```
+
+**Key Features:**
+- Observer-only: No memory allocation changes
+- Ring buffer: Bounded memory usage (configurable)
+- Thread-safe: Can be called from any thread
+- Pattern detection: Auto-detects suspicious write sequences
+- JSON export: AI-ready output with full provenance
+
+**Output Format:**
+```json
+{
+  "address": "0x20000000100",
+  "writers": [
+    {
+      "timestamp": "2024-01-15T10:30:45.123Z",
+      "frame": 1250,
+      "old_value": "0x0000000000000000",
+      "new_value": "0xDEADBEEFCAFEBABE",
+      "subsystem": "GPU",
+      "caller": "gpu_release_mem.cpp:150",
+      "thread": "GPU Cmd Buffer"
+    }
+  ]
+}
+```
+
+---
+
+### P2: HLE Contract Auditor
+
+**Problem Solved:** HLE functions return success without performing required side effects.
+
+```cpp
+#include "debug_intelligence/contracts/hle_contract_auditor.hpp"
+
+prosper_debug::contracts::HLEContractAuditor auditor;
+auditor.enable();
+
+// Register expected contract
+prosper_debug::contracts::HLEContract contract;
+contract.function_name = "sceKernelFtruncate";
+contract.expected_effects.push_back({
+    prosper_debug::contracts::SideEffectType::FileSizeChanged,
+    true  // required
+});
+auditor.registerContract(contract);
+
+// Around HLE call:
+auditor.startCall("sceKernelFtruncate", "call_123", "libkernel", DEBUG_HERE());
+// ... actual HLE call happens ...
+auditor.completeCall("call_123", 0);  // return value
+
+// Check for violations
+auto violations = auditor.getViolations();
+for (const auto& v : violations) {
+    std::cout << "VIOLATION: " << v.function_name 
+              << " missing: " << v.missing_side_effects.size() << "\n";
+}
+```
+
+**Supported Side Effects:**
+- File system: Create, Delete, SizeChange, PositionChange
+- Memory: Allocate, Free, Modify, HandleCreate/Destroy
+- Sync: Mutex, Semaphore, ConditionVariable operations
+- Thread: Create, Start, Terminate, PriorityChange
+- GPU: Resource, Command, Fence, Texture operations
+
+---
+
+### P3: State Timeline System
+
+**Problem Solved:** Crash location ≠ corruption location. Need historical state.
+
+```cpp
+#include "debug_intelligence/timeline/state_timeline.hpp"
+
+prosper_debug::timeline::StateTimelineSystem timeline;
+timeline.enable();
+
+// Track object lifecycle
+timeline.watchObject("texture_001");
+
+// Record events (called from instrumentation points)
+timeline.recordEvent(
+    prosper_debug::timeline::TimelineEventType::ObjectCreated,
+    "texture_001", DEBUG_HERE(), prosper_debug::Subsystem::GPU
+);
+timeline.setFrame(200);
+
+timeline.recordEvent(
+    prosper_debug::timeline::TimelineEventType::ObjectModified,
+    "texture_001", DEBUG_HERE(), prosper_debug::Subsystem::GPU
+);
+timeline.setFrame(600);
+
+// Query at crash time (frame 1300)
+auto lifecycle = timeline.getObjectLifecycle("texture_001");
+if (lifecycle) {
+    std::cout << "Created: frame " << lifecycle->created_frame << "\n";
+    std::cout << "Last modified: frame " << lifecycle->last_modified_frame << "\n";
+    std::cout << "Invalidated: " << (lifecycle->invalidated ? "yes" : "no") << "\n";
+}
+
+// Find objects destroyed before crash
+auto stale = timeline.findObjectsDestroyedBeforeFrame(1250);
+```
+
+**Event Types:**
+- Lifecycle: ObjectCreated, ObjectDestroyed, ObjectModified, StateChanged
+- Resource: Allocated, Freed, Mapped, Unmapped
+- GPU: CommandSubmitted, CommandCompleted, FenceCreated, TextureUploaded
+- Memory: RegionAllocated, RegionFreed, ProtectionChanged
+
+---
+
+### P4: Diagnostic Quality Analyzer
+
+**Problem Solved:** Diagnostics added but never executed (dead code paths).
+
+```cpp
+#include "debug_intelligence/diagnostics/quality_analyzer.hpp"
+
+prosper_debug::diagnostics::DiagnosticQualityAnalyzer analyzer;
+analyzer.enable();
+
+// Register diagnostic
+prosper_debug::diagnostics::DiagnosticDefinition def;
+def.id = "diag_nullptr_check";
+def.location = {"memory_manager.cpp", 250, "allocate"};
+def.description = "Check for nullptr before dereference";
+def.condition = "ptr != nullptr";
+analyzer.registerDiagnostic(def);
+
+// Mark when diagnostic code path is reached
+if (ptr != nullptr) {
+    analyzer.executeDiagnostic("diag_nullptr_check");
+    // ... diagnostic logic ...
+}
+
+// Check health
+auto summary = analyzer.getDiagnosticSummary("diag_nullptr_check");
+if (summary) {
+    std::cout << "Executed: " << summary->execution_count << " times\n";
+    std::cout << "Last reached: " << summary->last_execution.toISO8601() << "\n";
+    
+    if (summary->status == prosper_debug::diagnostics::DiagnosticStatus::NotReached) {
+        std::cout << "WARNING: Diagnostic code path not executed!\n";
+        std::cout << "Possible reasons: " << summary->not_reached_reason << "\n";
+    }
+}
+
+// Generate quality report
+auto report = analyzer.generateReport();
+```
+
+**Analysis Features:**
+- Tracks registration vs execution count
+- Detects unreachable diagnostics ("NOT REACHED" reporting)
+- Identifies suspicious patterns (never-executed diagnostics)
+- Provides reasons why diagnostic might not execute
+- Health scoring for diagnostic coverage
+
+---
+
+### P5: Evidence/Hypothesis Intelligence Database
+
+**Problem Solved:** Thousands of experiments created knowledge, but it was lost.
+
+```cpp
+#include "debug_intelligence/history/intelligence_database.hpp"
+
+prosper_debug::history::EvidenceIntelligenceDatabase db;
+
+// Create experiment
+std::string exp_id = db.createExperiment(
+    "GPU Memory Corruption Investigation",
+    "Crash in allocator after GPU ReleaseMem",
+    {"gpu", "memory", "crash", "allocator"}
+);
+
+// Add hypothesis
+std::string hyp_id = db.createHypothesis(exp_id,
+    "GPU wrote to freed memory",
+    "ReleaseMem command target already freed"
+);
+
+// Link evidence
+db.linkEvidence(hyp_id, "evd_memory_dump_001");
+db.linkEvidence(hyp_id, "evd_gpu_trace_042");
+
+// Confirm hypothesis
+db.confirmHypothesis(hyp_id, "Memory provenance shows GPU write to freed page");
+
+// Search for similar past investigations
+auto similar = db.searchText("GPU memory corruption");
+for (const auto& exp : similar) {
+    std::cout << "Similar: " << exp.title 
+              << " Status: " << experimentStatusToString(exp.status) << "\n";
+}
+
+// Find known upstream fixes
+auto fixes = db.findRelevantUpstreamFixes("allocator");
+```
+
+**Search Capabilities:**
+- Full-text search across experiments/hypotheses
+- Similarity detection (bigram overlap)
+- Tag-based filtering
+- Status-based queries (Running, Completed, Failed)
+- Upstream fix correlation
+
+---
+
+### P6: Causal Dependency Graph
+
+**Problem Solved:** Emulator debugging has multiple layers; crashes propagate across boundaries.
+
+```
+Guest Application
+       ↓
+HLE (High-Level Emulation)
+       ↓
+Kernel
+       ↓
+Memory ← Crash here (symptom)
+       ↑
+CPU → GPU ← Actual cause (wrote to freed memory 20s ago)
+       ↓
+Host System
+```
+
+```cpp
+#include "debug_intelligence/graph/causal_dependency_graph.hpp"
+
+prosper_debug::graph::CausalDependencyGraph graph;
+
+// Build dependency model
+std::string guest = graph.addNode(
+    prosper_debug::graph::NodeType::Object,
+    "game_main",
+    prosper_debug::graph::EmulationLayer::Guest,
+    DEBUG_HERE()
+);
+
+std::string gpu_op = graph.addNode(
+    prosper_debug::graph::NodeType::FunctionCall,
+    "gpu_release_mem",
+    prosper_debug::graph::EmulationLayer::GPU,
+    DEBUG_HERE(),
+    prosper_debug::Subsystem::GPU
+);
+
+std::string mem_alloc = graph.addNode(
+    prosper_debug::graph::NodeType::Operation,
+    "memory_allocate",
+    prosper_debug::graph::EmulationLayer::Memory,
+    DEBUG_HERE(),
+    prosper_debug::Subsystem::Memory
+);
+
+// Define relationships
+graph.addEdge(guest, gpu_op, prosper_debug::graph::EdgeType::Calls);
+graph.addEdge(gpu_op, mem_alloc, prosper_debug::graph::EdgeType::WritesTo);
+
+// When crash occurs, trace root cause
+auto analysis = graph.analyzeRootCause(mem_alloc, "allocation_failure");
+for (const auto& candidate : analysis.ranked_candidates) {
+    std::cout << "Candidate: " << candidate.node_id 
+              << " Score: " << candidate.confidence_score << "\n";
+    std::cout << "Path: ";
+    for (const auto& node : candidate.causality_path) {
+        std::cout << node << " → ";
+    }
+    std::cout << "\n";
+}
+```
+
+**Layer Types:** Guest, HLE, Kernel, Memory, CPU, GPU, Audio, Input, FileSystem, Network, Host
+
+**Edge Types:** Calls, ReadsFrom, WritesTo, DependsOn, Locks, Signals, AllocatesFor
+
+---
+
+### P7: Replay Debug Package
+
+**Problem Solved:** Many bugs require reproducing exact previous state.
+
+```cpp
+#include "debug_intelligence/replay/replay_package.hpp"
+
+prosper_debug::replay::ReplayPackageBuilder builder;
+builder.initialize("GPU Corruption Investigation", "Full evidence package");
+
+// Set build environment
+prosper_debug::replay::CommitInfo commit;
+commit.hash = "a1b2c3d4";
+commit.branch = "feature/memory-fix";
+commit.message="Fix GPU memory tracking";
+builder.setCommitInfo(commit);
+
+// Set system environment
+prosper_debug::replay::EnvironmentSnapshot env;
+env.os_name = "Linux";
+env.architecture = "x86_64";
+env.cpu_count = 8;
+env.total_memory_mb = 32768;
+builder.setEnvironmentSnapshot(env);
+
+// Add component data from other modules
+builder.addComponentFile("memory_provenance", tracker.exportToJson());
+builder.addComponentFile("hle_contracts", auditor.exportToJson());
+builder.addComponentFile("state_timeline", timeline.exportAllToJson());
+
+// Add crash record
+prosper_debug::replay::CrashRecord crash;
+crash.type = prosper_debug::replay::CrashRecord::CrashType::Segfault;
+crash.fault_address = "0x20000000100";
+crash.frame_number = 1300;
+builder.addCrashRecord(crash);
+
+// Include logs and screenshots
+builder.addLogFile("/tmp/prosper.log");
+builder.addScreenshot("/tmp/crash_state.png");
+
+// Build complete package
+auto manifest_path = builder.buildPackage();
+// Creates: debug_replay/package_20240115_103045/
+//   ├── manifest.json
+//   ├── commit.json
+//   ├── environment.json
+//   ├── memory_provenance.json
+//   ├── hle_contracts.json
+//   ├── state_timeline.json
+//   ├── crashes.json
+//   ├── logs/prosper.log
+//   └── screenshots/crash_state.png
+```
+
+**Loading a Package Later:**
+```cpp
+// Months later, reopen investigation
+auto meta = prosper_debug::replay::ReplayPackageLoader::loadManifest(package_dir);
+std::cout << "Package: " << meta.title << " Created: " << meta.created_at.toISO8601();
+
+auto memory_data = prosper_debug::replay::ReplayPackageLoader::loadComponent(
+    package_dir, "memory_provenance");
+```
+
+---
+
+## Compilation & Testing
+
+### Build All Modules
+
+```bash
+# Test compilation of individual modules
+g++ -std=c++17 -fsyntax-only -I src \
+    src/debug_intelligence/core/foundation.hpp
+g++ -std=c++17 -fsyntax-only -I src \
+    src/debug_intelligence/memory/provenance_tracker.hpp
+# ... etc for all modules
+
+# Run comprehensive test suite
+g++ -std=c++17 -I src tests/test_compile_check.cpp -o test_platform
+./test_platform
+```
+
+### Test Results (Current)
+
+```
+=== Debug Intelligence Platform - Compilation & Basic Test ===
+Test 1: Core Foundation Types... ✅ PASSED
+Test 2: Memory Provenance Tracker (P1)... ✅ PASSED
+Test 3: HLE Contract Auditor (P2)... ✅ PASSED
+Test 4: State Timeline System (P3)... ✅ PASSED
+Test 5: Diagnostic Quality Analyzer (P4)... ✅ PASSED
+Test 6: Intelligence Database (P5)... ✅ PASSED
+Test 7: Causal Dependency Graph (P6)... ✅ PASSED
+Test 8: Replay Debug Package (P7)... ✅ PASSED
+
+=== SUMMARY ===
+Passed: 8/8 🎉
+```
+
+---
+
 ## Version History
 
-### v1.0.0 (Current)
+### v2.0.0 (Next Generation - Current)
+- **P1**: Memory Provenance Tracker - Answer "Who wrote this value?"
+- **P2**: HLE Contract Auditor - Validate side-effect contracts
+- **P3**: State Timeline System - Frame-level object lifecycle tracking
+- **P4**: Diagnostic Quality Analyzer - Detect unreachable diagnostics
+- **P5**: Evidence/Hypothesis Intelligence Database - Searchable history
+- **P6**: Causal Dependency Graph - Cross-layer root cause tracing
+- **P7**: Replay Debug Package - Deterministic investigation snapshots
+- Refactored core types into foundation.hpp
+- Full C++17 compliance
+- Thread-safe design throughout
+- JSON-first data format for AI consumption
+
+### v1.0.0 (Legacy)
 - Initial release
 - Core evidence management
 - Hypothesis tracking

@@ -1,0 +1,827 @@
+     1→/**
+     2→ * Debug Intelligence Platform - Core Foundation Types
+     3→ * 
+     4→ * Based on analysis of 3000+ Prosper/SharpEmuT24 debugging investigations.
+     5→ * 
+     6→ * DESIGN PHILOSOPHY:
+     7→ * - Observer Only: Zero modifications to emulator behavior
+     8→ * - Evidence First: Every conclusion requires supporting data
+     9→ * - Root Cause Focus: Crash location ≠ corruption location
+    10→ * - Temporal Awareness: When matters as much as what
+    11→ * 
+    12→ * @version 2.0.0
+    13→ * @license MIT
+    14→ * 
+    15→ * GOLDEN RULES:
+    16→ * 1. No loader/HLE/GPU/CPU behavior changes
+    17→ * 2. No automatic fixes or hidden corrections
+    18→ * 3. Every diagnostic must prove: when, who, what evidence, rejected hypotheses
+    19→ * 4. Performance impact only when explicitly enabled
+    20→ */
+    21→
+    22→#pragma once
+    23→
+    24→#include <string>
+    25→#include <vector>
+    26→#include <map>
+    27→#include <set>
+    28→#include <optional>
+    29→#include <chrono>
+    30→#include <filesystem>
+    31→#include <fstream>
+    32→#include <sstream>
+    33→#include <algorithm>
+    34→#include <functional>
+    35→#include <memory>
+    36→#include <array>
+    37→#include <cstdint>
+    38→#include <ctime>
+    39→
+    40→namespace fs = std::filesystem;
+    41→namespace prosper_debug {
+    42→
+    43→// ============================================================================
+    44→// Version & Metadata
+    45→// ============================================================================
+    46→
+    47→constexpr const char* PLATFORM_VERSION = "2.0.0";
+    48→constexpr const char* PLATFORM_NAME = "Prosper Debug Intelligence";
+    49→
+    50→// ============================================================================
+    51→// Timestamp Utilities
+    52→// ============================================================================
+    53→
+    54→/**
+    55→ * High-resolution timestamp for precise event tracking
+    56→ */
+    57→class DebugTimestamp {
+    58→public:
+    59→    static DebugTimestamp now() {
+    60→        DebugTimestamp ts;
+    61→        ts.wall_clock = std::chrono::system_clock::now();
+    62→        ts.steady_clock = std::chrono::steady_clock::now();
+    63→        ts.frame_number = 0;  // Set by caller if in emulation context
+    64→        return ts;
+    65→    }
+    66→    
+    67→    static DebugTimestamp atFrame(uint64_t frame) {
+    68→        DebugTimestamp ts = now();
+    69→        ts.frame_number = frame;
+    70→        return ts;
+    71→    }
+    72→    
+    73→    /**
+    74→     * ISO 8601 formatted timestamp
+    75→     */
+    76→    std::string toISO8601() const {
+    77→        auto time_t = std::chrono::system_clock::to_time_t(wall_clock);
+    78→        std::stringstream ss;
+    79→        ss << std::put_time(std::gmtime(&time_t), "%Y-%m-%dT%H:%M:%SZ");
+    80→        return ss.str();
+    81→    }
+    82→    
+    83→    /**
+    84→     * File-friendly timestamp (no colons)
+    85→     */
+    86→    std::string toFileFriendly() const {
+    87→        auto time_t = std::chrono::system_clock::to_time_t(wall_clock);
+    88→        std::stringstream ss;
+    89→        ss << std::put_time(std::gmtime(&time_t), "%Y%m%d_%H%M%S");
+    90→        
+    91→        // Add milliseconds for uniqueness
+    92→        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    93→            wall_clock.time_since_epoch()) % 1000;
+    94→        ss << "_" << ms.count();
+    95→        
+    96→        return ss.str();
+    97→    }
+    98→    
+    99→    /**
+   100→     * Microseconds since epoch (for sorting/comparison)
+   101→     */
+   102→    uint64_t toMicroseconds() const {
+   103→        return std::chrono::duration_cast<std::chrono::microseconds>(
+   104→            wall_clock.time_since_epoch()).count();
+   105→    }
+   106→    
+   107→    // Time sources
+   108→    std::chrono::system_clock::time_point wall_clock;
+   109→    std::chrono::steady_clock::time_point steady_clock;
+   110→    uint64_t frame_number{0};
+   111→    
+   112→    // Comparison operators
+   113→    inline bool operator<(const DebugTimestamp& other) const {
+   114→        return wall_clock < other.wall_clock;
+   115→    }
+   116→    
+   117→    inline bool operator>(const DebugTimestamp& other) const {
+   118→        return wall_clock > other.wall_clock;
+   119→    }
+   120→    
+   121→    inline bool operator==(const DebugTimestamp& other) const {
+   122→        return wall_clock == other.wall_clock;
+   123→    }
+   124→};
+   125→
+   126→// ============================================================================
+   127→// Subsystem Identification
+   128→// ============================================================================
+   129→
+   130→/**
+   131→ * Emulator subsystems for source attribution
+   132→ */
+   133→enum class Subsystem : uint8_t {
+   134→    Unknown = 0,
+   135→    
+   136→    // Core systems
+   137→    CPU,
+   138→    Memory,
+   139→    GPU,
+   140→    Audio,
+   141→    Input,
+   142→    
+   143→    // Kernel layer
+   144→    Kernel,
+   145→    FileSystem,
+   146→    ThreadManager,
+   147→    Synchronization,
+   148→    
+   149→    // HLE layer
+   150→    HLE_LibKernel,
+   151→    HLE_LibGpu,
+   152→    HLE_LibAudio,
+   153→    HLE_LibNet,
+   154→    HLE_LibPng,
+   155→    HLE_LibJpeg,
+   156→    HLE_LibZlib,
+   157→    HLE_LibSsl,
+   158→    HLE_LibCrypto,
+   159→    HLE_Other,
+   160→    
+   161→    // Application layer
+   162→    GuestApplication,
+   163→    IL2CPP_Runtime,
+   164→    GameCode,
+   165→    
+   166→    // Diagnostic infrastructure
+   167→    DiagnosticSystem,
+   168→    TestFramework,
+   169→    
+   170→    // External
+   171→    HostSystem,
+   172→    FileSystemHost
+   173→};
+   174→
+   175→/**
+   176→ * Convert subsystem enum to string
+   177→ */
+   178→inline std::string subsystemToString(Subsystem subs) {
+   179→    switch (subs) {
+   180→        case Subsystem::Unknown: return "Unknown";
+   181→        case Subsystem::CPU: return "CPU";
+   182→        case Subsystem::Memory: return "Memory";
+   183→        case Subsystem::GPU: return "GPU";
+   184→        case Subsystem::Audio: return "Audio";
+   185→        case Subsystem::Input: return "Input";
+   186→        case Subsystem::Kernel: return "Kernel";
+   187→        case Subsystem::FileSystem: return "FileSystem";
+   188→        case Subsystem::ThreadManager: return "ThreadManager";
+   189→        case Subsystem::Synchronization: return "Synchronization";
+   190→        case Subsystem::HLE_LibKernel: return "HLE.LibKernel";
+   191→        case Subsystem::HLE_LibGpu: return "HLE.LibGpu";
+   192→        case Subsystem::HLE_LibAudio: return "HLE.LibAudio";
+   193→        case Subsystem::HLE_LibNet: return "HLE.LibNet";
+   194→        case Subsystem::HLE_LibPng: return "HLE.LibPng";
+   195→        case Subsystem::HLE_LibJpeg: return "HLE.LibJpeg";
+   196→        case Subsystem::HLE_LibZlib: return "HLE.LibZlib";
+   197→        case Subsystem::HLE_LibSsl: return "HLE.LibSsl";
+   198→        case Subsystem::HLE_LibCrypto: return "HLE.LibCrypto";
+   199→        case Subsystem::HLE_Other: return "HLE.Other";
+   200→        case Subsystem::GuestApplication: return "GuestApplication";
+   201→        case Subsystem::IL2CPP_Runtime: return "IL2CPP.Runtime";
+   202→        case Subsystem::GameCode: return "GameCode";
+   203→        case Subsystem::DiagnosticSystem: return "DiagnosticSystem";
+   204→        case Subsystem::TestFramework: return "TestFramework";
+   205→        case Subsystem::HostSystem: return "HostSystem";
+   206→        case Subsystem::FileSystemHost: return "FileSystemHost";
+   207→    }
+   208→    return "Unknown";
+   209→}
+   210→
+   211→/**
+   212→ * Parse subsystem from string
+   213→ */
+   214→inline Subsystem subsystemFromString(const std::string& str) {
+   215→    static const std::map<std::string, Subsystem> map = {
+   216→        {"CPU", Subsystem::CPU},
+   217→        {"Memory", Subsystem::Memory},
+   218→        {"GPU", Subsystem::GPU},
+   219→        {"Audio", Subsystem::Audio},
+   220→        {"Input", Subsystem::Input},
+   221→        {"Kernel", Subsystem::Kernel},
+   222→        {"FileSystem", Subsystem::FileSystem},
+   223→        {"ThreadManager", Subsystem::ThreadManager},
+   224→        {"Synchronization", Subsystem::Synchronization},
+   225→        {"HLE.LibKernel", Subsystem::HLE_LibKernel},
+   226→        {"HLE.LibGpu", Subsystem::HLE_LibGpu},
+   227→        {"HLE.LibAudio", Subsystem::HLE_LibAudio},
+   228→        {"HLE.LibNet", Subsystem::HLE_LibNet},
+   229→        {"HLE.LibPng", Subsystem::HLE_LibPng},
+   230→        {"HLE.LibJpeg", Subsystem::HLE_LibJpeg},
+   231→        {"HLE.LibZlib", Subsystem::HLE_LibZlib},
+   232→        {"HLE.LibSsl", Subsystem::HLE_LibSsl},
+   233→        {"HLE.LibCrypto", Subsystem::HLE_LibCrypto},
+   234→        {"HLE.Other", Subsystem::HLE_Other},
+   235→        {"GuestApplication", Subsystem::GuestApplication},
+   236→        {"IL2CPP.Runtime", Subsystem::IL2CPP_Runtime},
+   237→        {"GameCode", Subsystem::GameCode},
+   238→        {"DiagnosticSystem", Subsystem::DiagnosticSystem},
+   239→        {"TestFramework", Subsystem::TestFramework},
+   240→        {"HostSystem", Subsystem::HostSystem},
+   241→        {"FileSystemHost", Subsystem::FileSystemHost}
+   242→    };
+   243→    
+   244→    auto it = map.find(str);
+   245→    return it != map.end() ? it->second : Subsystem::Unknown;
+   246→}
+   247→
+   248→// ============================================================================
+   249→// Severity Levels
+   250→// ============================================================================
+   251→
+   252→enum class Severity : uint8_t {
+   253→    Info = 0,
+   254→    Warning,
+   255→    Error,
+   256→    Critical,
+   257→    Fatal
+   258→};
+   259→
+   260→inline std::string severityToString(Severity sev) {
+   261→    switch (sev) {
+   262→        case Severity::Info: return "Info";
+   263→        case Severity::Warning: return "Warning";
+   264→        case Severity::Error: return "Error";
+   265→        case Severity::Critical: return "Critical";
+   266→        case Severity::Fatal: return "Fatal";
+   267→    }
+   268→    return "Info";
+   269→}
+   270→
+   271→inline Severity severityFromString(const std::string& str) {
+   272→    if (str == "Warning") return Severity::Warning;
+   273→    if (str == "Error") return Severity::Error;
+   274→    if (str == "Critical") return Severity::Critical;
+   275→    if (str == "Fatal") return Severity::Fatal;
+   276→    return Severity::Info;
+   277→}
+   278→
+   279→// ============================================================================
+   280→// Source Location - Who Caused This?
+   281→// ============================================================================
+   282→
+   283→/**
+   284→ * Precise source attribution for any event
+   285→ */
+   286→struct SourceLocation {
+   287→    std::string file_name;
+   288→    int line_number{0};
+   289→    std::string function_name;
+   290→    std::string module_name;  // Library/module
+   291→    
+   292→    // For HLE calls
+   293→    std::string hle_function_name;
+   294→    int hle_function_id{-1};
+   295→    
+   296→    // For guest code
+   297→    uint64_t guest_address{0};
+   298→    std::string symbol_name;
+   299→    
+   300→    bool isValid() const {
+   301→        return !file_name.empty() || !function_name.empty() || 
+   302→               !hle_function_name.empty() || guest_address != 0;
+   303→    }
+   304→    
+   305→    std::string toString() const {
+   306→        std::stringstream ss;
+   307→        
+   308→        if (!hle_function_name.empty()) {
+   309→            ss << hle_function_name;
+   310→            if (!file_name.empty()) {
+   311→                ss << " at " << file_name;
+   312→                if (line_number > 0) {
+   313→                    ss << ":" << line_number;
+   314→                }
+   315→            }
+   316→        } else if (!function_name.empty()) {
+   317→            ss << function_name << "()";
+   318→            if (!file_name.empty()) {
+   319→                ss << " at " << file_name << ":" << line_number;
+   320→            }
+   321→        } else if (guest_address != 0) {
+   322→            ss << "0x" << std::hex << guest_address << std::dec;
+   323→            if (!symbol_name.empty()) {
+   324→                ss << " (" << symbol_name << ")";
+   325→            }
+   326→        } else {
+   327→            ss << "unknown location";
+   328→        }
+   329→        
+   330→        return ss.str();
+   331→    }
+   332→    
+   333→    /**
+   334→     * Create SourceLocation from current position (use macros)
+   335→     */
+   336→    static SourceLocation here(const std::string& file, int line, 
+   337→                               const std::string& func) {
+   338→        return {file, line, func, {}, {}, -1, 0, {}};
+   339→    }
+   340→};
+   341→
+   342→// Convenience macros for capturing source locations
+   343→#define DEBUG_HERE() ::prosper_debug::SourceLocation::here(__FILE__, __LINE__, __func__)
+   344→#define DEBUG_HLE(func_name, func_id) ::prosper_debug::SourceLocation{__FILE__, __LINE__, __func__, {}, (func_name), (func_id), 0, {}}
+   345→#define DEBUG_GUEST(addr, sym) ::prosper_debug::SourceLocation{__FILE__, __LINE__, __func__, {}, {}, -1, (addr), (sym)}
+   346→
+   347→// ============================================================================
+   348→// Evidence Types - What Do We Know?
+   349→// ============================================================================
+   350→
+   351→enum class EvidenceType : uint8_t {
+   352→    // Memory events
+   353→    MemoryWrite,
+   354→    MemoryRead,
+   355→    MemoryAllocation,
+   356→    MemoryFree,
+   357→    MemoryCorruptionDetected,
+   358→    
+   359→    // State changes
+   360→    StateChange,
+   361→    ResourceCreated,
+   362→    ResourceDestroyed,
+   363→    ResourceModified,
+   364→    
+   365→    // Execution flow
+   366→    FunctionEntry,
+   367→    FunctionExit,
+   368→    BranchTaken,
+   369→    ExceptionThrown,
+   370→    ExceptionCaught,
+   371→    
+   372→    // HLE specific
+   373→    HLE_CallStart,
+   374→    HLE_CallEnd,
+   375→    HLE_ContractViolation,
+   376→    HLE_SideEffectRecorded,
+   377→    HLE_MissingSideEffect,
+   378→    
+   379→    // System events
+   380→    Crash,
+   381→    AssertionFailure,
+   382→    LogMessage,
+   383→    WarningIssued,
+   384→    
+   385→    // Diagnostic
+   386→    DiagnosticRegistered,
+   387→    DiagnosticExecuted,
+   388→    DiagnosticNotReached,
+   389→    DiagnosticFailed,
+   390→    
+   391→    // User observations
+   392→    UserNote,
+   393→    HypothesisFormed,
+   394→    HypothesisConfirmed,
+   395→    HypothesisRejected,
+   396→    
+   397→    // External
+   398→    EnvironmentSnapshot,
+   399→    BuildInfo,
+   400→    GitCommit,
+   401→    ConfigurationChange
+   402→};
+   403→
+   404→inline std::string evidenceTypeToString(EvidenceType type) {
+   405→    switch (type) {
+   406→        case EvidenceType::MemoryWrite: return "MemoryWrite";
+   407→        case EvidenceType::MemoryRead: return "MemoryRead";
+   408→        case EvidenceType::MemoryAllocation: return "MemoryAllocation";
+   409→        case EvidenceType::MemoryFree: return "MemoryFree";
+   410→        case EvidenceType::MemoryCorruptionDetected: return "MemoryCorruptionDetected";
+   411→        case EvidenceType::StateChange: return "StateChange";
+   412→        case EvidenceType::ResourceCreated: return "ResourceCreated";
+   413→        case EvidenceType::ResourceDestroyed: return "ResourceDestroyed";
+   414→        case EvidenceType::ResourceModified: return "ResourceModified";
+   415→        case EvidenceType::FunctionEntry: return "FunctionEntry";
+   416→        case EvidenceType::FunctionExit: return "FunctionExit";
+   417→        case EvidenceType::BranchTaken: return "BranchTaken";
+   418→        case EvidenceType::ExceptionThrown: return "ExceptionThrown";
+   419→        case EvidenceType::ExceptionCaught: return "ExceptionCaught";
+   420→        case EvidenceType::HLE_CallStart: return "HLE.CallStart";
+   421→        case EvidenceType::HLE_CallEnd: return "HLE.CallEnd";
+   422→        case EvidenceType::HLE_ContractViolation: return "HLE.ContractViolation";
+   423→        case EvidenceType::HLE_SideEffectRecorded: return "HLE.SideEffectRecorded";
+   424→        case EvidenceType::HLE_MissingSideEffect: return "HLE.MissingSideEffect";
+   425→        case EvidenceType::Crash: return "Crash";
+   426→        case EvidenceType::AssertionFailure: return "AssertionFailure";
+   427→        case EvidenceType::LogMessage: return "LogMessage";
+   428→        case EvidenceType::WarningIssued: return "WarningIssued";
+   429→        case EvidenceType::DiagnosticRegistered: return "Diagnostic.Registered";
+   430→        case EvidenceType::DiagnosticExecuted: return "Diagnostic.Executed";
+   431→        case EvidenceType::DiagnosticNotReached: return "Diagnostic.NotReached";
+   432→        case EvidenceType::DiagnosticFailed: return "Diagnostic.Failed";
+   433→        case EvidenceType::UserNote: return "UserNote";
+   434→        case EvidenceType::HypothesisFormed: return "Hypothesis.Formed";
+   435→        case EvidenceType::HypothesisConfirmed: return "Hypothesis.Confirmed";
+   436→        case EvidenceType::HypothesisRejected: return "Hypothesis.Rejected";
+   437→        case EvidenceType::EnvironmentSnapshot: return "EnvironmentSnapshot";
+   438→        case EvidenceType::BuildInfo: return "BuildInfo";
+   439→        case EvidenceType::GitCommit: return "GitCommit";
+   440→        case EvidenceType::ConfigurationChange: return "ConfigurationChange";
+   441→    }
+   442→    return "Unknown";
+   443→}
+   444→
+   445→// ============================================================================
+   446→// Core Evidence Structure
+   447→// ============================================================================
+   448→
+   449→/**
+   450→ * Single piece of evidence with full provenance
+   451→ * 
+   452→ * Every evidence item MUST answer:
+   453→ * - WHEN did it happen? (timestamp)
+   454→ * - WHO caused it? (source_location + subsystem)
+   455→ * - WHAT happened? (type + data)
+   456→ * - Why is this notable? (severity)
+   457→ */
+   458→struct Evidence {
+   459→    // Unique identifier
+   460→    std::string id;
+   461→    
+   462→    // When
+   463→    DebugTimestamp timestamp;
+   464→    
+   465→    // Who
+   466→    Subsystem subsystem{Subsystem::Unknown};
+   467→    SourceLocation source;
+   468→    std::string thread_id;
+   469→    
+   470→    // What
+   471→    EvidenceType type{EvidenceType::LogMessage};
+   472→    std::string description;
+   473→    
+   474→    // Data payload (JSON-serializable string)
+   475→    std::string data_json;
+   476→    
+   477→    // Significance
+   478→    Severity severity{Severity::Info};
+   479→    
+   480→    // Verification
+   481→    bool verified{false};
+   482→    std::string verification_method;
+   483→    
+   484→    // Relationships
+   485→    std::string parent_id;       // Causal parent
+   486→    std::vector<std::string> related_ids;
+   487→    std::vector<std::string> refutes_ids;  // This evidence refutes these hypotheses
+   488→    
+   489→    // Metadata
+   490→    std::map<std::string, std::string> tags;
+   491→    std::map<std::string, std::string> metadata;
+   492→    
+   493→    // Generation
+   494→    static std::string generateId() {
+   495→        static uint64_t counter = 0;
+   496→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+   497→        return "evd_" + std::to_string(now) + "_" + std::to_string(++counter);
+   498→    }
+   499→    
+   500→    Evidence() {
+   501→        id = generateId();
+   502→        timestamp = DebugTimestamp::now();
+   503→    }
+   504→    
+   505→    /**
+   506→     * Convert to map for JSON serialization
+   507→     */
+   508→    std::map<std::string, std::string> toMap() const {
+   509→        return {
+   510→            {"id", id},
+   511→            {"timestamp", timestamp.toISO8601()},
+   512→            {"frame", std::to_string(timestamp.frame_number)},
+   513→            {"subsystem", subsystemToString(subsystem)},
+   514→            {"source", source.toString()},
+   515→            {"thread_id", thread_id},
+   516→            {"type", evidenceTypeToString(type)},
+   517→            {"description", description},
+   518→            {"data", data_json},
+   519→            {"severity", severityToString(severity)},
+   520→            {"verified", verified ? "true" : "false"},
+   521→            {"parent_id", parent_id}
+   522→        };
+   523→    }
+   524→};
+   525→
+   526→// ============================================================================
+   527→// Evidence Collection
+   528→// ============================================================================
+   529→
+   530→class EvidenceCollection {
+   531→public:
+   532→    void add(const Evidence& evidence) {
+   533→        m_evidences[evidence.id] = evidence;
+   534→        
+   535→        // Update indexes
+   536→        m_by_type[static_cast<size_t>(evidence.type)].push_back(evidence.id);
+   537→        m_by_subsystem[static_cast<size_t>(evidence.subsystem)].push_back(evidence.id);
+   538→        
+   539→        if (evidence.severity >= Severity::Error) {
+   540→            m_errors.push_back(evidence.id);
+   541→        }
+   542→    }
+   543→    
+   544→    bool remove(const std::string& id) {
+   545→        auto it = m_evidences.find(id);
+   546→        if (it == m_evidences.end()) return false;
+   547→        
+   548→        // Update indexes (slow but correct)
+   549→        Evidence evd = it->second;
+   550→        auto& type_vec = m_by_type[static_cast<size_t>(evd.type)];
+   551→        type_vec.erase(std::remove(type_vec.begin(), type_vec.end(), id), type_vec.end());
+   552→        
+   553→        auto& sub_vec = m_by_subsystem[static_cast<size_t>(evd.subsystem)];
+   554→        sub_vec.erase(std::remove(sub_vec.begin(), sub_vec.end(), id), sub_vec.end());
+   555→        
+   556→        m_errors.erase(std::remove(m_errors.begin(), m_errors.end(), id), m_errors.end());
+   557→        
+   558→        m_evidences.erase(it);
+   559→        return true;
+   560→    }
+   561→    
+   562→    std::optional<Evidence> find(const std::string& id) const {
+   563→        auto it = m_evidences.find(id);
+   564→        if (it != m_evidences.end()) return it->second;
+   565→        return std::nullopt;
+   566→    }
+   567→    
+   568→    std::vector<Evidence> findByType(EvidenceType type) const {
+   569→        std::vector<Evidence> result;
+   570→        for (const auto& id : m_by_type[static_cast<size_t>(type)]) {
+   571→            if (auto evd = find(id)) result.push_back(*evd);
+   572→        }
+   573→        return result;
+   574→    }
+   575→    
+   576→    std::vector<Evidence> findBySubsystem(Subsystem subs) const {
+   577→        std::vector<Evidence> result;
+   578→        for (const auto& id : m_by_subsystem[static_cast<size_t>(subs)]) {
+   579→            if (auto evd = find(id)) result.push_back(*evd);
+   580→        }
+   581→        return result;
+   582→    }
+   583→    
+   584→    std::vector<Evidence> findErrors() const {
+   585→        std::vector<Evidence> result;
+   586→        for (const auto& id : m_errors) {
+   587→            if (auto evd = find(id)) result.push_back(*evd);
+   588→        }
+   589→        return result;
+   590→    }
+   591→    
+   592→    std::vector<Evidence> findByTimeRange(DebugTimestamp start, DebugTimestamp end) const {
+   593→        std::vector<Evidence> result;
+   594→        for (const auto& [id, evd] : m_evidences) {
+   595→            if (evd.timestamp >= start && evd.timestamp <= end) {
+   596→                result.push_back(evd);
+   597→            }
+   598→        }
+   599→        return result;
+   600→    }
+   601→    
+   602→    std::vector<Evidence> all() const {
+   603→        std::vector<Evidence> result;
+   604→        result.reserve(m_evidences.size());
+   605→        for (const auto& [id, evd] : m_evidences) {
+   606→            result.push_back(evd);
+   607→        }
+   608→        return result;
+   609→    }
+   610→    
+   611→    size_t size() const { return m_evidences.size(); }
+   612→    bool empty() const { return m_evidences.empty(); }
+   613→    
+   614→    void clear() {
+   615→        m_evidences.clear();
+   616→        for (auto& vec : m_by_type) vec.clear();
+   617→        for (auto& vec : m_by_subsystem) vec.clear();
+   618→        m_errors.clear();
+   619→    }
+   620→
+   621→private:
+   622→    std::map<std::string, Evidence> m_evidences;
+   623→    
+   624→    // Indexes for fast queries
+   625→    std::array<std::vector<std::string>, 48> m_by_type;      // EvidenceType count
+   626→    std::array<std::vector<std::string>, 30> m_by_subsystem;   // Subsystem count
+   627→    std::vector<std::string> m_errors;
+   628→};
+   629→
+   630→// ============================================================================
+   631→// Investigation Status Tracking
+   632→// ============================================================================
+   633→
+   634→enum class InvestigationStatus : uint8_t {
+   635→    Open,
+   636→    InProgress,
+   637→    AwaitingEvidence,
+   638→    Blocked,
+   639→    Confirmed,
+   640→    Rejected,
+   641→    Superseded,
+   642→    Closed
+   643→};
+   644→
+   645→inline std::string investigationStatusToString(InvestigationStatus status) {
+   646→    switch (status) {
+   647→        case InvestigationStatus::Open: return "Open";
+   648→        case InvestigationStatus::InProgress: return "InProgress";
+   649→        case InvestigationStatus::AwaitingEvidence: return "AwaitingEvidence";
+   650→        case InvestigationStatus::Blocked: return "Blocked";
+   651→        case InvestigationStatus::Confirmed: return "Confirmed";
+   652→        case InvestigationStatus::Rejected: return "Rejected";
+   653→        case InvestigationStatus::Superseded: return "Superseded";
+   654→        case InvestigationStatus::Closed: return "Closed";
+   655→    }
+   656→    return "Open";
+   657→}
+   658→
+   659→// ============================================================================
+   660→// Hypothesis Structure
+   661→// ============================================================================
+   662→
+   663→struct Hypothesis {
+   664→    std::string id;
+   665→    std::string title;
+   666→    std::string description;
+   667→    InvestigationStatus status{InvestigationStatus::Open};
+   668→    
+   669→    // Timing
+   670→    DebugTimestamp created_at;
+   671→    DebugTimestamp updated_at;
+   672→    DebugTimestamp confirmed_at;
+   673→    DebugTimestamp rejected_at;
+   674→    
+   675→    // Evidence relationships
+   676→    std::vector<std::string> supporting_evidence_ids;
+   677→    std::vector<std::string> refuting_evidence_ids;
+   678→    
+   679→    // Confidence scoring
+   680→    double confidence_score{0.0};  // 0.0 to 1.0
+   681→    std::string confidence_reasoning;
+   682→    
+   683→    // Relationships
+   684→    std::vector<std::string> related_hypothesis_ids;
+   685→    std::string superseded_by_id;
+   686→    
+   687→    // Notes and findings
+   688→    std::string notes;
+   689→    std::vector<std::string> rejection_reasons;
+   690→    
+   691→    // Root cause chain (if confirmed)
+   692→    std::vector<std::string> causal_chain_evidence_ids;
+   693→    
+   694→    static std::string generateId() {
+   695→        static uint64_t counter = 0;
+   696→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+   697→        return "hyp_" + std::to_string(now) + "_" + std::to_string(++counter);
+   698→    }
+   699→    
+   700→    Hypothesis() {
+   701→        id = generateId();
+   702→        created_at = DebugTimestamp::now();
+   703→        updated_at = created_at;
+   704→    }
+   705→    
+   706→    void addSupportingEvidence(const std::string& evidence_id) {
+   707→        if (std::find(supporting_evidence_ids.begin(), supporting_evidence_ids.end(), evidence_id) 
+   708→            == supporting_evidence_ids.end()) {
+   709→            supporting_evidence_ids.push_back(evidence_id);
+   710→            updated_at = DebugTimestamp::now();
+   711→            updateConfidence();
+   712→        }
+   713→    }
+   714→    
+   715→    void addRefutingEvidence(const std::string& evidence_id) {
+   716→        if (std::find(refuting_evidence_ids.begin(), refuting_evidence_ids.end(), evidence_id) 
+   717→            == refuting_evidence_ids.end()) {
+   718→            refuting_evidence_ids.push_back(evidence_id);
+   719→            updated_at = DebugTimestamp::now();
+   720→            updateConfidence();
+   721→        }
+   722→    }
+   723→    
+   724→    void confirm() {
+   725→        status = InvestigationStatus::Confirmed;
+   726→        confirmed_at = DebugTimestamp::now();
+   727→        updated_at = confirmed_at;
+   728→        confidence_score = 1.0;
+   729→        confidence_reasoning = "Confirmed by direct evidence";
+   730→    }
+   731→    
+   732→    void reject(const std::string& reason = "") {
+   733→        status = InvestigationStatus::Rejected;
+   734→        rejected_at = DebugTimestamp::now();
+   735→        updated_at = rejected_at;
+   736→        confidence_score = 0.0;
+   737→        if (!reason.empty()) {
+   738→            rejection_reasons.push_back(reason);
+   739→        }
+   740→    }
+   741→    
+   742→private:
+   743→    void updateConfidence() {
+   744→        // Simple Bayesian-like update
+   745→        double support = supporting_evidence_ids.size();
+   746→        double refute = refuting_evidence_ids.size();
+   747→        double total = support + refute;
+   748→        
+   749→        if (total > 0) {
+   750→            confidence_score = support / total;
+   751→        }
+   752→        
+   753→        confidence_reasoning = std::to_string(supporting_evidence_ids.size()) + 
+   754→                              " supporting, " + 
+   755→                              std::to_string(refuting_evidence_ids.size()) + 
+   756→                              " refuting";
+   757→    }
+   758→};
+   759→
+   760→// ============================================================================
+   761→// JSON Utilities (Lightweight - No External Dependencies)
+   762→// ============================================================================
+   763→
+   764→class JsonUtils {
+   765→public:
+   766→    static std::string escapeJson(const std::string& input) {
+   767→        std::string output;
+   768→        output.reserve(input.length() * 2);
+   769→        for (char c : input) {
+   770→            switch (c) {
+   771→                case '"': output += "\\\""; break;
+   772→                case '\\': output += "\\\\"; break;
+   773→                case '\b': output += "\\b"; break;
+   774→                case '\f': output += "\\f"; break;
+   775→                case '\n': output += "\\n"; break;
+   776→                case '\r': output += "\\r"; break;
+   777→                case '\t': output += "\\t"; break;
+   778→                default:
+   779→                    if ('\x00' <= c && c <= '\x1f') {
+   780→                        char buf[8];
+   781→                        snprintf(buf, sizeof(buf), "\\u%04x", (unsigned)(unsigned char)c);
+   782→                        output += buf;
+   783→                    } else {
+   784→                        output += c;
+   785→                    }
+   786→            }
+   787→        }
+   788→        return output;
+   789→    }
+   790→    
+   791→    static std::string unescapeJson(const std::string& input) {
+   792→        std::string output;
+   793→        output.reserve(input.length());
+   794→        
+   795→        for (size_t i = 0; i < input.length(); ++i) {
+   796→            if (input[i] == '\\' && i + 1 < input.length()) {
+   797→                switch (input[i + 1]) {
+   798→                    case '"': output += '"'; i++; break;
+   799→                    case '\\': output += '\\'; i++; break;
+   800→                    case 'b': output += '\b'; i++; break;
+   801→                    case 'f': output += '\f'; i++; break;
+   802→                    case 'n': output += '\n'; i++; break;
+   803→                    case 'r': output += '\r'; i++; break;
+   804→                    case 't': output += '\t'; i++; break;
+   805→                    case 'u':
+   806→                        if (i + 5 < input.length()) {
+   807→                            std::string hex = input.substr(i + 2, 4);
+   808→                            unsigned int codepoint;
+   809→                            std::istringstream(hex) >> std::hex >> codepoint;
+   810→                            output += static_cast<char>(codepoint);
+   811→                            i += 5;
+   812→                        }
+   813→                        break;
+   814→                    default:
+   815→                        output += input[i];
+   816→                }
+   817→            } else {
+   818→                output += input[i];
+   819→            }
+   820→        }
+   821→        
+   822→        return output;
+   823→    }
+   824→};
+   825→
+   826→} // namespace prosper_debug
+   827→

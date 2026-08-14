@@ -1,0 +1,898 @@
+     1→/**
+     2→ * Evidence/Hypothesis Intelligence Database - Priority 5
+     3→ * 
+     4→ * PROBLEM SOLVED:
+     5→ * Thousands of experiments created knowledge, but it was lost.
+     6→ * Need searchable history to:
+     7→ * - Prevent duplicate investigations
+     8→ * - Reuse previous findings
+     9→ * - Track rejected hypotheses
+    10→ * - Detect patterns across investigations
+    11→ * 
+    12→ * EXAMPLE QUERIES:
+    13→ *   search "IL2CPP init"           → Find similar past experiments
+    14→ *   similar_crashes              → Find crashes with same symptoms
+    15→ *   previous_rejected_hypotheses → What was already ruled out?
+    16→ *   known_upstream_fixes         → Is this already fixed?
+    17→ */
+    18→
+    19→#pragma once
+    20→
+    21→#include "../core/foundation.hpp"
+    22→#include <mutex>
+    23→#include <set>
+    24→#include <regex>
+    25→#include <atomic>
+    26→
+    27→namespace prosper_debug {
+    28→namespace history {
+    29→
+    30→// ============================================================================
+    31→// Experiment Record
+    32→// ============================================================================
+    33→
+    34→enum class ExperimentStatus : uint8_t {
+    35→    Running,
+    36→    Completed,
+    37→    Failed,
+    38→    Abandoned,
+    39→    Superseded
+    40→};
+    41→
+    42→inline std::string experimentStatusToString(ExperimentStatus status) {
+    43→    switch (status) {
+    44→        case ExperimentStatus::Running: return "Running";
+    45→        case ExperimentStatus::Completed: return "Completed";
+    46→        case ExperimentStatus::Failed: return "Failed";
+    47→        case ExperimentStatus::Abandoned: return "Abandoned";
+    48→        case ExperimentStatus::Superseded: return "Superseded";
+    49→    }
+    50→    return "Unknown";
+    51→}
+    52→
+    53→struct ExperimentRecord {
+    54→    std::string id;
+    55→    std::string title;
+    56→    std::string description;
+    57→    
+    58→    // Timing
+    59→    DebugTimestamp created_at;
+    60→    DebugTimestamp updated_at;
+    61→    DebugTimestamp completed_at;
+    62→    
+    63→    ExperimentStatus status{ExperimentStatus::Running};
+    64→    
+    65→    // Context
+    66→    std::string commit_hash;
+    67→    std::string branch_name;
+    68→    std::string issue_reference;  // GitHub issue, JIRA, etc.
+    69→    
+    70→    // Build environment
+    71→    std::map<std::string, std::string> build_info;
+    72→    
+    73→    // Results
+    74→    std::string result_summary;
+    75→    std::string root_cause;  // If found
+    76→    bool root_cause_found{false};
+    77→    
+    78→    // Classification
+    79→    std::vector<std::string> tags;
+    80→    std::vector<std::string> affected_components;
+    81→    Severity severity{Severity::Info};
+    82→    
+    83→    // Related items
+    84→    std::vector<std::string> hypothesis_ids;
+    85→    std::vector<std::string> evidence_ids;
+    86→    std::string superseded_by;  // If this was superseded by another experiment
+    87→    
+    88→    // Package location
+    89→    fs::path package_path;
+    90→    
+    91→    static std::string generateId() {
+    92→        static std::atomic<uint64_t> counter{0};
+    93→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    94→        return "exp_" + std::to_string(now) + "_" + std::to_string(++counter);
+    95→    }
+    96→    
+    97→    ExperimentRecord() {
+    98→        id = generateId();
+    99→        created_at = DebugTimestamp::now();
+   100→        updated_at = created_at;
+   101→    }
+   102→    
+   103→    void markCompleted(const std::string& result = "") {
+   104→        status = ExperimentStatus::Completed;
+   105→        completed_at = DebugTimestamp::now();
+   106→        updated_at = completed_at;
+   107→        if (!result.empty()) result_summary = result;
+   108→    }
+   109→    
+   110→    void markFailed(const std::string& reason = "") {
+   111→        status = ExperimentStatus::Failed;
+   112→        updated_at = DebugTimestamp::now();
+   113→        if (!reason.empty()) result_summary = "Failed: " + reason;
+   114→    }
+   115→    
+   116→    void markAbandoned() {
+   117→        status = ExperimentStatus::Abandoned;
+   118→        updated_at = DebugTimestamp::now();
+   119→    }
+   120→    
+   121→    std::string toJson() const {
+   122→        std::stringstream json;
+   123→        json << "{\n";
+   124→        json << "  \"id\": \"" << JsonUtils::escapeJson(id) << "\",\n";
+   125→        json << "  \"title\": \"" << JsonUtils::escapeJson(title) << "\",\n";
+   126→        json << "  \"status\": \"" << experimentStatusToString(status) << "\",\n";
+   127→        json << "  \"created\": \"" << created_at.toISO8601() << "\",\n";
+   128→        if (!commit_hash.empty()) {
+   129→            json << "  \"commit\": \"" << JsonUtils::escapeJson(commit_hash) << "\",\n";
+   130→        }
+   131→        if (!result_summary.empty()) {
+   132→            json << "  \"result\": \"" << JsonUtils::escapeJson(result_summary) << "\",\n";
+   133→        }
+   134→        if (root_cause_found) {
+   135→            json << "  \"root_cause\": \"" << JsonUtils::escapeJson(root_cause) << "\"\n";
+   136→        }
+   137→        
+   138→        json << "}";
+   139→        return json.str();
+   140→    }
+   141→};
+   142→
+   143→// ============================================================================
+   144→// Hypothesis Record
+   145→// ============================================================================
+   146→
+   147→struct HypothesisRecord {
+   148→    std::string id;
+   149→    std::string experiment_id;  // Parent experiment
+   150→    
+   151→    std::string title;
+   152→    std::string description;
+   153→    
+   154→    InvestigationStatus status{InvestigationStatus::Open};
+   155→    
+   156→    // Timing
+   157→    DebugTimestamp created_at;
+   158→    DebugTimestamp confirmed_at;
+   159→    DebugTimestamp rejected_at;
+   160→    
+   161→    // Evidence
+   162→    std::vector<std::string> supporting_evidence_ids;
+   163→    std::vector<std::string> refuting_evidence_ids;
+   164→    
+   165→    // Confidence
+   166→    double confidence_score{0.0};
+   167→    std::string confidence_reasoning;
+   168→    
+   169→    // Rejection details (if rejected)
+   170→    std::vector<std::string> rejection_reasons;
+   171→    
+   172→    // Root cause chain (if confirmed)
+   173→    std::string root_cause_description;
+   174→    std::vector<std::string> causal_evidence_ids;
+   175→    
+   176→    static std::string generateId() {
+   177→        static std::atomic<uint64_t> counter{0};
+   178→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+   179→        return "hyp_" + std::to_string(now) + "_" + std::to_string(++counter);
+   180→    }
+   181→    
+   182→    HypothesisRecord() {
+   183→        id = generateId();
+   184→        created_at = DebugTimestamp::now();
+   185→    }
+   186→    
+   187→    void confirm(const std::string& cause = "") {
+   188→        status = InvestigationStatus::Confirmed;
+   189→        confirmed_at = DebugTimestamp::now();
+   190→        confidence_score = 1.0;
+   191→        if (!cause.empty()) root_cause_description = cause;
+   192→    }
+   193→    
+   194→    void reject(const std::string& reason = "") {
+   195→        status = InvestigationStatus::Rejected;
+   196→        rejected_at = DebugTimestamp::now();
+   197→        confidence_score = 0.0;
+   198→        if (!reason.empty()) rejection_reasons.push_back(reason);
+   199→    }
+   200→    
+   201→    std::string toJson() const {
+   202→        std::stringstream json;
+   203→        json << "{\n";
+   204→        json << "  \"id\": \"" << JsonUtils::escapeJson(id) << "\",\n";
+   205→        json << "  \"title\": \"" << JsonUtils::escapeJson(title) << "\",\n";
+   206→        json << "  \"status\": \"" << investigationStatusToString(status) << "\",\n";
+   207→        json << "  \"confidence\": " << std::fixed << std::setprecision(2) 
+   208→             << confidence_score << ",\n";
+   209→        json << "  \"supporting_evidence\": " << supporting_evidence_ids.size() << ",\n";
+   210→        json << "  \"refuting_evidence\": " << refuting_evidence_ids.size() << "\n";
+   211→        json << "}";
+   212→        return json.str();
+   213→    }
+   214→};
+   215→
+   216→// ============================================================================
+   217→// Upstream Fix Record
+   218→// ============================================================================
+   219→
+   220→struct UpstreamFixRecord {
+   221→    std::string id;
+   222→    
+   223→    // Identification
+   224→    std::string pr_url;
+   225→    std::string pr_title;
+   226→    std::string commit_hash;
+   227→    std::string author;
+   228→    
+   229→    // Content
+   230→    std::string description;
+   231→    std::string fixed_issue_description;
+   232→    
+   233→    // Status
+   234→    bool is_merged{false};
+   235→    std::string merged_in_version;
+   236→    DebugTimestamp merged_at;
+   237→    
+   238→    // Applicability
+   239→    std::vector<std::string> affected_components;
+   240→    std::vector<std::string> keywords;
+   241→    std::vector<std::string> related_issues;
+   242→    
+   243→    // Detection metadata
+   244→    DebugTimestamp added_to_database;
+   245→    std::string source;  // Manual, automated, etc.
+   246→    
+   247→    /**
+   248→     * Check relevance to a query
+   249→     */
+   250→    double relevanceToQuery(const std::string& query) const {
+   251→        std::string combined = pr_title + " " + description + " " + fixed_issue_description + " ";
+   252→        for (const auto& kw : keywords) combined += kw + " ";
+   253→        for (const auto& comp : affected_components) combined += comp + " ";
+   254→        
+   255→        std::string lower_query = query;
+   256→        std::transform(lower_query.begin(), lower_query.end(), lower_query.begin(), ::tolower);
+   257→        
+   258→        std::string lower_combined = combined;
+   259→        std::transform(lower_combined.begin(), lower_combined.end(), lower_combined.begin(), ::tolower);
+   260→        
+   261→        // Direct match
+   262→        if (lower_combined.find(lower_query) != std::string::npos) {
+   263→            return 0.95;
+   264→        }
+   265→        
+   266→        // Word-level matching
+   267→        std::vector<std::string> query_words = splitWords(lower_query);
+   268→        int matches = 0;
+   269→        for (const auto& word : query_words) {
+   270→            if (lower_combined.find(word) != std::string::npos) {
+   271→                matches++;
+   272→            }
+   273→        }
+   274→        
+   275→        if (!query_words.empty()) {
+   276→            return static_cast<double>(matches) / query_words.size() * 0.8;
+   277→        }
+   278→        
+   279→        return 0.0;
+   280→    }
+   281→
+   282→private:
+   283→    static std::vector<std::string> splitWords(const std::string& text) {
+   284→        std::vector<std::string> words;
+   285→        std::stringstream ss(text);
+   286→        std::string word;
+   287→        while (ss >> word) {
+   288→            if (word.length() > 2) words.push_back(word);
+   289→        }
+   290→        return words;
+   291→    }
+   292→};
+   293→
+   294→// ============================================================================
+   295→// Search Result
+   296→// ============================================================================
+   297→
+   298→struct SearchResult {
+   299→    double relevance_score;
+   300→    std::string matched_fields;
+   301→    
+   302→    // For experiment results
+   303→    std::optional<ExperimentRecord> experiment;
+   304→    
+   305→    // For hypothesis results
+   306→    std::optional<HypothesisRecord> hypothesis;
+   307→    
+   308→    // For upstream fix results
+   309→    std::optional<UpstreamFixRecord> fix;
+   310→    
+   311→    bool operator>(const SearchResult& other) const {
+   312→        return relevance_score > other.relevance_score;
+   313→    }
+   314→};
+   315→
+   316→// ============================================================================
+   317→// Duplicate Detection Warning
+   318→// ============================================================================
+   319→
+   320→struct DuplicateWarning {
+   321→    std::string existing_id;
+   322→    std::string existing_title;
+   323→    ExperimentStatus existing_status;
+   324→    double similarity_score;
+   325→    
+   326→    std::string reason;
+   327→    std::string recommendation;
+   328→    
+   329→    std::string toJson() const {
+   330→        std::stringstream json;
+   331→        json << "{\n";
+   332→        json << "  \"existing_id\": \"" << JsonUtils::escapeJson(existing_id) << "\",\n";
+   333→        json << "  \"existing_title\": \"" << JsonUtils::escapeJson(existing_title) << "\",\n";
+   334→        json << "  \"status\": \"" << experimentStatusToString(existing_status) << "\",\n";
+   335→        json << "  \"similarity\": " << std::fixed << std::setprecision(2) 
+   336→             << (similarity_score * 100.0) << "%,\n";
+   337→        json << "  \"reason\": \"" << JsonUtils::escapeJson(reason) << "\",\n";
+   338→        json << "  \"recommendation\": \"" << JsonUtils::escapeJson(recommendation) << "\"\n";
+   339→        json << "}";
+   340→        return json.str();
+   341→    }
+   342→};
+   343→
+   344→// ============================================================================
+   345→// Intelligence Database - Main Class
+   346→// ============================================================================
+   347→
+   348→class EvidenceIntelligenceDatabase {
+   349→public:
+   350→    struct Config {
+   351→        size_t max_experiments{10000};
+   352→        size_t max_hypotheses_per_experiment{100};
+   353→        size_t max_upstream_fixes{10000};
+   354→        bool auto_save{true};
+   355→        fs::path storage_directory;
+   356→        
+   357→        static Config defaultConfig() {
+   358→            return {10000, 100, 10000, true, fs::path("debug_history")};
+   359→        }
+   360→    };
+   361→    
+   362→    explicit EvidenceIntelligenceDatabase(const Config& config = Config())
+   363→        : m_config(config), m_initialized(false) {}
+   364→    
+   365→    // ========================================================================
+   366→    // Initialization
+   367→    // ========================================================================
+   368→    
+   369→    bool initialize() {
+   370→        try {
+   371→            if (!m_config.storage_directory.empty()) {
+   372→                fs::create_directories(m_config.storage_directory);
+   373→            }
+   374→            
+   375→            loadFromStorage();
+   376→            m_initialized = true;
+   377→            return true;
+   378→        } catch (const std::exception& e) {
+   379→            m_last_error = e.what();
+   380→            return false;
+   381→        }
+   382→    }
+   383→    
+   384→    bool isInitialized() const { return m_initialized; }
+   385→    std::string getLastError() const { return m_last_error; }
+   386→    
+   387→    // ========================================================================
+   388→    // Experiment Management
+   389→    // ========================================================================
+   390→    
+   391→    /**
+   392→     * Create new experiment record
+   393→     */
+   394→    ExperimentRecord createExperiment(
+   395→        const std::string& title,
+   396→        const std::string& description = "",
+   397→        const std::vector<std::string>& tags = {}) {
+   398→        
+   399→        ExperimentRecord exp;
+   400→        exp.title = title;
+   401→        exp.description = description;
+   402→        exp.tags = tags;
+   403→        
+   404→        std::unique_lock lock(m_mutex);
+   405→        m_experiments[exp.id] = exp;
+   406→        
+   407→        if (m_config.auto_save) {
+   408→            saveToStorageAsync();
+   409→        }
+   410→        
+   411→        return exp;
+   412→    }
+   413→    
+   414→    /**
+   415→     * Update experiment
+   416→     */
+   417→    bool updateExperiment(const ExperimentRecord& experiment) {
+   418→        std::unique_lock lock(m_mutex);
+   419→        
+   420→        auto it = m_experiments.find(experiment.id);
+   421→        if (it == m_experiments.end()) return false;
+   422→        
+   423→        it->second = experiment;
+   424→        it->second.updated_at = DebugTimestamp::now();
+   425→        
+   426→        if (m_config.auto_save) {
+   427→            saveToStorageAsync();
+   428→        }
+   429→        
+   430→        return true;
+   431→    }
+   432→    
+   433→    /**
+   434→     * Get experiment by ID
+   435→     */
+   436→    std::optional<ExperimentRecord> getExperiment(const std::string& id) const {
+   437→        std::shared_lock lock(m_mutex);
+   438→        
+   439→        auto it = m_experiments.find(id);
+   440→        if (it != m_experiments.end()) return it->second;
+   441→        return std::nullopt;
+   442→    }
+   443→    
+   444→    /**
+   445→     * Get all experiments with optional filtering
+   446→     */
+   447→    std::vector<ExperimentRecord> getExperiments(
+   448→        std::optional<ExperimentStatus> status_filter = std::nullopt,
+   449→        size_t limit = 100) const {
+   450→        
+   451→        std::shared_lock lock(m_mutex);
+   452→        
+   453→        std::vector<ExperimentRecord> result;
+   454→        for (const auto& [id, exp] : m_experiments) {
+   455→            if (status_filter.has_value() && exp.status != *status_filter) continue;
+   456→            result.push_back(exp);
+   457→            if (result.size() >= limit) break;
+   458→        }
+   459→        
+   460→        return result;
+   461→    }
+   462→    
+   463→    // ========================================================================
+   464→    // Hypothesis Management
+   465→    // ========================================================================
+   466→    
+   467→    /**
+   468→     * Create hypothesis within an experiment
+   469→     */
+   470→    HypothesisRecord createHypothesis(
+   471→        const std::string& experiment_id,
+   472→        const std::string& title,
+   473→        const std::string& description = "") {
+   474→        
+   475→        HypothesisRecord hyp;
+   476→        hyp.experiment_id = experiment_id;
+   477→        hyp.title = title;
+   478→        hyp.description = description;
+   479→        
+   480→        std::unique_lock lock(m_mutex);
+   481→        m_hypotheses[hyp.id] = hyp;
+   482→        
+   483→        // Link to experiment
+   484→        auto exp_it = m_experiments.find(experiment_id);
+   485→        if (exp_it != m_experiments.end()) {
+   486→            exp_it->second.hypothesis_ids.push_back(hyp.id);
+   487→        }
+   488→        
+   489→        return hyp;
+   490→    }
+   491→    
+   492→    /**
+   493→     * Update hypothesis
+   494→     */
+   495→    bool updateHypothesis(const HypothesisRecord& hypothesis) {
+   496→        std::unique_lock lock(m_mutex);
+   497→        
+   498→        auto it = m_hypotheses.find(hypothesis.id);
+   499→        if (it == m_hypotheses.end()) return false;
+   500→        
+   501→        it->second = hypothesis;
+   502→        return true;
+   503→    }
+   504→    
+   505→    /**
+   506→     * Get hypotheses for an experiment
+   507→     */
+   508→    std::vector<HypothesisRecord> getHypotheses(
+   509→        const std::string& experiment_id,
+   510→        std::optional<InvestigationStatus> status_filter = std::nullopt) const {
+   511→        
+   512→        std::shared_lock lock(m_mutex);
+   513→        
+   514→        std::vector<HypothesisRecord> result;
+   515→        for (const auto& [id, hyp] : m_hypotheses) {
+   516→            if (hyp.experiment_id != experiment_id) continue;
+   517→            if (status_filter.has_value() && hyp.status != *status_filter) continue;
+   518→            result.push_back(hyp);
+   519→        }
+   520→        
+   521→        return result;
+   522→    }
+   523→    
+   524→    /**
+   525→     * Get all confirmed root causes
+   526→     */
+   527→    std::vector<HypothesisRecord> getConfirmedRootCauses() const {
+   528→        std::shared_lock lock(m_mutex);
+   529→        
+   530→        std::vector<HypothesisRecord> result;
+   531→        for (const auto& [id, hyp] : m_hypotheses) {
+   532→            if (hyp.status == InvestigationStatus::Confirmed && 
+   533→                !hyp.root_cause_description.empty()) {
+   534→                result.push_back(hyp);
+   535→            }
+   536→        }
+   537→        
+   538→        return result;
+   539→    }
+   540→    
+   541→    /**
+   542→     * Get all rejected hypotheses (to avoid re-investigating)
+   543→     */
+   544→    std::vector<HypothesisRecord> getRejectedHypotheses(size_t limit = 100) const {
+   545→        std::shared_lock lock(m_mutex);
+   546→        
+   547→        std::vector<HypothesisRecord> result;
+   548→        for (const auto& [id, hyp] : m_hypotheses) {
+   549→            if (hyp.status == InvestigationStatus::Rejected) {
+   550→                result.push_back(hyp);
+   551→                if (result.size() >= limit) break;
+   552→            }
+   553→        }
+   554→        
+   555→        return result;
+   556→    }
+   557→    
+   558→    // ========================================================================
+   559→    // Upstream Fix Management
+   560→    // ========================================================================
+   561→    
+   562→    /**
+   563→     * Add known upstream fix
+   564→     */
+   565→    void addUpstreamFix(const UpstreamFixRecord& fix) {
+   566→        std::unique_lock lock(m_mutex);
+   567→        m_upstream_fixes[fix.id] = fix;
+   568→    }
+   569→    
+   570→    /**
+   571→     * Find relevant upstream fixes for a query
+   572→     */
+   573→    std::vector<UpstreamFixRecord> findRelevantUpstreamFixes(
+   574→        const std::string& query,
+   575→        double min_relevance = 0.5,
+   576→        size_t limit = 10) const {
+   577→        
+   578→        std::shared_lock lock(m_mutex);
+   579→        
+   580→        std::vector<std::pair<double, UpstreamFixRecord>> scored;
+   581→        
+   582→        for (const auto& [id, fix] : m_upstream_fixes) {
+   583→            double relevance = fix.relevanceToQuery(query);
+   584→            if (relevance >= min_relevance) {
+   585→                scored.push_back({relevance, fix});
+   586→            }
+   587→        }
+   588→        
+   589→        // Sort by relevance
+   590→        std::sort(scored.begin(), scored.end(),
+   591→            [](const auto& a, const auto& b) { return a.first > b.first; });
+   592→        
+   593→        // Extract top results
+   594→        std::vector<UpstreamFixRecord> result;
+   595→        for (size_t i = 0; i < scored.size() && i < limit; ++i) {
+   596→            result.push_back(scored[i].second);
+   597→        }
+   598→        
+   599→        return result;
+   600→    }
+   601→    
+   602→    // ========================================================================
+   603→    // Search Interface
+   604→    // ========================================================================
+   605→    
+   606→    struct SearchQuery {
+   607→        std::string text;
+   608→        std::vector<std::string> tags;
+   609→        std::optional<ExperimentStatus> status_filter;
+   610→        std::optional<InvestigationStatus> hypothesis_status_filter;
+   611→        int max_results{20};
+   612→        double min_relevance{0.3};
+   613→        
+   614→        static SearchQuery forText(const std::string& text, int max_results = 20) {
+   615→            return {text, {}, std::nullopt, std::nullopt, max_results, 0.3};
+   616→        }
+   617→        
+   618→        static SearchQuery forTags(const std::vector<std::string>& tags) {
+   619→            return {"", tags, std::nullopt, std::nullopt, 50, 0.0};
+   620→        }
+   621→    };
+   622→    
+   623→    /**
+   624→     * Search across all data
+   625→     */
+   626→    std::vector<SearchResult> search(const SearchQuery& query) const {
+   627→        std::vector<SearchResult> results;
+   628→        
+   629→        // Search experiments
+   630→        {
+   631→            std::shared_lock lock(m_mutex);
+   632→            
+   633→            for (const auto& [id, exp] : m_experiments) {
+   634→                double score = 0.0;
+   635→                std::string matched;
+   636→                
+   637→                if (!query.text.empty()) {
+   638→                    score = calculateTextSimilarity(query.text, exp.title + " " + exp.description);
+   639→                    if (score > 0) matched = "text";
+   640→                }
+   641→                
+   642→                // Tag matching boosts score
+   643→                for (const auto& tag : query.tags) {
+   644→                    auto it = std::find(exp.tags.begin(), exp.tags.end(), tag);
+   645→                    if (it != exp.tags.end()) {
+   646→                        score = std::max(score, 0.8);
+   647→                        if (!matched.empty()) matched += "+tag:" + tag;
+   648→                        else matched = "tag:" + tag;
+   649→                    }
+   650→                }
+   651→                
+   652→                // Status filter
+   653→                if (query.status_filter.has_value() && exp.status != *query.status_filter) {
+   654→                    score = 0.0;
+   655→                }
+   656→                
+   657→                if (score >= query.min_relevance) {
+   658→                    SearchResult sr;
+   659→                    sr.relevance_score = score;
+   660→                    sr.matched_fields = matched;
+   661→                    sr.experiment = exp;
+   662→                    results.push_back(sr);
+   663→                }
+   664→            }
+   665→        }
+   666→        
+   667→        // Sort by relevance
+   668→        std::sort(results.begin(), results.end(), std::greater<SearchResult>());
+   669→        
+   670→        // Limit results
+   671→        if (results.size() > static_cast<size_t>(query.max_results)) {
+   672→            results.resize(query.max_results);
+   673→        }
+   674→        
+   675→        return results;
+   676→    }
+   677→    
+   678→    /**
+   679→     * Simple text search
+   680→     */
+   681→    std::vector<SearchResult> searchText(const std::string& query, int max_results = 20) const {
+   682→        return search(SearchQuery::forText(query, max_results));
+   683→    }
+   684→    
+   685→    // ========================================================================
+   686→    // Duplicate Detection
+   687→    // ========================================================================
+   688→    
+   689→    /**
+   690→     * Check if a new experiment would duplicate existing work
+   691→     */
+   692→    std::vector<DuplicateWarning> checkForDuplicates(
+   693→        const std::string& title,
+   694→        const std::vector<std::string>& tags = {},
+   695→        double threshold = 0.7) const {
+   696→        
+   697→        std::vector<DuplicateWarning> warnings;
+   698→        
+   699→        std::shared_lock lock(m_mutex);
+   700→        
+   701→        for (const auto& [id, exp] : m_experiments) {
+   702→            double similarity = calculateTextSimilarity(title, exp.title);
+   703→            
+   704→            // Boost for matching tags
+   705→            if (!tags.empty()) {
+   706→                size_t matching_tags = 0;
+   707→                for (const auto& tag : tags) {
+   708→                    if (std::find(exp.tags.begin(), exp.tags.end(), tag) != exp.tags.end()) {
+   709→                        matching_tags++;
+   710→                    }
+   711→                }
+   712→                
+   713→                if (!exp.tags.empty()) {
+   714→                    double tag_ratio = static_cast<double>(matching_tags) / tags.size();
+   715→                    similarity = std::max(similarity, tag_ratio * 0.8);
+   716→                }
+   717→            }
+   718→            
+   719→            if (similarity >= threshold) {
+   720→                DuplicateWarning warn;
+   721→                warn.existing_id = id;
+   722→                warn.existing_title = exp.title;
+   723→                warn.existing_status = exp.status;
+   724→                warn.similarity_score = similarity;
+   725→                
+   726→                if (similarity >= 0.9) {
+   727→                    warn.reason = "Near-exact match to existing investigation";
+   728→                    warn.recommendation = "Review existing experiment before proceeding.";
+   729→                } else if (exp.status == ExperimentStatus::Completed) {
+   730→                    warn.reason = "Similar to completed investigation";
+   731→                    warn.recommendation = "Check if this experiment already solved your issue.";
+   732→                } else if (exp.status == ExperimentStatus::Running) {
+   733→                    warn.reason = "Similar investigation currently in progress";
+   734→                    warn.recommendation = "Coordinate with ongoing investigation or wait for results.";
+   735→                } else {
+   736→                    warn.reason = "Similar topic previously investigated";
+   737→                    warn.recommendation = "Review findings before starting new work.";
+   738→                }
+   739→                
+   740→                warnings.push_back(warn);
+   741→            }
+   742→        }
+   743→        
+   744→        return warnings;
+   745→    }
+   746→    
+   747→    /**
+   748→     * Quick duplicate check
+   749→     */
+   750→    std::pair<bool, std::optional<DuplicateWarning>> isDuplicate(
+   751→        const std::string& title,
+   752→        const std::vector<std::string>& tags = {}) const {
+   753→        
+   754→        auto warnings = checkForDuplicates(title, tags, 0.8);
+   755→        
+   756→        if (warnings.empty()) {
+   757→            return {false, std::nullopt};
+   758→        }
+   759→        
+   760→        // Return highest similarity
+   761→        auto max_it = std::max_element(warnings.begin(), warnings.end(),
+   762→            [](const DuplicateWarning& a, const DuplicateWarning& b) {
+   763→                return a.similarity_score < b.similarity_score;
+   764→            });
+   765→        
+   766→        return {true, *max_it};
+   767→    }
+   768→    
+   769→    // ========================================================================
+   770→    // Statistics
+   771→    // ========================================================================
+   772→    
+   773→    struct DatabaseStats {
+   774→        size_t total_experiments{0};
+   775→        size_t total_hypotheses{0};
+   776→        size_t total_upstream_fixes{0};
+   777→        
+   778→        size_t completed_experiments{0};
+   779→        size_t running_experiments{0};
+   780→        size_t failed_experiments{0};
+   781→        
+   782→        size_t confirmed_hypotheses{0};
+   783→        size_t rejected_hypotheses{0};
+   784→        
+   785→        size_t merged_upstream_fixes{0};
+   786→        
+   787→        std::string toJson() const {
+   788→            std::stringstream json;
+   789→            json << "{\n";
+   790→            json << "  \"experiments\": {\n";
+   791→            json << "    \"total\": " << total_experiments << ",\n";
+   792→            json << "    \"completed\": " << completed_experiments << ",\n";
+   793→            json << "    \"running\": " << running_experiments << ",\n";
+   794→            json << "    \"failed\": " << failed_experiments << "\n";
+   795→            json << "  },\n";
+   796→            json << "  \"hypotheses\": {\n";
+   797→            json << "    \"total\": " << total_hypotheses << ",\n";
+   798→            json << "    \"confirmed\": " << confirmed_hypotheses << ",\n";
+   799→            json << "    \"rejected\": " << rejected_hypotheses << "\n";
+   800→            json << "  },\n";
+   801→            json << "  \"upstream_fixes\": " << total_upstream_fixes << "\n";
+   802→            json << "}\n";
+   803→            return json.str();
+   804→        }
+   805→    };
+   806→    
+   807→    DatabaseStats getStats() const {
+   808→        DatabaseStats stats;
+   809→        
+   810→        std::shared_lock lock(m_mutex);
+   811→        
+   812→        stats.total_experiments = m_experiments.size();
+   813→        stats.total_hypotheses = m_hypotheses.size();
+   814→        stats.total_upstream_fixes = m_upstream_fixes.size();
+   815→        
+   816→        for (const auto& [id, exp] : m_experiments) {
+   817→            switch (exp.status) {
+   818→                case ExperimentStatus::Completed: stats.completed_experiments++; break;
+   819→                case ExperimentStatus::Running: stats.running_experiments++; break;
+   820→                case ExperimentStatus::Failed: stats.failed_experiments++; break;
+   821→                default: break;
+   822→            }
+   823→        }
+   824→        
+   825→        for (const auto& [id, hyp] : m_hypotheses) {
+   826→            switch (hyp.status) {
+   827→                case InvestigationStatus::Confirmed: stats.confirmed_hypotheses++; break;
+   828→                case InvestigationStatus::Rejected: stats.rejected_hypotheses++; break;
+   829→                default: break;
+   830→            }
+   831→        }
+   832→        
+   833→        for (const auto& [id, fix] : m_upstream_fixes) {
+   834→            if (fix.is_merged) stats.merged_upstream_fixes++;
+   835→        }
+   836→        
+   837→        return stats;
+   838→    }
+   839→
+   840→private:
+   841→    Config m_config;
+   842→    bool m_initialized;
+   843→    mutable std::string m_last_error;
+   844→    mutable std::shared_mutex m_mutex;
+   845→    
+   846→    // Storage
+   847→    std::map<std::string, ExperimentRecord> m_experiments;
+   848→    std::map<std::string, HypothesisRecord> m_hypotheses;
+   849→    std::map<std::string, UpstreamFixRecord> m_upstream_fixes;
+   850→    
+   851→    // ========================================================================
+   852→    // Internal Methods
+   853→    // ========================================================================
+   854→    
+   855→    double calculateTextSimilarity(const std::string& a, const std::string& b) const {
+   856→        // Bigram overlap similarity
+   857→        auto bigrams = [](const std::string& s) -> std::set<std::string> {
+   858→            std::set<std::string> result;
+   859→            std::string lower = s;
+   860→            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+   861→            
+   862→            for (size_t i = 0; i + 1 < lower.length(); ++i) {
+   863→                result.insert(lower.substr(i, 2));
+   864→            }
+   865→            return result;
+   866→        };
+   867→        
+   868→        auto bgA = bigrams(a);
+   869→        auto bgB = bigrams(b);
+   870→        
+   871→        if (bgA.empty() && bgB.empty()) return 1.0;
+   872→        if (bgA.empty() || bgB.empty()) return 0.0;
+   873→        
+   874→        std::set<std::string> intersection;
+   875→        std::set_intersection(bgA.begin(), bgA.end(), bgB.begin(), bgB.end(),
+   876→                             std::inserter(intersection, intersection.begin()));
+   877→        
+   878→        std::set<std::string> union_set;
+   879→        std::union(bgA.begin(), bgA.end(), bgB.begin(), bgB.end(),
+   880→                  std::inserter(union_set, union_set.begin()));
+   881→        
+   882→        return static_cast<double>(intersection.size()) / union_set.size();
+   883→    }
+   884→    
+   885→    void saveToStorageAsync() {
+   886→        // In real implementation, would write to disk asynchronously
+   887→        // For now, just note that we should save
+   888→    }
+   889→    
+   890→    void loadFromStorage() {
+   891→        // In real implementation, would load from JSON files in storage_directory
+   892→        // For now, start with empty database
+   893→    }
+   894→};
+   895→
+   896→} // namespace history
+   897→} // namespace prosper_debug
+   898→

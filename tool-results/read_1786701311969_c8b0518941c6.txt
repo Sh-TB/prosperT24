@@ -1,0 +1,959 @@
+     1→/**
+     2→ * Memory Provenance Tracker - Priority 1
+     3→ * 
+     4→ * PROBLEM SOLVED:
+     5→ * The biggest missing answer in debugging: "Who wrote this bad value?"
+     6→ * 
+     7→ * Current debugging shows:
+     8→ *   - Crash location (symptom)
+     9→ *   - Invalid memory
+    10→ *   - Corrupted pointer
+    11→ *   
+    12→ * Required answer:
+    13→ *   - Which subsystem wrote to this address?
+    14→ *   - When did it happen?
+    15→ *   - What was the old value?
+    16→ *   - What was the new value?
+    17→ *   - What function caused it?
+    18→ * 
+    19→ * DESIGN:
+    20→ * - Observer only: Does not modify memory operations
+    21→ * - Optional: Must be explicitly enabled
+    22→ * - Ring buffer: Bounded memory usage
+    23→ * - Thread-safe: Can be called from any thread
+    24→ * 
+    25→ * USAGE:
+    26→ *   // Enable tracking for address range
+    27→ *   tracker.watchRange(0x2000000000, 0x10000);
+    28→ *   
+    29→ *   // On memory write (called by existing code)
+    30→ *   tracker.recordWrite(0x20000000100, value, size, source);
+    31→ *   
+    32→ *   // Query when corruption found
+    33→ *   auto writers = tracker.whoWrote(0x20000000100);
+    34→ */
+    35→
+    36→#pragma once
+    37→
+    38→#include "../core/foundation.hpp"
+    39→#include <mutex>
+    40→#include <atomic>
+    41→#include <unordered_map>
+    42→#include <list>
+    43→#include <shared_mutex>
+    44→
+    45→namespace prosper_debug {
+    46→namespace memory {
+    47→
+    48→// ============================================================================
+    49→// Memory Event Types
+    50→// ============================================================================
+    51→
+    52→enum class MemoryEventType : uint8_t {
+    53→    Write,
+    54→    Read,
+    55→    Allocation,
+    56→    Free,
+    57→    Reallocation,
+    58→    ProtectionChange,
+    59→    CorruptionDetected,
+    60→    AccessViolation
+    61→};
+    62→
+    63→inline std::string memoryEventTypeToString(MemoryEventType type) {
+    64→    switch (type) {
+    65→        case MemoryEventType::Write: return "Write";
+    66→        case MemoryEventType::Read: return "Read";
+    67→        case MemoryEventType::Allocation: return "Allocation";
+    68→        case MemoryEventType::Free: return "Free";
+    69→        case MemoryEventType::Reallocation: return "Reallocation";
+    70→        case MemoryEventType::ProtectionChange: return "ProtectionChange";
+    71→        case MemoryEventType::CorruptionDetected: return "CorruptionDetected";
+    72→        case MemoryEventType::AccessViolation: return "AccessViolation";
+    73→    }
+    74→    return "Unknown";
+    75→}
+    76→
+    77→// ============================================================================
+    78→// Memory Value Representation
+    79→// ============================================================================
+    80→
+    81→/**
+    82→ * Represents a memory value with type information
+    83→ */
+    84→struct MemoryValue {
+    85→    std::vector<uint8_t> bytes;
+    86→    size_t size{0};
+    87→    
+    88→    // Typed accessors
+    89→    uint8_t asUint8() const { return bytes.size() >= 1 ? bytes[0] : 0; }
+    90→    uint16_t asUint16() const { 
+    91→        return bytes.size() >= 2 ? 
+    92→            (static_cast<uint16_t>(bytes[1]) << 8) | bytes[0] : 0; 
+    93→    }
+    94→    uint32_t asUint32() const {
+    95→        if (bytes.size() < 4) return 0;
+    96→        return (static_cast<uint32_t>(bytes[3]) << 24) |
+    97→               (static_cast<uint32_t>(bytes[2]) << 16) |
+    98→               (static_cast<uint32_t>(bytes[1]) << 8) |
+    99→               bytes[0];
+   100→    }
+   101→    uint64_t asUint64() const {
+   102→        if (bytes.size() < 8) return asUint32();
+   103→        return (static_cast<uint64_t>(asUint32()) << 32) | asUint32();
+   104→    }
+   105→    
+   106→    /**
+   107→     * Convert to hex string for display/JSON
+   108→     */
+   109→    std::string toHex() const {
+   110→        std::stringstream ss;
+   111→        ss << "0x";
+   112→        // Print in reverse order (big-endian display)
+   113→        for (auto it = bytes.rbegin(); it != bytes.rend(); ++it) {
+   114→            ss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(*it);
+   115→        }
+   116→        return ss.str();
+   117→    }
+   118→    
+   119→    static MemoryValue fromBytes(const void* data, size_t size) {
+   120→        MemoryValue val;
+   121→        val.size = size;
+   122→        val.bytes.assign(
+   123→            static_cast<const uint8_t*>(data),
+   124→            static_cast<const uint8_t*>(data) + size
+   125→        );
+   126→        return val;
+   127→    }
+   128→    
+   129→    static MemoryValue fromUint64(uint64_t value, size_t size = 8) {
+   130→        MemoryValue val;
+   131→        val.size = size;
+   132→        val.bytes.resize(size);
+   133→        for (size_t i = 0; i < size; ++i) {
+   134→            val.bytes[i] = (value >> (i * 8)) & 0xFF;
+   135→        }
+   136→        return val;
+   137→    }
+   138→};
+   139→
+   140→// ============================================================================
+   141→// Memory Event - Single Memory Operation Record
+   142→// ============================================================================
+   143→
+   144→struct MemoryEvent {
+   145→    std::string id;
+   146→    DebugTimestamp timestamp;
+   147→    MemoryEventType type;
+   148→    
+   149→    // Address info
+   150→    uint64_t address{0};
+   151→    size_t size{0};
+   152→    MemoryValue old_value;
+   153→    MemoryValue new_value;
+   154→    
+   155→    // Provenance
+   156→    Subsystem subsystem{Subsystem::Unknown};
+   157→    SourceLocation source;
+   158→    std::string thread_id;
+   159→    
+   160→    // Context
+   161→    std::map<std::string, std::string> metadata;
+   162→    
+   163→    // For allocations
+   164→    uint64_t allocation_base{0};
+   165→    size_t allocation_size{0};
+   166→    std::string allocation_tag;
+   167→    
+   168→    static std::string generateId() {
+   169→        static std::atomic<uint64_t> counter{0};
+   170→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+   171→        return "mem_" + std::to_string(now) + "_" + std::to_string(++counter);
+   172→    }
+   173→    
+   174→    MemoryEvent() {
+   175→        id = generateId();
+   176→        timestamp = DebugTimestamp::now();
+   177→    }
+   178→    
+   179→    /**
+   180→     * Convert to JSON for export
+   181→     */
+   182→    std::string toJson() const {
+   183→        std::stringstream json;
+   184→        json << "{\n";
+   185→        json << "  \"id\": \"" << JsonUtils::escapeJson(id) << "\",\n";
+   186→        json << "  \"timestamp\": \"" << timestamp.toISO8601() << "\",\n";
+   187→        json << "  \"frame\": " << timestamp.frame_number << ",\n";
+   188→        json << "  \"type\": \"" << memoryEventTypeToString(type) << "\",\n";
+   189→        json << "  \"address\": \"0x" << std::hex << address << std::dec << "\",\n";
+   190→        json << "  \"size\": " << size << ",\n";
+   191→        json << "  \"old_value\": \"" << JsonUtils::escapeJson(old_value.toHex()) << "\",\n";
+   192→        json << "  \"new_value\": \"" << JsonUtils::escapeJson(new_value.toHex()) << "\",\n";
+   193→        json << "  \"subsystem\": \"" << subsystemToString(subsystem) << "\",\n";
+   194→        json << "  \"source\": \"" << JsonUtils::escapeJson(source.toString()) << "\",\n";
+   195→        json << "  \"thread_id\": \"" << JsonUtils::escapeJson(thread_id) << "\"\n";
+   196→        json << "}";
+   197→        return json.str();
+   198→    }
+   199→};
+   200→
+   201→// ============================================================================
+   202→// Address Range Watch Configuration
+   203→// ============================================================================
+   204→
+   205→struct AddressRange {
+   206→    uint64_t start{0};
+   207→    uint64_t end{0};  // Exclusive
+   208→    std::string description;
+   209→    bool enabled{true};
+   210→    
+   211→    bool contains(uint64_t addr, size_t size = 1) const {
+   212→        return addr >= start && (addr + size) <= end;
+   213→    }
+   214→    
+   215→    bool overlaps(uint64_t addr, size_t size) const {
+   216→        uint64_t range_start = addr;
+   217→        uint64_t range_end = addr + size;
+   218→        return range_start < end && range_end > start;
+   219→    }
+   220→    
+   221→    size_t length() const { return end - start; }
+   222→};
+   223→
+   224→// ============================================================================
+   225→// Writer Information - Answering "Who Wrote This?"
+   226→// ============================================================================
+   227→
+   228→struct WriterInfo {
+   229→    MemoryEvent event;
+   230→    
+   231→    // Computed context
+   232→    double seconds_before_crash{-1};
+   233→    int events_before_crash{-1};
+   234→    
+   235→    // Classification
+   236→    bool is_suspicious{false};
+   237→    std::string suspicion_reason;
+   238→    
+   239→    std::string toJson() const {
+   240→        std::stringstream json;
+   241→        json << "{\n";
+   242→        json << "  \"event\": " << event.toJson() << ",\n";
+   243→        json << "  \"seconds_before_crash\": " << seconds_before_crash << ",\n";
+   244→        json << "  \"events_before_crash\": " << events_before_crash << ",\n";
+   245→        json << "  \"is_suspicious\": " << (is_suspicious ? "true" : "false") << ",\n";
+   246→        json << "  \"suspicion_reason\": \"" << JsonUtils::escapeJson(suspicion_reason) << "\"\n";
+   247→        json << "}";
+   248→        return json.str();
+   249→    }
+   250→};
+   251→
+   252→// ============================================================================
+   253→// Memory History Query Result
+   254→// ============================================================================
+   255→
+   256→struct MemoryHistoryQuery {
+   257→    uint64_t target_address{0};
+   258→    size_t query_range{0};
+   259→    
+   260→    std::vector<WriterInfo> all_writers;
+   261→    std::vector<WriterInfo> all_readers;
+   262→    
+   263→    // Last state
+   264→    std::optional<MemoryValue> current_value;
+   265→    std::optional<WriterInfo> last_writer;
+   266→    
+   267→    // Timeline summary
+   268→    uint64_t first_access_frame{0};
+   269→    uint64_t last_access_frame{0};
+   270→    size_t total_writes{0};
+   271→    size_t total_reads{0};
+   272→    
+   273→    // Corruption analysis
+   274→    std::vector<WriterInfo> suspicious_writes;
+   275→    
+   276→    std::string toJson() const {
+   277→        std::stringstream json;
+   278→        json << "{\n";
+   279→        json << "  \"target_address\": \"0x" << std::hex << target_address << std::dec << "\",\n";
+   280→        json << "  \"query_range\": " << query_range << ",\n";
+   281→        
+   282→        json << "  \"writers\": [\n";
+   283→        for (size_t i = 0; i < all_writers.size(); ++i) {
+   284→            json << "    " << all_writers[i].toJson();
+   285→            if (i < all_writers.size() - 1) json << ",";
+   286→            json << "\n";
+   287→        }
+   288→        json << "  ],\n";
+   289→        
+   290→        json << "  \"last_writer\": ";
+   291→        if (last_writer) {
+   292→            json << last_writer->toJson() << "\n";
+   293→        } else {
+   294→            json << "null\n";
+   295→        }
+   296→        
+   297→        json << ",\n  \"statistics\": {\n";
+   298→        json << "    \"total_writes\": " << total_writes << ",\n";
+   299→        json << "    \"total_reads\": " << total_reads << ",\n";
+   300→        json << "    \"suspicious_writes\": " << suspicious_writes.size() << "\n";
+   301→        json << "  }\n";
+   302→        
+   303→        json << "}\n";
+   304→        return json.str();
+   305→    }
+   306→};
+   307→
+   308→// ============================================================================
+   309→// Memory Provenance Tracker - Main Class
+   310→// ============================================================================
+   311→
+   312→class MemoryProvenanceTracker {
+   313→public:
+   314→    struct Config {
+   315→        size_t max_events_per_address;
+   316→        size_t max_total_events;
+   317→        size_t max_watch_ranges;
+   318→        bool track_reads;
+   319→        bool auto_watch_allocations;
+   320→        bool detect_corruption_patterns;
+   321→        
+   322→        Config() 
+   323→            : max_events_per_address(1000)
+   324→            , max_total_events(1000000)
+   325→            , max_watch_ranges(100)
+   326→            , track_reads(false)
+   327→            , auto_watch_allocations(true)
+   328→            , detect_corruption_patterns(true) {}
+   329→        
+   330→        static Config sensitive() {
+   331→            return {10000, 10000000, 500, true, true, true};
+   332→        }
+   333→        
+   334→        static Config minimal() {
+   335→            return {100, 10000, 10, false, false, false};
+   336→        }
+   337→    };
+   338→    
+   339→    explicit MemoryProvenanceTracker(const Config& config = Config())
+   340→        : m_config(config), m_enabled(false), m_total_events(0) {}
+   341→    
+   342→    // ========================================================================
+   343→    // Control Interface
+   344→    // ========================================================================
+   345→    
+   346→    /**
+   347→     * Enable/disable tracking
+   348→     * When disabled, recordXxx calls are no-ops (minimal overhead)
+   349→     */
+   350→    void enable() { m_enabled.store(true); }
+   351→    void disable() { m_enabled.store(false); }
+   352→    bool isEnabled() const { return m_enabled.load(); }
+   353→    
+   354→    /**
+   355→     * Clear all tracked data
+   356→     */
+   357→    void clear() {
+   358→        std::unique_lock lock(m_mutex);
+   359→        m_events.clear();
+   360→        m_address_index.clear();
+   361→        m_watch_ranges.clear();
+   362→        m_allocations.clear();
+   363→        m_total_events = 0;
+   364→    }
+   365→    
+   366→    // ========================================================================
+   367→    // Range Watching
+   368→    // ========================================================================
+   369→    
+   370→    /**
+   371→     * Watch an address range for changes
+   372→     */
+   373→    bool watchRange(uint64_t start, uint64_t end, const std::string& description = "") {
+   374→        std::unique_lock lock(m_mutex);
+   375→        
+   376→        if (m_watch_ranges.size() >= m_config.max_watch_ranges) {
+   377→            return false;
+   378→        }
+   379→        
+   380→        AddressRange range;
+   381→        range.start = start;
+   382→        range.end = end;
+   383→        range.description = description;
+   384→        
+   385→        m_watch_ranges.push_back(range);
+   386→        return true;
+   387→    }
+   388→    
+   389→    /**
+   390→     * Remove a watch range
+   391→     */
+   392→    bool unwatchRange(uint64_t start, uint64_t end) {
+   393→        std::unique_lock lock(m_mutex);
+   394→        
+   395→        auto it = std::find_if(m_watch_ranges.begin(), m_watch_ranges.end(),
+   396→            [start, end](const AddressRange& r) {
+   397→                return r.start == start && r.end == end;
+   398→            });
+   399→        
+   400→        if (it != m_watch_ranges.end()) {
+   401→            m_watch_ranges.erase(it);
+   402→            return true;
+   403→        }
+   404→        return false;
+   405→    }
+   406→    
+   407→    /**
+   408→     * Check if address is being watched
+   409→     */
+   410→    bool isWatched(uint64_t address, size_t size = 1) const {
+   411→        std::shared_lock lock(m_mutex);
+   412→        
+   413→        for (const auto& range : m_watch_ranges) {
+   414→            if (range.contains(address, size)) {
+   415→                return true;
+   416→            }
+   417→        }
+   418→        return false;
+   419→    }
+   420→    
+   421→    // ========================================================================
+   422→    // Event Recording (Call These From Existing Code)
+   423→    // ========================================================================
+   424→    
+   425→    /**
+   426→     * Record a memory write event
+   427→     * Call this AFTER actual write completes, passing old and new values
+   428→     */
+   429→    void recordWrite(uint64_t address, const void* data, size_t size,
+   430→                     Subsystem subs = Subsystem::Unknown,
+   431→                     const SourceLocation& loc = SourceLocation(),
+   432→                     const std::string& thread_id = "") {
+   433→        
+   434→        if (!isEnabled()) return;
+   435→        if (!shouldTrack(address, size)) return;
+   436→        
+   437→        MemoryEvent event;
+   438→        event.type = MemoryEventType::Write;
+   439→        event.address = address;
+   440→        event.size = size;
+   441→        event.new_value = MemoryValue::fromBytes(data, size);
+   442→        event.subsystem = subs;
+   443→        event.source = loc;
+   444→        event.thread_id = thread_id.empty() ? getCurrentThreadId() : thread_id;
+   445→        
+   446→        // Try to get old value (may not always be available)
+   447→        // In real implementation, would read from actual memory
+   448→        event.old_value = MemoryValue::fromUint64(0, size);  // Placeholder
+   449→        
+   450→        addEvent(event);
+   451→    }
+   452→    
+   453→    /**
+   454→     * Record a memory write with known old value
+   455→     */
+   456→    void recordWriteWithOldValue(uint64_t address, 
+   457→                                  const MemoryValue& old_val,
+   458→                                  const MemoryValue& new_val,
+   459→                                  Subsystem subs = Subsystem::Unknown,
+   460→                                  const SourceLocation& loc = SourceLocation(),
+   461→                                  const std::string& thread_id = "") {
+   462→        
+   463→        if (!isEnabled()) return;
+   464→        if (!shouldTrack(address, new_val.size)) return;
+   465→        
+   466→        MemoryEvent event;
+   467→        event.type = MemoryEventType::Write;
+   468→        event.address = address;
+   469→        event.size = new_val.size;
+   470→        event.old_value = old_val;
+   471→        event.new_value = new_val;
+   472→        event.subsystem = subs;
+   473→        event.source = loc;
+   474→        event.thread_id = thread_id.empty() ? getCurrentThreadId() : thread_id;
+   475→        
+   476→        addEvent(event);
+   477→    }
+   478→    
+   479→    /**
+   480→     * Record a memory read event (only if reads are tracked)
+   481→     */
+   482→    void recordRead(uint64_t address, const void* data, size_t size,
+   483→                    Subsystem subs = Subsystem::Unknown,
+   484→                    const SourceLocation& loc = SourceLocation(),
+   485→                    const std::string& thread_id = "") {
+   486→        
+   487→        if (!isEnabled()) return;
+   488→        if (!m_config.track_reads) return;
+   489→        if (!shouldTrack(address, size)) return;
+   490→        
+   491→        MemoryEvent event;
+   492→        event.type = MemoryEventType::Read;
+   493→        event.address = address;
+   494→        event.size = size;
+   495→        event.new_value = MemoryValue::fromBytes(data, size);
+   496→        event.subsystem = subs;
+   497→        event.source = loc;
+   498→        event.thread_id = thread_id.empty() ? getCurrentThreadId() : thread_id;
+   499→        
+   500→        addEvent(event);
+   501→    }
+   502→    
+   503→    /**
+   504→     * Record a memory allocation
+   505→     */
+   506→    void recordAllocation(uint64_t address, size_t size,
+   507→                          const std::string& tag = "",
+   508→                          Subsystem subs = Subsystem::Unknown,
+   509→                          const SourceLocation& loc = SourceLocation()) {
+   510→        
+   511→        if (!isEnabled()) return;
+   512→        if (!m_config.auto_watch_allocations) return;
+   513→        
+   514→        MemoryEvent event;
+   515→        event.type = MemoryEventType::Allocation;
+   516→        event.address = address;
+   517→        event.size = size;
+   518→        event.allocation_base = address;
+   519→        event.allocation_size = size;
+   520→        event.allocation_tag = tag;
+   521→        event.subsystem = subs;
+   522→        event.source = loc;
+   523→        event.thread_id = getCurrentThreadId();
+   524→        
+   525→        addEvent(event);
+   526→        
+   527→        // Auto-watch this allocation
+   528→        std::unique_lock lock(m_mutex);
+   529→        m_allocations[address] = {address, address + size, tag, true};
+   530→    }
+   531→    
+   532→    /**
+   533→     * Record a memory free
+   534→     */
+   535→    void recordFree(uint64_t address,
+   536→                    Subsystem subs = Subsystem::Unknown,
+   537→                    const SourceLocation& loc = SourceLocation()) {
+   538→        
+   539→        if (!isEnabled()) return;
+   540→        if (!m_config.auto_watch_allocations) return;
+   541→        
+   542→        MemoryEvent event;
+   543→        event.type = MemoryEventType::Free;
+   544→        event.address = address;
+   545→        event.subsystem = subs;
+   546→        event.source = loc;
+   547→        event.thread_id = getCurrentThreadId();
+   548→        
+   549→        // Look up allocation info
+   550→        std::unique_lock lock(m_mutex);
+   551→        auto it = m_allocations.find(address);
+   552→        if (it != m_allocations.end()) {
+   553→            event.allocation_base = it->second.start;
+   554→            event.allocation_size = it->second.length();
+   555→            event.allocation_tag = it->second.description;
+   556→            m_allocations.erase(it);
+   557→        }
+   558→        
+   559→        addEvent(event);
+   560→    }
+   561→    
+   562→    /**
+   563→     * Record detected corruption
+   564→     */
+   565→    void recordCorruption(uint64_t address, const MemoryValue& corrupt_value,
+   566→                           const std::string& detection_method,
+   567→                           Severity severity = Severity::Critical) {
+   568→        
+   569→        // Always record corruption, even if not in watched range
+   570→        MemoryEvent event;
+   571→        event.type = MemoryEventType::CorruptionDetected;
+   572→        event.address = address;
+   573→        event.size = corrupt_value.size;
+   574→        event.new_value = corrupt_value;
+   575→        event.subsystem = Subsystem::DiagnosticSystem;
+   576→        event.metadata["detection_method"] = detection_method;
+   577→        
+   578→        addEvent(event);
+   579→    }
+   580→    
+   581→    // ========================================================================
+   582→    // Query Interface - Answer "Who Wrote This?"
+   583→    // ========================================================================
+   584→    
+   585→    /**
+   586→     * Find who wrote to a specific address
+   587→     */
+   588→    std::vector<WriterInfo> whoWrote(uint64_t address) const {
+   589→        std::shared_lock lock(m_mutex);
+   590→        
+   591→        std::vector<WriterInfo> writers;
+   592→        auto events = getEventsForAddress(address);
+   593→        
+   594→        for (const auto& event : events) {
+   595→            if (event.type == MemoryEventType::Write || 
+   596→                event.type == MemoryEventType::Allocation) {
+   597→                WriterInfo writer;
+   598→                writer.event = event;
+   599→                
+   600→                // Analyze suspicion
+   601→                analyzeSuspicion(writer);
+   602→                
+   603→                writers.push_back(writer);
+   604→            }
+   605→        }
+   606→        
+   607→        return writers;
+   608→    }
+   609→    
+   610→    /**
+   611→     * Get the last writer to an address
+   612→     */
+   613→    std::optional<WriterInfo> lastWriter(uint64_t address) const {
+   614→        auto writers = whoWrote(address);
+   615→        if (writers.empty()) return std::nullopt;
+   616→        return writers.back();  // Most recent
+   617→    }
+   618→    
+   619→    /**
+   620→     * Get complete history for an address or range
+   621→     */
+   622→    MemoryHistoryQuery memoryHistory(uint64_t address, size_t range = 1) const {
+   623→        MemoryHistoryQuery query;
+   624→        query.target_address = address;
+   625→        query.query_range = range;
+   626→        
+   627→        std::shared_lock lock(m_mutex);
+   628→        
+   629→        // Collect all events in range
+   630→        for (uint64_t addr = address; addr < address + range; ++addr) {
+   631→            auto events = getEventsForAddress(addr);
+   632→            
+   633→            for (const auto& event : events) {
+   634→                WriterInfo info;
+   635→                info.event = event;
+   636→                
+   637→                if (event.type == MemoryEventType::Write ||
+   638→                    event.type == MemoryEventType::Allocation) {
+   639→                    query.all_writers.push_back(info);
+   640→                    query.total_writes++;
+   641→                    analyzeSuspicion(info);
+   642→                    if (info.is_suspicious) {
+   643→                        query.suspicious_writes.push_back(info);
+   644→                    }
+   645→                    query.last_writer = info;
+   646→                    query.current_value = event.new_value;
+   647→                    
+   648→                    if (query.first_access_frame == 0 || 
+   649→                        event.timestamp.frame_number < query.first_access_frame) {
+   650→                        query.first_access_frame = event.timestamp.frame_number;
+   651→                    }
+   652→                    if (event.timestamp.frame_number > query.last_access_frame) {
+   653→                        query.last_access_frame = event.timestamp.frame_number;
+   654→                    }
+   655→                } else if (event.type == MemoryEventType::Read) {
+   656→                    query.all_readers.push_back(info);
+   657→                    query.total_reads++;
+   658→                }
+   659→            }
+   660→        }
+   661→        
+   662→        return query;
+   663→    }
+   664→    
+   665→    /**
+   666→     * Find all addresses written by a specific subsystem
+   667→     */
+   668→    std::vector<uint64_t> addressesWrittenBy(Subsystem subs) const {
+   669→        std::shared_lock lock(m_mutex);
+   670→        
+   671→        std::set<uint64_t> addresses;
+   672→        for (const auto& [addr, events] : m_address_index) {
+   673→            for (const auto& event : events) {
+   674→                if (event.subsystem == subs && 
+   675→                    (event.type == MemoryEventType::Write ||
+   676→                     event.type == MemoryEventType::Allocation)) {
+   677→                    addresses.insert(addr);
+   678→                    break;
+   679→                }
+   680→            }
+   681→        }
+   682→        
+   683→        return std::vector<uint64_t>(addresses.begin(), addresses.end());
+   684→    }
+   685→    
+   686→    /**
+   687→     * Find corruption events
+   688→     */
+   689→    std::vector<MemoryEvent> findCorruptions() const {
+   690→        std::shared_lock lock(m_mutex);
+   691→        
+   692→        std::vector<MemoryEvent> corruptions;
+   693→        for (const auto& [addr, events] : m_address_index) {
+   694→            for (const auto& event : events) {
+   695→                if (event.type == MemoryEventType::CorruptionDetected) {
+   696→                    corruptions.push_back(event);
+   697→                }
+   698→            }
+   699→        }
+   700→        
+   701→        return corruptions;
+   702→    }
+   703→    
+   704→    // ========================================================================
+   705→    // Statistics
+   706→    // ========================================================================
+   707→    
+   708→    struct Stats {
+   709→        size_t total_events{0};
+   710→        size_t write_events{0};
+   711→        size_t read_events{0};
+   712→        size_t allocation_events{0};
+   713→        size_t corruption_events{0};
+   714→        size_t tracked_addresses{0};
+   715→        size_t watch_ranges{0};
+   716→        size_t active_allocations{0};
+   717→    };
+   718→    
+   719→    Stats getStats() const {
+   720→        std::shared_lock lock(m_mutex);
+   721→        
+   722→        Stats stats;
+   723→        stats.total_events = m_total_events;
+   724→        stats.tracked_addresses = m_address_index.size();
+   725→        stats.watch_ranges = m_watch_ranges.size();
+   726→        stats.active_allocations = m_allocations.size();
+   727→        
+   728→        for (const auto& [addr, events] : m_address_index) {
+   729→            for (const auto& event : events) {
+   730→                switch (event.type) {
+   731→                    case MemoryEventType::Write: stats.write_events++; break;
+   732→                    case MemoryEventType::Read: stats.read_events++; break;
+   733→                    case MemoryEventType::Allocation: 
+   734→                    case MemoryEventType::Free:
+   735→                    case MemoryEventType::Reallocation:
+   736→                        stats.allocation_events++; break;
+   737→                    case MemoryEventType::CorruptionDetected:
+   738→                        stats.corruption_events++; break;
+   739→                    default: break;
+   740→                }
+   741→            }
+   742→        }
+   743→        
+   744→        return stats;
+   745→    }
+   746→    
+   747→    // ========================================================================
+   748→    // Export
+   749→    // ========================================================================
+   750→    
+   751→    /**
+   752→     * Export all data as JSON
+   753→     */
+   754→    std::string exportToJson() const {
+   755→        std::shared_lock lock(m_mutex);
+   756→        
+   757→        std::stringstream json;
+   758→        json << "{\n";
+   759→        json << "  \"export_timestamp\": \"" << DebugTimestamp::now().toISO8601() << "\",\n";
+   760→        json << "  \"config\": {\n";
+   761→        json << "    \"max_events_per_address\": " << m_config.max_events_per_address << ",\n";
+   762→        json << "    \"track_reads\": " << (m_config.track_reads ? "true" : "false") << "\n";
+   763→        json << "  },\n";
+   764→        
+   765→        json << "  \"watch_ranges\": [\n";
+   766→        for (size_t i = 0; i < m_watch_ranges.size(); ++i) {
+   767→            const auto& range = m_watch_ranges[i];
+   768→            json << "    {\"start\": \"0x" << std::hex << range.start 
+   769→                 << "\", \"end\": \"0x" << range.end << std::dec
+   770→                 << "\", \"description\": \"" << JsonUtils::escapeJson(range.description) << "\"}";
+   771→            if (i < m_watch_ranges.size() - 1) json << ",";
+   772→            json << "\n";
+   773→        }
+   774→        json << "  ],\n";
+   775→        
+   776→        json << "  \"events_by_address\": {\n";
+   777→        bool first_addr = true;
+   778→        for (const auto& [addr, events] : m_address_index) {
+   779→            if (!first_addr) json << ",\n";
+   780→            first_addr = false;
+   781→            
+   782→            json << "    \"0x" << std::hex << addr << std::dec << "\": [\n";
+   783→            for (size_t i = 0; i < events.size(); ++i) {
+   784→                json << "      " << events[i].toJson();
+   785→                if (i < events.size() - 1) json << ",";
+   786→                json << "\n";
+   787→            }
+   788→            json << "    ]";
+   789→        }
+   790→        json << "\n  }\n";
+   791→        
+   792→        json << "}\n";
+   793→        return json.str();
+   794→    }
+   795→
+   796→private:
+   797→    Config m_config;
+   798→    std::atomic<bool> m_enabled;
+   799→    mutable std::shared_mutex m_mutex;
+   800→    
+   801→    // Storage: address -> list of events (ring buffer behavior via size limit)
+   802→    std::map<uint64_t, std::list<MemoryEvent>> m_address_index;
+   803→    
+   804→    // Watch ranges
+   805→    std::vector<AddressRange> m_watch_ranges;
+   806→    
+   807→    // Active allocations (for auto-unwatch on free)
+   808→    std::map<uint64_t, AddressRange> m_allocations;
+   809→    
+   810→    // Counters
+   811→    size_t m_total_events;
+   812→    
+   813→    // ========================================================================
+   814→    // Internal Methods
+   815→    // ========================================================================
+   816→    
+   817→    bool shouldTrack(uint64_t address, size_t size) const {
+   818→        // Always check watched ranges first
+   819→        for (const auto& range : m_watch_ranges) {
+   820→            if (range.overlaps(address, size)) {
+   821→                return true;
+   822→            }
+   823→        }
+   824→        
+   825→        // Check if address is in a tracked allocation
+   826→        auto it = m_allocations.lower_bound(address);
+   827→        if (it != m_allocations.end()) {
+   828→            if (it->second.contains(address, size)) {
+   829→                return true;
+   830→            }
+   831→        }
+   832→        
+   833→        return false;
+   834→    }
+   835→    
+   836→    void addEvent(const MemoryEvent& event) {
+   837→        std::unique_lock lock(m_mutex);
+   838→        
+   839→        // Check global limit
+   840→        if (m_total_events >= m_config.max_total_events) {
+   841→            return;  // Or could evict oldest
+   842→        }
+   843→        
+   844→        // Add to address index
+   845→        auto& events = m_address_index[event.address];
+   846→        events.push_back(event);
+   847→        
+   848→        // Enforce per-address limit (ring buffer)
+   849→        while (events.size() > m_config.max_events_per_address) {
+   850→            events.pop_front();
+   851→        }
+   852→        
+   853→        m_total_events++;
+   854→        
+   855→        // Auto-detect corruption patterns if enabled
+   856→        if (m_config.detect_corruption_patterns &&
+   857→            event.type == MemoryEventType::Write) {
+   858→            detectCorruptionPatterns(event, events);
+   859→        }
+   860→    }
+   861→    
+   862→    std::list<MemoryEvent> getEventsForAddress(uint64_t address) const {
+   863→        auto it = m_address_index.find(address);
+   864→        if (it != m_address_index.end()) {
+   865→            return it->second;
+   866→        }
+   867→        return {};
+   868→    }
+   869→    
+   870→    void analyzeSuspicion(WriterInfo& writer) const {
+   871→        // Pattern: Writing to recently freed memory
+   872→        // Pattern: Writing outside allocation bounds
+   873→        // Pattern: GPU writing to CPU memory (or vice versa)
+   874→        // Pattern: Large value change in single write
+   875→        
+   876→        const auto& event = writer.event;
+   877→        
+   878→        // Check if writing to freed memory
+   879→        auto alloc_it = m_allocations.lower_bound(event.address);
+   880→        if (alloc_it != m_allocations.begin()) {
+   881→            --alloc_it;
+   882→            if (alloc_it != m_allocations.end()) {
+   883→                const auto& alloc = alloc_it->second;
+   884→                if (event.address >= alloc.end) {
+   885→                    writer.is_suspicious = true;
+   886→                    writer.suspicion_reason = "Write to potentially freed memory region";
+   887→                }
+   888→            }
+   889→        }
+   890→        
+   891→        // Check for large value changes
+   892→        if (event.old_value.size == event.new_value.size &&
+   893→            event.old_value.size >= 4) {
+   894→            uint64_t old_val = event.old_value.asUint64();
+   895→            uint64_t new_val = event.new_value.asUint64();
+   896→            
+   897→            // If most bits changed, might be corruption
+   898→            uint64_t xor_result = old_val ^ new_val;
+   899→            int changed_bits = __builtin_popcountll(xor_result);
+   900→            
+   901→            if (changed_bits > (sizeof(uint64_t) * 8 * 0.7)) {  // 70%+ bits changed
+   902→                writer.is_suspicious = true;
+   903→                writer.suspicion_reason = "Large value change (" + 
+   904→                    std::to_string(changed_bits) + " of " + 
+   905→                    std::to_string(sizeof(uint64_t) * 8) + " bits changed)";
+   906→            }
+   907→        }
+   908→        
+   909→        // Cross-subsystem writes can be suspicious
+   910→        if (event.subsystem == Subsystem::GPU &&
+   911→            event.address < 0x100000000ULL) {  // Low memory (likely CPU)
+   912→            writer.is_suspicious = true;
+   913→            writer.suspicion_reason = "GPU write to low memory address space";
+   914→        }
+   915→    }
+   916→    
+   917→    void detectCorruptionPatterns(const MemoryEvent& new_event,
+   918→                                   const std::list<MemoryEvent>& existing_events) {
+   919→        // Look for pattern: write, write-back different, write again
+   920→        // This can indicate race conditions or use-after-free
+   921→        
+   922→        if (existing_events.size() < 3) return;
+   923→        
+   924→        auto it = existing_events.rbegin();
+   925→        ++it;  // Skip the event we just added
+   926→        
+   927→        // Check recent writes for inconsistencies
+   928→        MemoryValue prev_value;
+   929→        int write_count = 0;
+   930→        
+   931→        for (; it != existing_events.rend() && write_count < 5; ++it) {
+   932→            if (it->type == MemoryEventType::Write) {
+   933→                write_count++;
+   934→                
+   935→                if (!prev_value.bytes.empty()) {
+   936→                    // Values oscillating between different states?
+   937→                    if (prev_value.bytes != it->new_value.bytes &&
+   938→                        it->new_value.bytes != new_event.new_value.bytes) {
+   939→                        
+   940→                        // Could be normal, flag for review
+   941→                        // (In production, would have more sophisticated heuristics)
+   942→                    }
+   943→                }
+   944→                
+   945→                prev_value = it->new_value;
+   946→            }
+   947→        }
+   948→    }
+   949→    
+   950→    static std::string getCurrentThreadId() {
+   951→        std::stringstream ss;
+   952→        ss << std::this_thread::get_id();
+   953→        return ss.str();
+   954→    }
+   955→};
+   956→
+   957→} // namespace memory
+   958→} // namespace prosper_debug
+   959→

@@ -1,0 +1,879 @@
+     1→/**
+     2→ * State Timeline System - Priority 3
+     3→ * 
+     4→ * PROBLEM SOLVED:
+     5→ * Crash location is usually not corruption location.
+     6→ * Need historical state to trace back to root cause.
+     7→ * 
+     8→ * EXAMPLE:
+     9→ *   Current: "Crash at frame 1300"
+    10→ *   Required: 
+    11→ *     Object created:  frame 200
+    12→ *     Modified:        frame 600
+    13→ *     Invalidated:     frame 900
+    14→ *     Used incorrectly: frame 1250
+    15→ *     Crash:           frame 1300
+    16→ * 
+    17→ * DESIGN:
+    18→ * - Records state changes with frame-level precision
+    19→ * - Tracks object/resource lifecycles
+    20→ * - Enables time-travel queries ("what was state at frame X?")
+    21→ * - Supports multiple timeline streams (GPU, memory, HLE, etc.)
+    22→ */
+    23→
+    24→#pragma once
+    25→
+    26→#include "../core/foundation.hpp"
+    27→#include <mutex>
+    28→#include <unordered_map>
+    29→#include <deque>
+    30→#include <set>
+    31→
+    32→namespace prosper_debug {
+    33→namespace timeline {
+    34→
+    35→// ============================================================================
+    36→// Timeline Event Types
+    37→// ============================================================================
+    38→
+    39→enum class TimelineEventType : uint8_t {
+    40→    // Lifecycle events
+    41→    ObjectCreated,
+    42→    ObjectDestroyed,
+    43→    ObjectModified,
+    44→    StateChanged,
+    45→    
+    46→    // Resource-specific
+    47→    ResourceAllocated,
+    48→    ResourceFreed,
+    49→    ResourceMapped,
+    50→    ResourceUnmapped,
+    51→    
+    52→    // GPU specific
+    53→    GpuCommandSubmitted,
+    54→    GpuCommandCompleted,
+    55→    GpuFenceCreated,
+    56→    GpuFenceSignaled,
+    57→    GpuMemoryAllocated,
+    58→    GpuMemoryFreed,
+    59→    TextureUploaded,
+    60→    RenderTargetBound,
+    61→    
+    62→    // Memory specific
+    63→    MemoryRegionAllocated,
+    64→    MemoryRegionFreed,
+    65→    MemoryProtectionChanged,
+    66→    MemoryCorrupted,
+    67→    
+    68→    // Thread/execution
+    69→    ThreadCreated,
+    70→    ThreadStarted,
+    71→    ThreadSuspended,
+    72→    ThreadResumed,
+    73→    ThreadTerminated,
+    74→    ContextSwitch,
+    75→    
+    76→    // Synchronization
+    77→    LockAcquired,
+    78→    LockReleased,
+    79→    WaitStarted,
+    80→    WaitCompleted,
+    81→    
+    82→    // Error/corruption
+    83→    ErrorDetected,
+    84→    CorruptionDetected,
+    85→    AssertionFailed,
+    86→    AnomalyDetected,
+    87→    
+    88→    // Markers (for manual annotation)
+    89→    FrameMarker,
+    90→    UserMarker,
+    91→    SectionStart,
+    92→    SectionEnd,
+    93→    
+    94→    // Generic
+    95→    CustomEvent
+    96→};
+    97→
+    98→inline std::string timelineEventTypeToString(TimelineEventType type) {
+    99→    switch (type) {
+   100→        case TimelineEventType::ObjectCreated: return "ObjectCreated";
+   101→        case TimelineEventType::ObjectDestroyed: return "ObjectDestroyed";
+   102→        case TimelineEventType::ObjectModified: return "ObjectModified";
+   103→        case TimelineEventType::StateChanged: return "StateChanged";
+   104→        case TimelineEventType::ResourceAllocated: return "ResourceAllocated";
+   105→        case TimelineEventType::ResourceFreed: return "ResourceFreed";
+   106→        case TimelineEventType::ResourceMapped: return "ResourceMapped";
+   107→        case TimelineEventType::ResourceUnmapped: return "ResourceUnmapped";
+   108→        case TimelineEventType::GpuCommandSubmitted: return "Gpu.CommandSubmitted";
+   109→        case TimelineEventType::GpuCommandCompleted: return "Gpu.CommandCompleted";
+   110→        case TimelineEventType::GpuFenceCreated: return "Gpu.FenceCreated";
+   111→        case TimelineEventType::GpuFenceSignaled: return "Gpu.FenceSignaled";
+   112→        case TimelineEventType::GpuMemoryAllocated: return "Gpu.MemoryAllocated";
+   113→        case TimelineEventType::GpuMemoryFreed: return "Gpu.MemoryFreed";
+   114→        case TimelineEventType::TextureUploaded: return "TextureUploaded";
+   115→        case TimelineEventType::RenderTargetBound: return "RenderTargetBound";
+   116→        case TimelineEventType::MemoryRegionAllocated: return "MemoryRegionAllocated";
+   117→        case TimelineEventType::MemoryRegionFreed: return "MemoryRegionFreed";
+   118→        case TimelineEventType::MemoryProtectionChanged: return "MemoryProtectionChanged";
+   119→        case TimelineEventType::MemoryCorrupted: return "MemoryCorrupted";
+   120→        case TimelineEventType::ThreadCreated: return "ThreadCreated";
+   121→        case TimelineEventType::ThreadStarted: return "ThreadStarted";
+   122→        case TimelineEventType::ThreadSuspended: return "ThreadSuspended";
+   123→        case TimelineEventType::ThreadResumed: return "ThreadResumed";
+   124→        case TimelineEventType::ThreadTerminated: return "ThreadTerminated";
+   125→        case TimelineEventType::ContextSwitch: return "ContextSwitch";
+   126→        case TimelineEventType::LockAcquired: return "LockAcquired";
+   127→        case TimelineEventType::LockReleased: return "LockReleased";
+   128→        case TimelineEventType::WaitStarted: return "WaitStarted";
+   129→        case TimelineEventType::WaitCompleted: return "WaitCompleted";
+   130→        case TimelineEventType::ErrorDetected: return "ErrorDetected";
+   131→        case TimelineEventType::CorruptionDetected: return "CorruptionDetected";
+   132→        case TimelineEventType::AssertionFailed: return "AssertionFailed";
+   133→        case TimelineEventType::AnomalyDetected: return "AnomalyDetected";
+   134→        case TimelineEventType::FrameMarker: return "FrameMarker";
+   135→        case TimelineEventType::UserMarker: return "UserMarker";
+   136→        case TimelineEventType::SectionStart: return "SectionStart";
+   137→        case TimelineEventType::SectionEnd: return "SectionEnd";
+   138→        case TimelineEventType::CustomEvent: return "CustomEvent";
+   139→    }
+   140→    return "Unknown";
+   141→}
+   142→
+   143→// ============================================================================
+   144→// Timeline Event
+   145→// ============================================================================
+   146→
+   147→struct TimelineEvent {
+   148→    std::string id;
+   149→    DebugTimestamp timestamp;
+   150→    uint64_t frame_number{0};
+   151→    TimelineEventType type;
+   152→    
+   153→    // What object/state?
+   154→    std::string object_id;       // Unique identifier for the object
+   155→    std::string object_type;     // Class/type of object
+   156→    std::string object_description;  // Human-readable description
+   157→    
+   158→    // What changed?
+   159→    std::string attribute_name;   // Which attribute changed
+   160→    std::string old_value;        // Previous value (JSON string)
+   161→    std::string new_value;        // New value (JSON string)
+   162→    
+   163→    // Provenance
+   164→    Subsystem subsystem{Subsystem::Unknown};
+   165→    SourceLocation source;
+   166→    std::string thread_id;
+   167→    
+   168→    // Additional data
+   169→    std::map<std::string, std::string> metadata;
+   170→    
+   171→    // Relationships
+   172→    std::string parent_event_id;  // Causal parent
+   173→    std::vector<std::string> related_event_ids;
+   174→    
+   175→    static std::string generateId() {
+   176→        static std::atomic<uint64_t> counter{0};
+   177→        auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+   178→        return "tle_" + std::to_string(now) << "_" << std::to_string(++counter);
+   179→    }
+   180→    
+   181→    TimelineEvent() {
+   182→        id = generateId();
+   183→        timestamp = DebugTimestamp::now();
+   184→    }
+   185→    
+   186→    bool isErrorOrCorruption() const {
+   187→        return type == TimelineEventType::ErrorDetected ||
+   188→               type == TimelineEventType::CorruptionDetected ||
+   189→               type == TimelineEventType::AssertionFailed ||
+   190→               type == TimelineEventType::AnomalyDetected;
+   191→    }
+   192→    
+   193→    bool isLifecycleEvent() const {
+   194→        return type == TimelineEventType::ObjectCreated ||
+   195→               type == TimelineEventType::ObjectDestroyed ||
+   196→               type == TimelineEventType::ResourceAllocated ||
+   197→               type == TimelineEventType::ResourceFreed;
+   198→    }
+   199→    
+   200→    std::string toJson() const {
+   201→        std::stringstream json;
+   202→        json << "{\n";
+   203→        json << "  \"id\": \"" << JsonUtils::escapeJson(id) << "\",\n";
+   204→        json << "  \"timestamp\": \"" << timestamp.toISO8601() << "\",\n";
+   205→        json << "  \"frame\": " << frame_number << ",\n";
+   206→        json << "  \"type\": \"" << timelineEventTypeToString(type) << "\",\n";
+   207→        json << "  \"object_id\": \"" << JsonUtils::escapeJson(object_id) << "\",\n";
+   208→        json << "  \"object_type\": \"" << JsonUtils::escapeJson(object_type) << "\",\n";
+   209→        if (!object_description.empty()) {
+   210→            json << "  \"description\": \"" << JsonUtils::escapeJson(object_description) << "\",\n";
+   211→        }
+   212→        if (!attribute_name.empty()) {
+   213→            json << "  \"attribute\": \"" << JsonUtils::escapeJson(attribute_name) << "\",\n";
+   214→            json << "  \"old_value\": \"" << JsonUtils::escapeJson(old_value) << "\",\n";
+   215→            json << "  \"new_value\": \"" << JsonUtils::escapeJson(new_value) << "\",\n";
+   216→        }
+   217→        json << "  \"subsystem\": \"" << subsystemToString(subsystem) << "\"\n";
+   218→        json << "}";
+   219→        return json.str();
+   220→    }
+   221→};
+   222→
+   223→// ============================================================================
+   224→// Object Lifecycle Tracker
+   225→// ============================================================================
+   226→
+   227→struct ObjectLifecycle {
+   228→    std::string object_id;
+   229→    std::string object_type;
+   230→    
+   231→    // Key lifecycle events
+   232→    std::optional<TimelineEvent> created;
+   233→    std::optional<TimelineEvent> destroyed;
+   234→    std::vector<TimelineEvent> modifications;
+   235→    
+   236→    // Current state (reconstructed from events)
+   237→    std::map<std::string, std::string> current_state;
+   238→    
+   239→    // Statistics
+   240→    uint64_t creation_frame{0};
+   241→    uint64_t destruction_frame{0};  // 0 if still alive
+   242→    size_t total_modifications{0};
+   243→    uint64_t last_access_frame{0};
+   244→    
+   245→    bool isAlive() const { return !destroyed.has_value(); }
+   246→    uint64_t lifetime() const { 
+   247→        return destruction_frame > 0 ? destruction_frame - creation_frame : 0;
+   248→    }
+   249→    
+   250→    std::string toJson() const {
+   251→        std::stringstream json;
+   252→        json << "{\n";
+   253→        json << "  \"object_id\": \"" << JsonUtils::escapeJson(object_id) << "\",\n";
+   254→        json << "  \"object_type\": \"" << JsonUtils::escapeJson(object_type) << "\",\n";
+   255→        json << "  \"alive\": " << (isAlive() ? "true" : "false") << ",\n";
+   256→        json << "  \"created_frame\": " << creation_frame << ",\n";
+   257→        json << "  \"modifications\": " << total_modifications << ",\n";
+   258→        json << "  \"lifetime_frames\": " << lifetime() << "\n";
+   259→        json << "}";
+   260→        return json.str();
+   261→    }
+   262→};
+   263→
+   264→// ============================================================================
+   265→// Timeline Query Results
+   266→// ============================================================================
+   267→
+   268→struct TimelineQueryResult {
+   269→    std::vector<TimelineEvent> events;
+   270→    
+   271→    // Time range of results
+   272→    uint64_t start_frame{0};
+   273→    uint64_t end_frame{0};
+   274→    
+   275→    // Filtering applied
+   276→    std::vector<TimelineEventType> event_types_filter;
+   277→    Subsystem subsystem_filter{Subsystem::Unknown};
+   278→    std::string object_id_filter;
+   279→    
+   280→    // Aggregated statistics
+   281→    size_t total_events{0};
+   282→    size_t error_events{0};
+   283→    size_t lifecycle_events{0};
+   284→    
+   285→    // Object lifecycles found (if querying by object)
+   286→    std::map<std::string, ObjectLifecycle> object_lifecycles;
+   287→    
+   288→    std::string toJson() const {
+   289→        std::stringstream json;
+   290→        json << "{\n";
+   291→        json << "  \"total_events\": " << total_events << ",\n";
+   292→        json << "  \"error_events\": " << error_events << ",\n";
+   293→        json << "  \"frame_range\": [" << start_frame << ", " << end_frame << "],\n";
+   294→        
+   295→        json << "  \"events\": [\n";
+   296→        for (size_t i = 0; i < events.size() && i < 100; ++i) {  // Limit output
+   297→            json << "    " << events[i].toJson();
+   298→            if (i < events.size() - 1 && i < 99) json << ",";
+   299→            json << "\n";
+   300→        }
+   301→        if (events.size() > 100) {
+   302→            json << "    ... and " << (events.size() - 100) << " more\n";
+   303→        }
+   304→        json << "  ]\n";
+   305→        
+   306→        json << "}\n";
+   307→        return json.str();
+   308→    }
+   309→};
+   310→
+   311→// ============================================================================
+   312→// State Snapshot at a Point in Time
+   313→// ============================================================================
+   314→
+   315→struct StateSnapshot {
+   316→    uint64_t target_frame;
+   317→    DebugTimestamp approximate_time;
+   318→    
+   319→    // All active objects at this point
+   320→    std::map<std::string, ObjectLifecycle> active_objects;
+   321→    
+   322→    // Recent events leading to this state
+   323→    std::vector<TimelineEvent> preceding_events;
+   324→    
+   325→    // Any errors/corruptions before this point
+   326→    std::vector<TimelineEvent> prior_errors;
+   327→    
+   328→    std::string toJson() const {
+   329→        std::stringstream json;
+   330→        json << "{\n";
+   331→        json << "  \"frame\": " << target_frame << ",\n";
+   332→        json << "  \"active_objects\": " << active_objects.size() << ",\n";
+   333→        json << "  \"prior_errors\": " << prior_errors.size() << "\n";
+   334→        json << "}";
+   335→        return json.str();
+   336→    }
+   337→};
+   338→
+   339→// ============================================================================
+   340→// Timeline System - Main Class
+   341→// ============================================================================
+   342→
+   343→class StateTimelineSystem {
+   344→public:
+   345→    struct Config {
+   346→        bool enabled{true};
+   347→        size_t max_events{1000000};          // Global event limit
+   348→        size_t max_events_per_object{10000}; // Per-object limit
+   349→        bool track_all_objects{false};       // Track everything or just watched
+   350→        bool auto_track_gpu{true};           // Auto-track GPU resources
+   351→        bool auto_track_memory{true};        // Auto-track major allocations
+   352→        bool record_full_state_changes{false}; // Record old+new values (expensive)
+   353→        
+   354→        static Config minimal() {
+   355→            return {true, 100000, 1000, false, false, false, false};
+   356→        }
+   357→        
+   358→        static Config comprehensive() {
+   359→            return {true, 10000000, 50000, true, true, true, true};
+   360→        }
+   361→    };
+   362→    
+   363→    explicit StateTimelineSystem(const Config& config = Config())
+   364→        : m_config(config), m_enabled(config.enabled), m_current_frame(0) {}
+   365→    
+   366→    // ========================================================================
+   367→    // Control Interface
+   368→    // ========================================================================
+   369→    
+   370→    void enable() { m_enabled.store(true); }
+   371→    void disable() { m_enabled.store(false); }
+   372→    bool isEnabled() const { return m_enabled.load(); }
+   373→    
+   374→    void clear() {
+   375→        std::unique_lock lock(m_mutex);
+   376→        m_events.clear();
+   377→        m_object_lifecycles.clear();
+   378→        m_watch_list.clear();
+   379→        m_current_frame = 0;
+   380→    }
+   381→    
+   382→    // ========================================================================
+   383→    // Frame Tracking
+   384→    // ========================================================================
+   385→    
+   386→    /**
+   387→     * Advance to next frame (call once per emulated frame)
+   388→     */
+   389→    void advanceFrame() {
+   390→        if (!isEnabled()) return;
+   391→        
+   392→        ++m_current_frame;
+   393→        
+   394→        // Optionally emit frame marker
+   395→        if (m_config.track_all_objects) {
+   396→            TimelineEvent marker;
+   397→            marker.type = TimelineEventType::FrameMarker;
+   398→            marker.frame_number = m_current_frame;
+   399→            marker.description = "Frame " + std::to_string(m_current_frame);
+   400→            
+   401→            addEventInternal(marker);
+   402→        }
+   403→    }
+   404→    
+   405→    void setFrame(uint64_t frame) {
+   406→        m_current_frame = frame;
+   407→    }
+   408→    
+   409→    uint64_t getCurrentFrame() const { return m_current_frame.load(); }
+   410→    
+   411→    // ========================================================================
+   412→    // Object Watching
+   413→    // ========================================================================
+   414→    
+   415→    /**
+   416→     * Watch a specific object for all state changes
+   417→     */
+   418→    void watchObject(const std::string& object_id, const std::string& object_type = "") {
+   419→        std::unique_lock lock(m_mutex);
+   420→        m_watch_list[object_id] = object_type;
+   421→    }
+   422→    
+   423→    void unwatchObject(const std::string& object_id) {
+   424→        std::unique_lock lock(m_mutex);
+   425→        m_watch_list.erase(object_id);
+   426→    }
+   427→    
+   428→    bool isWatching(const std::string& object_id) const {
+   429→        std::shared_lock lock(m_mutex);
+   430→        return m_watch_list.count(object_id) > 0 || m_config.track_all_objects;
+   431→    }
+   432→    
+   433→    // ========================================================================
+   434→    // Event Recording Interface
+   435→    // ========================================================================
+   436→    
+   437→    /**
+   438→     * Record generic timeline event
+   439→     */
+   440→    void recordEvent(
+   441→        TimelineEventType type,
+   442→        const std::string& object_id,
+   443→        const SourceLocation& loc = DEBUG_HERE(),
+   444→        Subsystem subs = Subsystem::Unknown) {
+   445→        
+   446→        if (!isEnabled()) return;
+   447→        if (!shouldTrack(object_id)) return;
+   448→        
+   449→        TimelineEvent event;
+   450→        event.type = type;
+   451→        event.object_id = object_id;
+   452→        event.frame_number = m_current_frame;
+   453→        event.subsystem = subs;
+   454→        event.source = loc;
+   455→        event.thread_id = getCurrentThreadId();
+   456→        
+   457→        addEventInternal(event);
+   458→    }
+   459→    
+   460→    /**
+   461→     * Record object creation
+   462→     */
+   463→    void recordCreation(
+   464→        const std::string& object_id,
+   465→        const std::string& object_type,
+   466→        const std::string& description = "",
+   467→        Subsystem subs = Subsystem::Unknown,
+   468→        const SourceLocation& loc = DEBUG_HERE()) {
+   469→        
+   470→        if (!isEnabled()) return;
+   471→        if (!shouldTrack(object_id)) return;
+   472→        
+   473→        TimelineEvent event;
+   474→        event.type = TimelineEventType::ObjectCreated;
+   475→        event.object_id = object_id;
+   476→        event.object_type = object_type;
+   477→        event.object_description = description;
+   478→        event.frame_number = m_current_frame;
+   479→        event.subsystem = subs;
+   480→        event.source = loc;
+   481→        event.thread_id = getCurrentThreadId();
+   482→        
+   483→        addEventInternal(event);
+   484→    }
+   485→    
+   486→    /**
+   487→     * Record object destruction
+   488→     */
+   489→    void recordDestruction(
+   490→        const std::string& object_id,
+   491→        Subsystem subs = Subsystem::Unknown,
+   492→        const SourceLocation& loc = DEBUG_HERE()) {
+   493→        
+   494→        if (!isEnabled()) return;
+   495→        if (!shouldTrack(object_id)) return;
+   496→        
+   497→        TimelineEvent event;
+   498→        event.type = TimelineEventType::ObjectDestroyed;
+   499→        event.object_id = object_id;
+   500→        event.frame_number = m_current_frame;
+   501→        event.subsystem = subs;
+   502→        event.source = loc;
+   503→        event.thread_id = getCurrentThreadId();
+   504→        
+   505→        addEventInternal(event);
+   506→    }
+   507→    
+   508→    /**
+   509→     * Record state change on an object
+   510→     */
+   511→    void recordStateChange(
+   512→        const std::string& object_id,
+   513→        const std::string& attribute,
+   514→        const std::string& old_value,
+   515→        const std::string& new_value,
+   516→        Subsystem subs = Subsystem::Unknown,
+   517→        const SourceLocation& loc = DEBUG_HERE()) {
+   518→        
+   519→        if (!isEnabled()) return;
+   520→        if (!shouldTrack(object_id)) return;
+   521→        if (!m_config.record_full_state_changes) return;  // Skip if not recording details
+   522→        
+   523→        TimelineEvent event;
+   524→        event.type = TimelineEventType::StateChanged;
+   525→        event.object_id = object_id;
+   526→        event.attribute_name = attribute;
+   527→        event.old_value = old_value;
+   528→        event.new_value = new_value;
+   529→        event.frame_number = m_current_frame;
+   530→        event.subsystem = subs;
+   531→        event.source = loc;
+   532→        event.thread_id = getCurrentThreadId();
+   533→        
+   534→        addEventInternal(event);
+   535→    }
+   536→    
+   537→    /**
+   538→     * Record error/corruption event (always recorded even for unwatched objects)
+   539→     */
+   540→    void recordError(
+   541→        TimelineEventType error_type,
+   542→        const std::string& object_id,
+   543→        const std::string& description = "",
+   544→        Severity severity = Severity::Error,
+   545→        Subsystem subs = Subsystem::Unknown,
+   546→        const SourceLocation& loc = DEBUG_HERE()) {
+   547→        
+   548→        if (!isEnabled()) return;
+   549→        
+   550→        TimelineEvent event;
+   551→        event.type = error_type;
+   552→        event.object_id = object_id;
+   553→        event.object_description = description;
+   554→        event.frame_number = m_current_frame;
+   555→        event.subsystem = subs;
+   556→        event.source = loc;
+   557→        event.thread_id = getCurrentThreadId();
+   558→        event.metadata["severity"] = severityToString(severity);
+   559→        
+   560→        // Always add errors regardless of watch status
+   561→        addEventInternal(event);
+   562→    }
+   563→    
+   564→    /**
+   565→     * Add user-defined marker for manual annotation
+   566→     */
+   567→    void addMarker(const std::string& message, const std::map<std::string, std::string>& tags = {}) {
+   568→        if (!isEnabled()) return;
+   569→        
+   570→        TimelineEvent event;
+   571→        event.type = TimelineEventType::UserMarker;
+   572→        event.object_description = message;
+   573→        event.frame_number = m_current_frame;
+   574→        event.subsystem = Subsystem::DiagnosticSystem;
+   575→        event.metadata = tags;
+   576→        
+   577→        addEventInternal(event);
+   578→    }
+   579→    
+   580→    // ========================================================================
+   581→    // Query Interface - Time Travel
+   582→    // ========================================================================
+   583→    
+   584→    /**
+   585→     * Get all events in a frame range
+   586→     */
+   587→    TimelineQueryResult queryByFrameRange(uint64_t start_frame, uint64_t end_frame) const {
+   588→        TimelineQueryResult result;
+   589→        result.start_frame = start_frame;
+   590→        result.end_frame = end_frame;
+   591→        
+   592→        std::shared_lock lock(m_mutex);
+   593→        
+   594→        for (const auto& event : m_events) {
+   595→            if (event.frame_number >= start_frame && event.frame_number <= end_frame) {
+   596→                result.events.push_back(event);
+   597→                
+   598→                if (event.isErrorOrCorruption()) result.error_events++;
+   599→                if (event.isLifecycleEvent()) result.lifecycle_events++;
+   600→                result.total_events++;
+   601→            }
+   602→        }
+   603→        
+   604→        return result;
+   605→    }
+   606→    
+   607→    /**
+   608→     * Get complete lifecycle of an object
+   609→     */
+   610→    std::optional<ObjectLifecycle> getObjectLifecycle(const std::string& object_id) const {
+   611→        std::shared_lock lock(m_mutex);
+   612→        
+   613→        auto it = m_object_lifecycles.find(object_id);
+   614→        if (it != m_object_lifecycles.end()) {
+   615→            return it->second;
+   616→        }
+   617→        return std::nullopt;
+   618→    }
+   619→    
+   620→    /**
+   621→     * Get state snapshot at a specific frame
+   622→     */
+   623→    StateSnapshot getSnapshotAtFrame(uint64_t target_frame) const {
+   624→        StateSnapshot snapshot;
+   625→        snapshot.target_frame = target_frame;
+   626→        
+   627→        std::shared_lock lock(m_mutex);
+   628→        
+   629→        // Find all objects that existed at this frame
+   630→        for (const auto& [obj_id, lifecycle] : m_object_lifecycles) {
+   631→            if (lifecycle.creation_frame <= target_frame &&
+   632→                (lifecycle.destruction_frame == 0 || lifecycle.destruction_frame > target_frame)) {
+   633→                snapshot.active_objects[obj_id] = lifecycle;
+   634→            }
+   635→        }
+   636→        
+   637→        // Get recent events leading up to this frame
+   638→        int count = 0;
+   639→        for (auto it = m_events.rbegin(); it != m_events.rend() && count < 50; ++it) {
+   640→            if (it->frame_number <= target_frame) {
+   641→                snapshot.preceding_events.push_back(*it);
+   642→                count++;
+   643→                
+   644→                if (it->isErrorOrCorruption()) {
+   645→                    snapshot.prior_errors.push_back(*it);
+   646→                }
+   647→            }
+   648→        }
+   649→        
+   650→        return snapshot;
+   651→    }
+   652→    
+   653→    /**
+   654→     * Find what happened to an object around a specific frame
+   655→     */
+   656→    std::vector<TimelineEvent> getObjectEventsAroundFrame(
+   657→        const std::string& object_id,
+   658→        uint64_t center_frame,
+   659→        uint64_t window_size = 100) const {
+   660→        
+   661→        std::vector<TimelineEvent> result;
+   662→        uint64_t start = window_size > center_frame ? 0 : center_frame - window_size;
+   663→        uint64_t end = center_frame + window_size;
+   664→        
+   665→        std::shared_lock lock(m_mutex);
+   666→        
+   667→        for (const auto& event : m_events) {
+   668→            if (event.object_id == object_id &&
+   669→                event.frame_number >= start &&
+   670→                event.frame_number <= end) {
+   671→                result.push_back(event);
+   672→            }
+   673→        }
+   674→        
+   675→        return result;
+   676→    }
+   677→    
+   678→    /**
+   679→     * Find all errors/corruptions in a frame range
+   680→     */
+   681→    std::vector<TimelineEvent> findErrorsInFrameRange(
+   682→        uint64_t start_frame,
+   683→        uint64_t end_frame) const {
+   684→        
+   685→        std::vector<TimelineEvent> errors;
+   686→        
+   687→        std::shared_lock lock(m_mutex);
+   688→        
+   689→        for (const auto& event : m_events) {
+   690→            if (event.isErrorOrCorruption() &&
+   691→                event.frame_number >= start_frame &&
+   692→                event.frame_number <= end_frame) {
+   693→                errors.push_back(event);
+   694→            }
+   695→        }
+   696→        
+   697→        return errors;
+   698→    }
+   699→    
+   700→    /**
+   701→     * Find objects that were destroyed shortly before a crash
+   702→     * (Common pattern: use-after-free)
+   703→     */
+   704→    std::vector<ObjectLifetime> findObjectsDestroyedBeforeFrame(
+   705→        uint64_t crash_frame,
+   706→        uint64_t lookback_window = 1000) const {
+   707→        
+   708→        struct ObjectLifetime {
+   709→            std::string object_id;
+   710→            std::string object_type;
+   711→            uint64_t destruction_frame;
+   712→            uint64_t frames_before_crash;
+   713→        };
+   714→        
+   715→        std::vector<ObjectLifetime> recently_destroyed;
+   716→        uint64_t start = lookback_window > crash_frame ? 0 : crash_frame - lookback_window;
+   717→        
+   718→        std::shared_lock lock(m_mutex);
+   719→        
+   720→        for (const auto& [obj_id, lifecycle] : m_object_lifecycles) {
+   721→            if (lifecycle.destruction_frame > 0 &&
+   722→                lifecycle.destruction_frame >= start &&
+   723→                lifecycle.destruction_frame < crash_frame) {
+   724→                
+   725→                ObjectLifetime lt;
+   726→                lt.object_id = obj_id;
+   727→                lt.object_type = lifecycle.object_type;
+   728→                lt.destruction_frame = lifecycle.destruction_frame;
+   729→                lt.frames_before_crash = crash_frame - lifecycle.destruction_frame;
+   730→                
+   731→                recently_destroyed.push_back(lt);
+   732→            }
+   733→        }
+   734→        
+   735→        // Sort by proximity to crash
+   736→        std::sort(recently_destroyed.begin(), recently_destroyed.end(),
+   737→            [](const ObjectLifetime& a, const ObjectLifetime& b) {
+   738→                return a.frames_before_crash < b.frames_before_crash;
+   739→            });
+   740→        
+   741→        return recently_destroyed;
+   742→    }
+   743→    
+   744→    // ========================================================================
+   745→    // Statistics
+   746→    // ============================================================================
+   747→    
+   748→    struct Stats {
+   749→        size_t total_events{0};
+   750→        uint64_t current_frame{0};
+   751→        size_t tracked_objects{0};
+   752→        size_t watched_objects{0};
+   753→        size_t active_objects{0};
+   754→        size_t total_errors{0};
+   755→        size_t total_corruptions{0};
+   756→        
+   757→        std::map<TimelineEventType, size_t> events_by_type;
+   758→        std::map<Subsystem, size_t> events_by_subsystem;
+   759→    };
+   760→    
+   761→    Stats getStats() const {
+   762→        std::shared_lock lock(m_mutex);
+   763→        
+   764→        Stats stats;
+   765→        stats.current_frame = m_current_frame;
+   766→        stats.tracked_objects = m_object_lifecycles.size();
+   767→        stats.watched_objects = m_watch_list.size();
+   768→        
+   769→        for (const auto& [obj_id, lifecycle] : m_object_lifecycles) {
+   770→            if (lifecycle.isAlive()) stats.active_objects++;
+   771→        }
+   772→        
+   773→        for (const auto& event : m_events) {
+   774→            stats.total_events++;
+   775→            stats.events_by_type[event.type]++;
+   776→            stats.events_by_subsystem[event.subsystem]++;
+   777→            
+   778→            if (event.type == TimelineEventType::ErrorDetected) stats.total_errors++;
+   779→            if (event.type == TimelineEventType::CorruptionDetected) stats.total_corruptions++;
+   780→        }
+   781→        
+   782→        return stats;
+   783→    }
+   784→
+   785→private:
+   786→    Config m_config;
+   787→    std::atomic<bool> m_enabled;
+   788→    std::atomic<uint64_t> m_current_frame;
+   789→    mutable std::shared_mutex m_mutex;
+   790→    
+   791→    // Event storage (ordered by insertion)
+   792→    std::deque<TimelineEvent> m_events;
+   793→    
+   794→    // Object lifecycle tracking
+   795→    std::map<std::string, ObjectLifecycle> m_object_lifecycles;
+   796→    
+   797→    // Watch list
+   798→    std::map<std::string, std::string> m_watch_list;  // object_id -> type
+   799→    
+   800→    // ========================================================================
+   801→    // Internal Methods
+   802→    // ========================================================================
+   803→    
+   804→    bool shouldTrack(const std::string& object_id) const {
+   805→        if (m_config.track_all_objects) return true;
+   806→        return m_watch_list.count(object_id) > 0;
+   807→    }
+   808→    
+   809→    void addEventInternal(const TimelineEvent& event) {
+   810→        std::unique_lock lock(m_mutex);
+   811→        
+   812→        // Check global limit
+   813→        if (m_events.size() >= m_config.max_events) {
+   814→            m_events.pop_front();  // Evict oldest
+   815→        }
+   816→        
+   817→        m_events.push_back(event);
+   818→        
+   819→        // Update object lifecycle tracking
+   820→        updateObjectLifecycle(event);
+   821→    }
+   822→    
+   823→    void updateObjectLifecycle(const TimelineEvent& event) {
+   824→        // Get or create lifecycle entry
+   825→        auto& lifecycle = m_object_lifecycles[event.object_id];
+   826→        
+   827→        if (lifecycle.object_id.empty()) {
+   828→            lifecycle.object_id = event.object_id;
+   829→            lifecycle.object_type = event.object_type;
+   830→        }
+   831→        
+   832→        switch (event.type) {
+   833→            case TimelineEventType::ObjectCreated:
+   834→            case TimelineEventType::ResourceAllocated:
+   835→                if (!lifecycle.created.has_value()) {
+   836→                    lifecycle.created = event;
+   837→                    lifecycle.creation_frame = event.frame_number;
+   838→                }
+   839→                break;
+   840→                
+   841→            case TimelineEventType::ObjectDestroyed:
+   842→            case TimelineEventType::ResourceFreed:
+   843→                if (!lifecycle.destroyed.has_value()) {
+   844→                    lifecycle.destroyed = event;
+   845→                    lifecycle.destruction_frame = event.frame_number;
+   846→                }
+   847→                break;
+   848→                
+   849→            case TimelineEventType::ObjectModified:
+   850→            case TimelineEventType::StateChanged:
+   851→                lifecycle.modifications.push_back(event);
+   852→                lifecycle.total_modifications++;
+   853→                
+   854→                // Update current state
+   855→                if (!event.attribute_name.empty()) {
+   856→                    lifecycle.current_state[event.attribute_name] = event.new_value;
+   857→                }
+   858→                break;
+   859→                
+   860→            default:
+   861→                break;
+   862→        }
+   863→        
+   864→        // Update last access
+   865→        if (event.frame_number > lifecycle.last_access_frame) {
+   866→            lifecycle.last_access_frame = event.frame_number;
+   867→        }
+   868→    }
+   869→    
+   870→    static std::string getCurrentThreadId() {
+   871→        std::stringstream ss;
+   872→        ss << std::this_thread::get_id();
+   873→        return ss.str();
+   874→    }
+   875→};
+   876→
+   877→} // namespace timeline
+   878→} // namespace prosper_debug
+   879→
